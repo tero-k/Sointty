@@ -357,6 +357,11 @@ fn worker_loop<R: Read + Seek>(mut reader: R, shared: Arc<Shared>, capacity: usi
         match reader.read(&mut chunk[..to_read]) {
             Ok(0) => {
                 let mut state = lock(&shared);
+                // A seek may have invalidated this in-flight read. Stale
+                // terminal results must not poison the new generation.
+                if generation != state.generation {
+                    continue;
+                }
                 state.eof = true;
                 state.stalled_since = None;
                 shared.data_ready.notify_all();
@@ -389,6 +394,9 @@ fn worker_loop<R: Read + Seek>(mut reader: R, shared: Arc<Shared>, capacity: usi
             Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
             Err(error) => {
                 let mut state = lock(&shared);
+                if generation != state.generation {
+                    continue;
+                }
                 state.reader_error = Some(error.kind());
                 state.eof = true;
                 state.stalled_since = None;
@@ -413,7 +421,7 @@ fn worker_loop<R: Read + Seek>(mut reader: R, shared: Arc<Shared>, capacity: usi
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::{Condvar as TestCondvar, Mutex as TestMutex};
     use std::thread;
 
@@ -744,5 +752,92 @@ mod tests {
             src.total_buffered() <= capacity as u64,
             "worker kept more than capacity buffered at EOF"
         );
+    }
+
+    #[derive(Clone, Copy, Debug)]
+    enum StaleTerminal {
+        Eof,
+        Error,
+    }
+
+    /// Blocks the first terminal read so a seek can invalidate its generation
+    /// before it returns EOF (or an error).
+    struct StaleTerminalReader {
+        pos: usize,
+        terminal: StaleTerminal,
+        terminal_pending: bool,
+        entered: Arc<AtomicBool>,
+        gate: Arc<(TestMutex<bool>, TestCondvar)>,
+    }
+
+    impl Read for StaleTerminalReader {
+        fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+            let data = b"ABCD";
+            if self.pos < data.len() {
+                let n = (data.len() - self.pos).min(buf.len());
+                buf[..n].copy_from_slice(&data[self.pos..self.pos + n]);
+                self.pos += n;
+                return Ok(n);
+            }
+            if self.terminal_pending {
+                self.terminal_pending = false;
+                self.entered.store(true, Ordering::SeqCst);
+                let mut open = self.gate.0.lock().unwrap();
+                while !*open {
+                    open = self.gate.1.wait(open).unwrap();
+                }
+                return match self.terminal {
+                    StaleTerminal::Eof => Ok(0),
+                    StaleTerminal::Error => Err(io::ErrorKind::Other.into()),
+                };
+            }
+            Ok(0)
+        }
+    }
+
+    impl Seek for StaleTerminalReader {
+        fn seek(&mut self, pos: SeekFrom) -> io::Result<u64> {
+            if let SeekFrom::Start(n) = pos {
+                self.pos = n as usize;
+                Ok(n)
+            } else {
+                Err(io::ErrorKind::Unsupported.into())
+            }
+        }
+    }
+
+    #[test]
+    fn seek_ignores_stale_eof_and_error() {
+        for terminal in [StaleTerminal::Eof, StaleTerminal::Error] {
+            let entered = Arc::new(AtomicBool::new(false));
+            let gate = Arc::new((TestMutex::new(false), TestCondvar::new()));
+            let reader = StaleTerminalReader {
+                pos: 0,
+                terminal,
+                terminal_pending: true,
+                entered: Arc::clone(&entered),
+                gate: Arc::clone(&gate),
+            };
+            let (mut src, _stall) = ReadAheadSource::with_reader(reader, Some(4), 64);
+            let mut buf = [0u8; 4];
+            assert_eq!(src.read(&mut buf).unwrap(), 4);
+            assert_eq!(&buf, b"ABCD");
+            assert!(wait_for(|| entered.load(Ordering::SeqCst), Duration::from_secs(1)));
+
+            let shared = Arc::clone(&src.shared);
+            let seeking = thread::spawn(move || {
+                src.seek(SeekFrom::Start(0)).unwrap();
+                let mut buf = [0u8; 4];
+                (src.read(&mut buf).unwrap(), buf)
+            });
+            assert!(
+                wait_for(|| lock(&shared).seek.is_some(), Duration::from_secs(1)),
+                "seek was not posted before stale {terminal:?} returned"
+            );
+            FakeReader::open_gate(&gate);
+            let (n, buf) = seeking.join().unwrap();
+            assert_eq!(n, 4, "stale {terminal:?} poisoned the new generation");
+            assert_eq!(&buf, b"ABCD");
+        }
     }
 }

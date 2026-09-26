@@ -271,6 +271,8 @@ pub enum PlayerCommand {
     Next,
     SeekFrame(u64),
     SelectDevice(DeviceId),
+    /// Opt in to non-bit-perfect F32-to-integer output when exact F32 fails.
+    SetFloatToInt(bool),
     Quit,
 }
 
@@ -279,6 +281,8 @@ pub enum PlayerEvent {
     Playing {
         track: TrackId,
         output: OutputSpec,
+        /// True only when samples were converted from F32 to integer PCM.
+        converted: bool,
     },
     Position {
         track: TrackId,

@@ -132,15 +132,10 @@ mod imp {
                     Err(error) => return Err(error),
                 }
             }
-            let (candidate, mut spec) =
+            // Negotiated parameters are surfaced through the returned
+            // `OutputSpec`; printing here would corrupt the TUI.
+            let (_, mut spec) =
                 configured.ok_or_else(|| no_dsd_mode_error(input.dsd_rate_hz, input.layout.channels))?;
-            // Off-RT, once per successful configure: report the negotiated mode.
-            eprintln!(
-                "sointty-output-alsa: negotiated DSD via {} at {} Hz, {} channel(s)",
-                candidate.wire.as_str(),
-                spec.rate_hz,
-                spec.layout.channels,
-            );
             spec.device = self.device.clone();
             self.spec = Some(spec.clone());
             self.pcm = Some(pcm);

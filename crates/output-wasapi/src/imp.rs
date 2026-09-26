@@ -8,8 +8,9 @@ use sointty_core::{
     AudioOutput, BufferConfig, DeviceId, OutputCounters, OutputSpec, PlayerError, StreamSpec,
     validate_exact_spec,
 };
+use windows::Win32::Foundation::CloseHandle;
 use windows::Win32::Foundation::{
-    HANDLE, PROPERTYKEY, RPC_E_CHANGED_MODE, S_FALSE, S_OK, WAIT_OBJECT_0,
+    HANDLE, PROPERTYKEY, RPC_E_CHANGED_MODE, S_FALSE, S_OK, WAIT_TIMEOUT,
 };
 use windows::Win32::Media::Audio::{
     AUDCLNT_E_DEVICE_IN_USE, AUDCLNT_SHAREMODE_EXCLUSIVE, AUDCLNT_STREAMFLAGS_EVENTCALLBACK,
@@ -22,7 +23,10 @@ use windows::Win32::System::Com::StructuredStorage::{
 use windows::Win32::System::Com::{
     CLSCTX_ALL, COINIT_MULTITHREADED, CoCreateInstance, CoInitializeEx, CoTaskMemFree, STGM_READ,
 };
-use windows::Win32::System::Threading::{CreateEventW, SetEvent, WaitForSingleObject};
+use windows::Win32::System::Threading::{
+    CancelWaitableTimer, CreateEventW, CreateWaitableTimerW, SetEvent, SetWaitableTimer,
+    WaitForMultipleObjects, WaitForSingleObject,
+};
 use windows::Win32::UI::Shell::PropertiesSystem::IPropertyStore;
 use windows::core::{Error, GUID, HSTRING};
 
@@ -81,6 +85,13 @@ pub struct WasapiOutput {
     buffer_frames: u32,
     /// Negotiated periodicity in frames.
     period_frames: u32,
+    /// Render cadence decided in `configure` from the ACTUAL device buffer:
+    /// push mode or a driver-forced whole-buffer period both need timer
+    /// top-ups. Recomputing this in the render thread from requested values
+    /// is wrong when the driver rounds the buffer up (observed: 8820
+    /// requested frames became 15360 at 192 kHz, silently disabling the
+    /// timer for a push-mode client whose event is never armed).
+    timer_mode: bool,
     thread: Option<JoinHandle<()>>,
     /// Set by `stop()`; the render thread checks it after every event wake so
     /// a stop request is never lost to a WASAPI signal or a full-buffer
@@ -108,6 +119,7 @@ impl WasapiOutput {
             spec: None,
             buffer_frames: 0,
             period_frames: 0,
+            timer_mode: false,
             thread: None,
             stop: Arc::new(AtomicBool::new(false)),
         })
@@ -143,7 +155,7 @@ impl AudioOutput for WasapiOutput {
         let endpoint = self.resolve_endpoint(&enumerator)?;
         let client: IAudioClient = unsafe { endpoint.Activate(CLSCTX_ALL, None) }
             .map_err(|error| map_activate_error(&error))?;
-        let client = SendCom(client);
+        let mut client = SendCom(client);
 
         // Try every candidate, in fidelity order, accepting ONLY an exact
         // S_OK from IsFormatSupported (exclusive mode).
@@ -172,15 +184,9 @@ impl AudioOutput for WasapiOutput {
             reason: "no exact exclusive format",
         })?;
 
-        let mut default_period = 0_i64;
         let mut min_period = 0_i64;
-        unsafe {
-            client.GetDevicePeriod(
-                Some(&raw mut default_period),
-                Some(&raw mut min_period),
-            )
-        }
-        .map_err(|_| PlayerError::Output)?;
+        unsafe { client.GetDevicePeriod(None, Some(&raw mut min_period)) }
+            .map_err(|_| PlayerError::Output)?;
         // Endpoints may force legal timing; clamp requested buffer and
         // periodicity against the device minimum period.
         let buffer_hns = frames_to_hns(buffers.buffer_frames, input.rate_hz).max(min_period);
@@ -188,68 +194,96 @@ impl AudioOutput for WasapiOutput {
             .max(min_period)
             .min(buffer_hns);
 
-        let init_result = unsafe {
-            client.Initialize(
-                AUDCLNT_SHAREMODE_EXCLUSIVE,
-                AUDCLNT_STREAMFLAGS_EVENTCALLBACK,
-                buffer_hns,
-                period_hns,
-                format.as_waveformatex_ptr(),
-                None,
-            )
-        };
-        // Endpoints may force legal timing. Negotiate in steps, keeping the
-        // stream format exact throughout:
-        // 1. requested buffer duration with requested periodicity;
-        // 2. periodicity == buffer duration (some endpoints require this in
-        //    exclusive event mode, AUDCLNT_E_INVALID_DEVICE_PERIOD);
-        // 3. buffer byte size aligned up to a 128-byte multiple (the Intel
-        //    HD Audio requirement, AUDCLNT_E_BUFFER_SIZE_ERROR).
         let frame_bytes =
             u32::from(input.layout.channels) * u32::from(candidate.container_bits / 8);
         let aligned_buffer_hns = align_buffer_hns(buffer_hns, input.rate_hz, frame_bytes);
-        let mut actual_period_hns = period_hns;
-        let init_result = match init_result {
-            Err(error) if error.code() == AUDCLNT_E_INVALID_DEVICE_PERIOD => {
-                actual_period_hns = buffer_hns;
-                unsafe {
-                    client.Initialize(
-                        AUDCLNT_SHAREMODE_EXCLUSIVE,
-                        AUDCLNT_STREAMFLAGS_EVENTCALLBACK,
-                        buffer_hns,
-                        buffer_hns,
-                        format.as_waveformatex_ptr(),
-                        None,
-                    )
+        // Endpoints may force legal timing. Negotiate in steps, keeping the
+        // stream format exact throughout:
+        // 1. requested buffer duration with requested periodicity;
+        // 2. periodicity rounded up to whole milliseconds (USB drivers like
+        //    the iFi reject fractional-millisecond periods with
+        //    AUDCLNT_E_INVALID_DEVICE_PERIOD);
+        // 3. periodicity == buffer duration (endpoints that only accept one
+        //    event per buffer in exclusive event mode);
+        // 4. buffer byte size aligned up to a 128-byte multiple (the Intel
+        //    HD Audio requirement, AUDCLNT_E_BUFFER_SIZE_ERROR).
+        let attempts = init_attempts(buffer_hns, period_hns, aligned_buffer_hns);
+        let mut initialized = None;
+        for (attempt_buffer, attempt_period) in attempts {
+            let result = unsafe {
+                client.Initialize(
+                    AUDCLNT_SHAREMODE_EXCLUSIVE,
+                    AUDCLNT_STREAMFLAGS_EVENTCALLBACK,
+                    attempt_buffer,
+                    attempt_period,
+                    format.as_waveformatex_ptr(),
+                    None,
+                )
+            };
+            match result {
+                Ok(()) => {
+                    initialized = Some(attempt_period);
+                    break;
+                }
+                Err(error)
+                    if error.code() == AUDCLNT_E_INVALID_DEVICE_PERIOD
+                        || error.code() == AUDCLNT_E_BUFFER_SIZE_ERROR => {}
+                Err(error) => {
+                    return Err(if error.code() == AUDCLNT_E_DEVICE_IN_USE {
+                        PlayerError::DeviceBusy
+                    } else {
+                        PlayerError::Output
+                    });
                 }
             }
-            result => result,
+        }
+        let Some(actual_period_hns) = initialized else {
+            return Err(PlayerError::Output);
         };
-        let init_result = match init_result {
-            Err(error)
-                if error.code() == AUDCLNT_E_BUFFER_SIZE_ERROR
-                    && aligned_buffer_hns > buffer_hns =>
-            {
-                actual_period_hns = aligned_buffer_hns;
-                unsafe {
-                    client.Initialize(
-                        AUDCLNT_SHAREMODE_EXCLUSIVE,
-                        AUDCLNT_STREAMFLAGS_EVENTCALLBACK,
-                        aligned_buffer_hns,
-                        aligned_buffer_hns,
-                        format.as_waveformatex_ptr(),
-                        None,
-                    )
-                }
-            }
-            result => result,
-        };
-        if let Err(error) = init_result {
-            return Err(if error.code() == AUDCLNT_E_DEVICE_IN_USE {
-                PlayerError::DeviceBusy
+
+        // Some USB drivers (observed: iFi) reject any event-mode period below
+        // the buffer duration and then report padding as binary full/empty,
+        // firing the event only once the buffer is completely exhausted —
+        // every write delay becomes an audible click. Retry the stream in
+        // push mode (no event callback), where such drivers report granular
+        // padding and the render loop tops up on a timer. Fall back to
+        // whole-buffer event mode if push mode is rejected.
+        let mut push_mode = false;
+        if actual_period_hns >= buffer_hns {
+            drop(client);
+            let push_client: IAudioClient = unsafe { endpoint.Activate(CLSCTX_ALL, None) }
+                .map_err(|error| map_activate_error(&error))?;
+            let result = unsafe {
+                push_client.Initialize(
+                    AUDCLNT_SHAREMODE_EXCLUSIVE,
+                    Default::default(),
+                    buffer_hns,
+                    0,
+                    format.as_waveformatex_ptr(),
+                    None,
+                )
+            };
+            if result.is_ok() {
+                push_mode = true;
+                client = SendCom(push_client);
             } else {
-                PlayerError::Output
-            });
+                // Push mode rejected; fall back to whole-buffer event mode.
+                drop(push_client);
+                let event_client: IAudioClient = unsafe { endpoint.Activate(CLSCTX_ALL, None) }
+                    .map_err(|error| map_activate_error(&error))?;
+                unsafe {
+                    event_client.Initialize(
+                        AUDCLNT_SHAREMODE_EXCLUSIVE,
+                        AUDCLNT_STREAMFLAGS_EVENTCALLBACK,
+                        buffer_hns,
+                        buffer_hns,
+                        format.as_waveformatex_ptr(),
+                        None,
+                    )
+                }
+                .map_err(|_| PlayerError::Output)?;
+                client = SendCom(event_client);
+            }
         }
 
         let buffer_frames = unsafe { client.GetBufferSize() }.map_err(|_| PlayerError::Output)?;
@@ -258,18 +292,13 @@ impl AudioOutput for WasapiOutput {
 
         let event =
             unsafe { CreateEventW(None, false, false, None) }.map_err(|_| PlayerError::Output)?;
-        unsafe { client.SetEventHandle(event) }.map_err(|_| PlayerError::Output)?;
+        if !push_mode {
+            unsafe { client.SetEventHandle(event) }.map_err(|_| PlayerError::Output)?;
+        }
         let render: IAudioRenderClient =
             unsafe { client.GetService() }.map_err(|_| PlayerError::Output)?;
-        eprintln!(
-            "sointty-output-wasapi: negotiated exclusive {:?} {} Hz {}ch; \
-             device buffer {buffer_frames} frames, requested periodicity {period_frames} frames \
-             (device default period {default_period} x100ns, minimum {min_period} x100ns)",
-            candidate.format,
-            input.rate_hz,
-            input.layout.channels,
-        );
-
+        // Negotiated parameters are surfaced through the returned `OutputSpec`;
+        // printing here would corrupt the TUI's alternate screen.
         let spec = OutputSpec {
             device: self.device.clone(),
             rate_hz: input.rate_hz,
@@ -282,6 +311,7 @@ impl AudioOutput for WasapiOutput {
         self.event = Some(SendCom(event));
         self.buffer_frames = buffer_frames;
         self.period_frames = period_frames;
+        self.timer_mode = push_mode || needs_timer_topup(period_frames, buffer_frames);
         self.spec = Some(spec.clone());
         Ok(spec)
     }
@@ -302,6 +332,7 @@ impl AudioOutput for WasapiOutput {
         let rate_hz = spec.rate_hz;
         let buffer_frames = self.buffer_frames.max(1);
         let period_frames = self.period_frames.max(1);
+        let timer_mode = self.timer_mode;
 
         // Preallocate the render scratch before the thread starts; the render
         // loop itself performs no heap allocation.
@@ -317,6 +348,7 @@ impl AudioOutput for WasapiOutput {
                     rate_hz,
                     buffer_frames,
                     period_frames,
+                    timer_mode,
                     scratch,
                     &mut consumer,
                     counters,
@@ -349,6 +381,7 @@ impl AudioOutput for WasapiOutput {
         self.spec = None;
         self.buffer_frames = 0;
         self.period_frames = 0;
+        self.timer_mode = false;
         Ok(())
     }
 }
@@ -388,6 +421,20 @@ impl AcceptedFormat {
     }
 }
 
+/// Drivers that reject a period below the buffer duration signal the device
+/// event only once per whole buffer, when it is already exhausted. Detect
+/// that negotiation so the render loop can top up on a timer instead.
+fn needs_timer_topup(period_frames: u32, buffer_frames: u32) -> bool {
+    period_frames >= buffer_frames
+}
+
+/// Top-up cadence for [`needs_timer_topup`] devices: a quarter buffer per
+/// tick keeps at least half the buffer of slack against scheduling jitter.
+fn timer_interval_ms(buffer_frames: u32, rate_hz: u32) -> u32 {
+    let quarter = u64::from(buffer_frames / 4).max(1);
+    (quarter * 1000 / u64::from(rate_hz)).max(1) as u32
+}
+
 #[allow(clippy::too_many_arguments)]
 fn render_loop(
     client: SendCom<IAudioClient>,
@@ -396,6 +443,7 @@ fn render_loop(
     rate_hz: u32,
     buffer_frames: u32,
     period_frames: u32,
+    timer_mode: bool,
     mut scratch: Vec<u8>,
     consumer: &mut rtrb::Consumer<u8>,
     counters: Arc<OutputCounters>,
@@ -411,8 +459,18 @@ fn render_loop(
         return;
     }
 
+    // In timer mode the buffer duration doubles as the driver period; give
+    // MMCSS the real top-up cadence instead.
+    let rt_period_frames = if timer_mode {
+        (buffer_frames / 4).max(1)
+    } else {
+        period_frames
+    };
     let rt_handle =
-        match audio_thread_priority::promote_current_thread_to_real_time(period_frames, rate_hz) {
+        match audio_thread_priority::promote_current_thread_to_real_time(
+            rt_period_frames,
+            rate_hz,
+        ) {
             Ok(handle) => Some(handle),
             Err(error) => {
                 eprintln!(
@@ -423,6 +481,63 @@ fn render_loop(
             }
         };
 
+    let frame_bytes = scratch.len() / buffer_frames as usize;
+
+    // Pre-fill the device buffer before starting: drivers that force
+    // period == buffer otherwise play one full buffer of driver-owned data
+    // before the first event. A short ring supply at startup pads with
+    // silence; that is startup latency, not an underrun.
+    let (_, shortage) = consumer.pop_partial_slice(&mut scratch[..]);
+    shortage.fill(0);
+    match unsafe { render.GetBuffer(buffer_frames) } {
+        Ok(pointer) => {
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    scratch.as_ptr(),
+                    pointer,
+                    scratch.len(),
+                )
+            };
+            if unsafe { render.ReleaseBuffer(buffer_frames, 0) }.is_err() {
+                counters.fault.store(true, Ordering::Relaxed);
+                if let Some(handle) = rt_handle {
+                    let _ =
+                        audio_thread_priority::demote_current_thread_from_real_time(handle);
+                }
+                return;
+            }
+        }
+        Err(_) => {
+            counters.fault.store(true, Ordering::Relaxed);
+            if let Some(handle) = rt_handle {
+                let _ = audio_thread_priority::demote_current_thread_from_real_time(handle);
+            }
+            return;
+        }
+    }
+
+    // Timer-driven top-up covers two driver behaviours: push mode (the event
+    // is never armed; the timer is the only cadence) and drivers that force
+    // whole-buffer event mode (the event fires only when the buffer is
+    // already exhausted, so the timer provides the real cadence and the
+    // event is just an extra wake). Quarter-buffer ticks keep at least half
+    // the buffer of slack against scheduling jitter.
+    let interval_ms = timer_interval_ms(buffer_frames, rate_hz);
+    let timer = if timer_mode {
+        unsafe { CreateWaitableTimerW(None, false, None) }
+            .ok()
+            .and_then(|handle| {
+                let due = -(i64::from(interval_ms)) * 10_000;
+                unsafe {
+                    SetWaitableTimer(handle, &due, interval_ms as i32, None, None, false)
+                }
+                .ok()
+                .map(|_| handle)
+            })
+    } else {
+        None
+    };
+
     if let Err(error) = unsafe { client.Start() } {
         eprintln!("sointty-output-wasapi: IAudioClient::Start failed: {error}");
         counters.fault.store(true, Ordering::Relaxed);
@@ -432,17 +547,25 @@ fn render_loop(
         return;
     }
 
-    let frame_bytes = scratch.len() / buffer_frames as usize;
     let capacity_frames = buffer_frames;
 
     'stream: loop {
         // No allocation, locks, formatting, or channel traffic in this loop:
         // event wait + device buffer queries + ring pops + device writes only.
-        let wait = unsafe { WaitForSingleObject(event, EVENT_TIMEOUT_MS) };
+        // WAIT_OBJECT_0 = device event, WAIT_OBJECT_0 + 1 = top-up timer. In
+        // timer mode without a timer handle, the wait timeout IS the tick.
+        let wait = match timer {
+            Some(timer) => unsafe {
+                WaitForMultipleObjects(&[event, timer], false, EVENT_TIMEOUT_MS)
+            },
+            None if timer_mode => unsafe { WaitForSingleObject(event, interval_ms) },
+            None => unsafe { WaitForSingleObject(event, EVENT_TIMEOUT_MS) },
+        };
         if stop.load(Ordering::Acquire) {
             break;
         }
-        if wait != WAIT_OBJECT_0 {
+        let tick = wait == WAIT_TIMEOUT && timer_mode && timer.is_none();
+        if !tick && wait.0 > 1 {
             counters.fault.store(true, Ordering::Relaxed);
             break;
         }
@@ -488,6 +611,14 @@ fn render_loop(
             .fetch_add(u64::from(available), Ordering::Relaxed);
     }
 
+    if let Some(timer) = timer {
+        unsafe {
+            let _ = CancelWaitableTimer(timer);
+            let _ = CloseHandle(timer);
+        }
+    }
+
+
     let _ = unsafe { client.Stop() };
     let _ = unsafe { client.Reset() };
     if let Some(handle) = rt_handle {
@@ -519,6 +650,24 @@ fn is_supported_exact(client: &IAudioClient, format: *const WAVEFORMATEX) -> boo
     // exact format is not supported; never fall back to a closest match.
     let hr = unsafe { client.IsFormatSupported(AUDCLNT_SHAREMODE_EXCLUSIVE, format, None) };
     hr == S_OK
+}
+
+/// `(buffer, period)` initialization attempts in fallback order. A
+/// fractional-millisecond period gets a whole-millisecond retry before the
+/// whole-buffer last resorts; duplicate steps are skipped.
+fn init_attempts(buffer_hns: i64, period_hns: i64, aligned_buffer_hns: i64) -> Vec<(i64, i64)> {
+    let mut attempts = vec![(buffer_hns, period_hns)];
+    let ms_period = (u64::try_from(period_hns.max(0)).unwrap_or(0).div_ceil(10_000) * 10_000) as i64;
+    if ms_period != period_hns && ms_period < buffer_hns {
+        attempts.push((buffer_hns, ms_period));
+    }
+    if period_hns != buffer_hns {
+        attempts.push((buffer_hns, buffer_hns));
+    }
+    if aligned_buffer_hns > buffer_hns {
+        attempts.push((aligned_buffer_hns, aligned_buffer_hns));
+    }
+    attempts
 }
 
 /// Round a buffer duration (100-ns units) up so the buffer byte size is a
@@ -726,6 +875,47 @@ mod tests {
         let frames = aligned * 44_100 / 10_000_000;
         assert_eq!(frames * 4 % 128, 0);
         assert!(frames >= 6624);
+    }
+
+    #[test]
+    fn timer_topup_only_when_driver_forces_whole_buffer_period() {
+        // Normal negotiation: period well below the buffer -> event-driven.
+        assert!(!needs_timer_topup(2205, 8820));
+        // iFi USB negotiation observed on hardware: the driver clamps the
+        // period up to the full buffer duration.
+        assert!(needs_timer_topup(8820, 8820));
+        assert!(needs_timer_topup(9000, 8820));
+    }
+
+    #[test]
+    fn timer_interval_is_quarter_buffer_with_floor() {
+        // 96 kHz / 8820-frame buffer: 2205 frames = 22 ms.
+        assert_eq!(timer_interval_ms(8820, 96_000), 22);
+        // 44.1 kHz / 8820-frame buffer: 2205 frames = 50 ms.
+        assert_eq!(timer_interval_ms(8820, 44_100), 50);
+        // Degenerate sizes never produce a zero (non-periodic) timer.
+        assert_eq!(timer_interval_ms(1, 192_000), 1);
+        assert_eq!(timer_interval_ms(8, 44_100), 1);
+    }
+
+    #[test]
+    fn init_attempts_insert_ms_aligned_period_before_whole_buffer_fallback() {
+        // 96 kHz defaults: period 229688 hns (22.97 ms) is fractional.
+        let attempts = init_attempts(918_750, 229_688, 918_750);
+        assert_eq!(
+            attempts,
+            vec![
+                (918_750, 229_688),
+                (918_750, 230_000), // rounded up to whole ms
+                (918_750, 918_750), // whole-buffer last resort
+            ]
+        );
+        // An already ms-aligned period (44.1 kHz: 50 ms exactly) needs no retry.
+        let attempts = init_attempts(2_000_000, 500_000, 2_000_000);
+        assert_eq!(attempts, vec![(2_000_000, 500_000), (2_000_000, 2_000_000)]);
+        // A 128-byte-aligned larger buffer is the final fallback.
+        let attempts = init_attempts(918_750, 918_750, 920_000);
+        assert_eq!(attempts, vec![(918_750, 918_750), (920_000, 920_000)]);
     }
 
     /// Manual smoke test against real hardware:

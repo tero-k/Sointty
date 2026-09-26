@@ -9,7 +9,7 @@ use crossbeam_channel::{Receiver, Sender};
 use sointty_core::{
     AudioOutput, BufferConfig, Decoder, DecodedBlock, DecodedPcm, DeviceFormat, DeviceId,
     DopPacker, OutputCounters, OutputSpec, PlayerCommand, PlayerError, PlayerEvent, QueueEntry,
-    TrackId, TrackTags, cd_frames_to_samples, pack_exact, pack_native_dsd,
+    SampleEncoding, StreamSpec, TrackId, TrackTags, cd_frames_to_samples, pack_exact, pack_native_dsd,
 };
 use sointty_source::StallState;
 
@@ -58,13 +58,18 @@ struct PreparedNext {
 /// and seamless same-spec track swaps; every reconfigure/seek starts fresh.
 enum Packing {
     Pcm,
+    /// Explicitly opted-in, non-bit-perfect conversion on the decoder thread.
+    FloatToInt,
     Dop(DopPacker),
     /// Native DSD groups consecutive time bytes per channel into ALSA slots.
     NativeDsd { channels: u16, slot_bytes: usize },
 }
 
 impl Packing {
-    fn for_output(output: &OutputSpec) -> Self {
+    fn for_output(output: &OutputSpec, converted: bool) -> Self {
+        if converted {
+            return Self::FloatToInt;
+        }
         match output.format {
             DeviceFormat::Dop24 => Self::Dop(DopPacker::new(output.layout.channels)),
             DeviceFormat::DsdU8 | DeviceFormat::DsdU16Le | DeviceFormat::DsdU32Le => {
@@ -75,6 +80,10 @@ impl Packing {
             }
             _ => Self::Pcm,
         }
+    }
+
+    fn converted(&self) -> bool {
+        matches!(self, Self::FloatToInt)
     }
 }
 
@@ -112,6 +121,7 @@ fn pack_block(
 ) -> Result<(), PlayerError> {
     match packing {
         Packing::Pcm => pack_exact(block, output, scratch),
+        Packing::FloatToInt => pack_float_to_int(block, output, scratch),
         Packing::Dop(packer) => {
             let DecodedPcm::Dsd(bytes) = &block.pcm else {
                 return Err(PlayerError::Decode);
@@ -125,6 +135,61 @@ fn pack_block(
             pack_native_dsd(bytes, *channels, *slot_bytes, scratch)
         }
     }
+}
+
+/// Compatibility-only conversion. This runs on the decoder worker, never on
+/// the render thread. Round to nearest-even, clip to the signed integer range,
+/// and reject non-finite decoder samples rather than emitting invalid audio.
+fn quantize_float(sample: f32, bits: u32) -> Result<i32, PlayerError> {
+    if !sample.is_finite() {
+        return Err(PlayerError::Decode);
+    }
+    let scale = (1_u64 << (bits - 1)) as f64;
+    Ok((f64::from(sample) * scale)
+        .round_ties_even()
+        .clamp(-scale, scale - 1.0) as i32)
+}
+
+fn pack_float_to_int(
+    block: DecodedBlock<'_>,
+    output: &OutputSpec,
+    scratch: &mut Vec<u8>,
+) -> Result<(), PlayerError> {
+    let spec = block.spec.pcm().ok_or(PlayerError::Decode)?;
+    let DecodedPcm::F32(samples) = block.pcm else {
+        return Err(PlayerError::Decode);
+    };
+    let (bits, valid_bits) = match output.format {
+        DeviceFormat::S16Le => (16, 16),
+        DeviceFormat::S24_3Le | DeviceFormat::S24In32Low | DeviceFormat::S24In32High => (24, 24),
+        DeviceFormat::S32Le => (32, 32),
+        _ => return Err(PlayerError::Decode),
+    };
+    if spec.encoding != SampleEncoding::F32
+        || output.rate_hz != spec.rate_hz
+        || output.layout != spec.layout
+        || output.valid_bits != valid_bits
+        || samples.len() != block.frames as usize * spec.layout.channels as usize
+    {
+        return Err(PlayerError::Decode);
+    }
+    scratch.clear();
+    scratch.resize(samples.len() * output.format.bytes_per_sample(), 0);
+    for (sample, bytes) in samples
+        .iter()
+        .zip(scratch.chunks_exact_mut(output.format.bytes_per_sample()))
+    {
+        let value = quantize_float(*sample, bits)?;
+        match output.format {
+            DeviceFormat::S16Le => bytes.copy_from_slice(&(value as i16).to_le_bytes()),
+            DeviceFormat::S24_3Le => bytes.copy_from_slice(&value.to_le_bytes()[..3]),
+            DeviceFormat::S24In32Low => bytes.copy_from_slice(&value.to_le_bytes()),
+            DeviceFormat::S24In32High => bytes.copy_from_slice(&(value << 8).to_le_bytes()),
+            DeviceFormat::S32Le => bytes.copy_from_slice(&value.to_le_bytes()),
+            _ => unreachable!("integer formats validated above"),
+        }
+    }
+    Ok(())
 }
 
 /// A playback the coordinator suspended after a stall timeout: the decoder
@@ -150,6 +215,7 @@ enum WorkerMsg {
     Next,
     SeekFrame(u64),
     SelectDevice(DeviceId),
+    SetFloatToInt(bool),
     StallStop,
     Resume,
     Quit,
@@ -275,6 +341,7 @@ struct Worker<O: AudioOutput> {
     decoder_factory: DecoderFactory,
     device: DeviceId,
     buffers: BufferConfig,
+    float_to_int: bool,
     counters: Arc<OutputCounters>,
     events: Sender<PlayerEvent>,
     msgs: Receiver<WorkerMsg>,
@@ -282,12 +349,13 @@ struct Worker<O: AudioOutput> {
 }
 
 impl<O: AudioOutput> Worker<O> {
-    /// Returns `Err` only for unrecoverable output/decode failures; the
-    /// error propagates to the engine thread result.
+    /// Runs until `Quit` or channel disconnect. Command and playback failures
+    /// are reported as `PlayerEvent::Error` and leave the worker stopped but
+    /// alive: one bad track must never kill the whole engine.
     fn run(mut self) -> Result<(), PlayerError> {
         loop {
             if let Some(msg) = self.pending.take() {
-                if !self.handle(msg)? {
+                if !self.handle_reporting(msg) {
                     return Ok(());
                 }
                 continue;
@@ -295,7 +363,7 @@ impl<O: AudioOutput> Worker<O> {
             if self.playback.is_none() {
                 match self.msgs.recv() {
                     Ok(msg) => {
-                        if !self.handle(msg)? {
+                        if !self.handle_reporting(msg) {
                             return Ok(());
                         }
                     }
@@ -304,7 +372,7 @@ impl<O: AudioOutput> Worker<O> {
             } else {
                 match self.msgs.recv_timeout(WORKER_WAIT) {
                     Ok(msg) => {
-                        if !self.handle(msg)? {
+                        if !self.handle_reporting(msg) {
                             return Ok(());
                         }
                     }
@@ -322,7 +390,9 @@ impl<O: AudioOutput> Worker<O> {
                                         frame: playback.span_written,
                                     });
                                 }
-                                self.start_next()?;
+                                if let Err(error) = self.start_next() {
+                                    self.report_failure(&error);
+                                }
                             }
                             Err(error) => {
                                 if self.may_be_cancel_abort(&error)
@@ -334,20 +404,22 @@ impl<O: AudioOutput> Worker<O> {
                                     // interrupted decode as a clean abort of
                                     // the current operation, never as a
                                     // decode failure.
-                                    if !self.handle(msg)? {
+                                    if !self.handle_reporting(msg) {
                                         return Ok(());
                                     }
                                     continue;
                                 }
                                 self.send_error(&error);
                                 if matches!(error, PlayerError::Decode) {
-                                    self.start_next()?;
+                                    if let Err(error) = self.start_next() {
+                                        self.report_failure(&error);
+                                    }
                                 } else {
                                     self.playback = None;
                                     self.suspended = None;
                                     self.prepared = None;
                                     self.boundary = None;
-                                    self.output.stop()?;
+                                    let _ = self.output.stop();
                                     self.clear_shared_stall();
                                 }
                             }
@@ -363,6 +435,33 @@ impl<O: AudioOutput> Worker<O> {
     /// reported unconditionally.
     fn may_be_cancel_abort(&self, error: &PlayerError) -> bool {
         matches!(error, PlayerError::Decode | PlayerError::Io(_))
+    }
+
+    /// Handle a command, converting failures into an `Error` event plus a
+    /// clean stopped state instead of killing the worker: one bad track must
+    /// not take down the whole engine (regression: `UnsupportedFormat` on
+    /// `Play` froze the player with no error ever shown).
+    fn handle_reporting(&mut self, msg: WorkerMsg) -> bool {
+        let quit = matches!(msg, WorkerMsg::Quit);
+        match self.handle(msg) {
+            Ok(keep_going) => keep_going,
+            Err(error) => {
+                self.report_failure(&error);
+                !quit
+            }
+        }
+    }
+
+    /// Stop output, drop all playback state and report `error`. The worker
+    /// stays alive and keeps accepting commands.
+    fn report_failure(&mut self, error: &PlayerError) {
+        self.playback = None;
+        self.suspended = None;
+        self.prepared = None;
+        self.boundary = None;
+        let _ = self.output.stop();
+        self.clear_shared_stall();
+        self.send_error(error);
     }
 
     /// Handle one coordinator message. Returns `Ok(false)` when the worker
@@ -408,10 +507,19 @@ impl<O: AudioOutput> Worker<O> {
                 self.boundary = None;
                 self.output.stop()?;
                 self.clear_shared_stall();
-                self.device = device.clone();
-                self.output = (self.output_factory)(device)?;
+                // Build the replacement before committing: on factory failure
+                // the previous device/output pair stays consistent.
+                let output = (self.output_factory)(device.clone())?;
+                self.device = device;
+                self.output = output;
                 self.emit(PlayerEvent::Reconfiguring);
                 self.start_next()?;
+                true
+            }
+            WorkerMsg::SetFloatToInt(enabled) => {
+                // Applies on the next configure. An already running stream
+                // keeps its established format until seek/next/restart.
+                self.float_to_int = enabled;
                 true
             }
             WorkerMsg::StallStop => {
@@ -447,6 +555,35 @@ impl<O: AudioOutput> Worker<O> {
         });
     }
 
+    /// Exact F32 is always tried first. Only an explicit compatibility opt-in
+    /// permits quantization to an exact-rate/layout integer device format.
+    fn configure_for_decoder(
+        &mut self,
+        decoder: &dyn Decoder,
+    ) -> Result<(OutputSpec, bool), PlayerError> {
+        if let Some(dsd) = decoder.dsd_spec() {
+            return self.output.configure_dsd(&dsd, self.buffers).map(|output| (output, false));
+        }
+        let decoded = decoder.spec();
+        let original = match self.output.configure(&decoded, self.buffers) {
+            Ok(output) => return Ok((output, false)),
+            Err(error) if self.float_to_int
+                && decoded.encoding == SampleEncoding::F32
+                && matches!(error, PlayerError::UnsupportedFormat { .. }) => error,
+            Err(error) => return Err(error),
+        };
+        for encoding in [SampleEncoding::S32, SampleEncoding::S24, SampleEncoding::S16] {
+            let integer = StreamSpec { encoding, ..decoded };
+            match self.output.configure(&integer, self.buffers) {
+                Ok(output) if output.stream_compatible(&integer) => return Ok((output, true)),
+                Ok(_) => return Err(PlayerError::Output),
+                Err(PlayerError::UnsupportedFormat { .. }) => {}
+                Err(error) => return Err(error),
+            }
+        }
+        Err(original)
+    }
+
     fn start_next(&mut self) -> Result<(), PlayerError> {
         self.playback = None;
         self.suspended = None;
@@ -464,7 +601,15 @@ impl<O: AudioOutput> Worker<O> {
                     self.emit(PlayerEvent::EndOfQueue);
                     return Ok(());
                 };
-                let opened = (self.decoder_factory)(&track.path)?;
+                let opened = match (self.decoder_factory)(&track.path) {
+                    Ok(opened) => opened,
+                    Err(error) => {
+                        // Attribute the failure to the track that could not be
+                        // opened so the Error event names it.
+                        self.current = Some(track);
+                        return Err(error);
+                    }
+                };
                 (track, opened.decoder, opened.stall)
             };
             if decoder.dsd_spec().is_some() && track.cue_range.is_some() {
@@ -485,10 +630,7 @@ impl<O: AudioOutput> Worker<O> {
         self.current = Some(track.clone());
         self.publish_track(track.id, stall);
         self.emit(PlayerEvent::Reconfiguring);
-        let output_spec = match dsd {
-            Some(dsd) => self.output.configure_dsd(&dsd, self.buffers)?,
-            None => self.output.configure(&decoder.spec(), self.buffers)?,
-        };
+        let (output_spec, converted) = self.configure_for_decoder(decoder.as_ref())?;
         let (producer, consumer) =
             rtrb::RingBuffer::new(self.ring_bytes(output_spec.bytes_per_frame()));
         let mut playback = Playback {
@@ -502,7 +644,7 @@ impl<O: AudioOutput> Worker<O> {
             scratch: Vec::new(),
             pending_offset: 0,
             pending_frames: 0,
-            packing: Packing::for_output(&output_spec),
+            packing: Packing::for_output(&output_spec, converted),
         };
         self.counters = Arc::new(OutputCounters::default());
         self.prefill(&mut playback)?;
@@ -510,6 +652,7 @@ impl<O: AudioOutput> Worker<O> {
         self.emit(PlayerEvent::Playing {
             track: track.id,
             output: output_spec,
+            converted,
         });
         self.emit(PlayerEvent::Tags {
             track: track.id,
@@ -538,13 +681,10 @@ impl<O: AudioOutput> Worker<O> {
         self.output.stop()?;
         // `seek_to_frame` counts per-channel DSD bytes for DSD decoders, so
         // the seek target needs no unit conversion.
-        let output_spec = match decoder.dsd_spec() {
-            Some(dsd) => self.output.configure_dsd(&dsd, self.buffers)?,
-            None => self.output.configure(&decoder.spec(), self.buffers)?,
-        };
+        let (output_spec, converted) = self.configure_for_decoder(decoder.as_ref())?;
         let (producer, consumer) =
             rtrb::RingBuffer::new(self.ring_bytes(output_spec.bytes_per_frame()));
-        let packing = Packing::for_output(&output_spec);
+        let packing = Packing::for_output(&output_spec, converted);
         let mut playback = Playback {
             decoder,
             producer,
@@ -608,10 +748,7 @@ impl<O: AudioOutput> Worker<O> {
         }
         decoder.seek_to_frame(target)?;
         self.emit(PlayerEvent::Reconfiguring);
-        let output_spec = match decoder.dsd_spec() {
-            Some(dsd) => self.output.configure_dsd(&dsd, self.buffers)?,
-            None => self.output.configure(&decoder.spec(), self.buffers)?,
-        };
+        let (output_spec, converted) = self.configure_for_decoder(decoder.as_ref())?;
         let (producer, consumer) =
             rtrb::RingBuffer::new(self.ring_bytes(output_spec.bytes_per_frame()));
         let mut playback = Playback {
@@ -625,7 +762,7 @@ impl<O: AudioOutput> Worker<O> {
             scratch: Vec::new(),
             pending_offset: 0,
             pending_frames: 0,
-            packing: Packing::for_output(&output_spec),
+            packing: Packing::for_output(&output_spec, converted),
         };
         self.counters = Arc::new(OutputCounters::default());
         self.prefill(&mut playback)?;
@@ -635,6 +772,7 @@ impl<O: AudioOutput> Worker<O> {
             self.emit(PlayerEvent::Playing {
                 track: track.id,
                 output: output_spec,
+                converted,
             });
         }
         Ok(())
@@ -721,6 +859,7 @@ impl<O: AudioOutput> Worker<O> {
             self.emit(PlayerEvent::Playing {
                 track,
                 output: playback.output.clone(),
+                converted: playback.packing.converted(),
             });
         }
     }
@@ -809,7 +948,7 @@ impl<O: AudioOutput> Worker<O> {
                 (None, None) => playback.decoder.spec() == prepared.decoder.spec(),
                 _ => false,
             };
-            if same_spec {
+            if same_spec && (self.float_to_int || !playback.packing.converted()) {
                 // CUE never applies to DSD; hand the track to start_next,
                 // which reports the error and skips it.
                 if prepared.decoder.dsd_spec().is_some() && prepared.track.cue_range.is_some() {
@@ -905,6 +1044,7 @@ pub struct PlayerEngine<O: AudioOutput> {
     decoder_factory: DecoderFactory,
     device: DeviceId,
     buffers: BufferConfig,
+    float_to_int: bool,
     events: Sender<PlayerEvent>,
     stall_timeout: Duration,
 }
@@ -915,6 +1055,7 @@ impl<O: AudioOutput + 'static> PlayerEngine<O> {
         output_factory: OutputFactory<O>,
         device: DeviceId,
         buffers: BufferConfig,
+        float_to_int: bool,
         decoder_factory: DecoderFactory,
         events: Sender<PlayerEvent>,
         stall_timeout: Duration,
@@ -924,6 +1065,7 @@ impl<O: AudioOutput + 'static> PlayerEngine<O> {
             output_factory,
             decoder_factory,
             device,
+            float_to_int,
             buffers,
             events,
             stall_timeout,
@@ -949,6 +1091,7 @@ impl<O: AudioOutput + 'static> PlayerEngine<O> {
             decoder_factory: self.decoder_factory,
             device: self.device,
             buffers: self.buffers,
+            float_to_int: self.float_to_int,
             counters: Arc::new(OutputCounters::default()),
             events: self.events.clone(),
             msgs: msg_rx,
@@ -1026,6 +1169,7 @@ impl Coordinator {
                 self.cancel_current();
                 WorkerMsg::SelectDevice(device)
             }
+            PlayerCommand::SetFloatToInt(enabled) => WorkerMsg::SetFloatToInt(enabled),
             PlayerCommand::Quit => {
                 self.cancel_current();
                 WorkerMsg::Quit
@@ -1216,6 +1360,7 @@ mod tests {
         next_frame: u64,
         block_frames: u32,
         silence: Vec<i16>,
+        silence_f32: Vec<f32>,
         /// Per-block DSD byte pattern, indexed by in-block byte position.
         dsd_data: Vec<u8>,
         seeks: Arc<Mutex<Vec<u64>>>,
@@ -1256,11 +1401,13 @@ mod tests {
                 )));
             }
             let channels = self.spec.layout.channels as usize;
-            Ok(Some(DecodedBlock::pcm_block(
-                self.spec,
-                frames,
-                DecodedPcm::I16(&self.silence[..frames as usize * channels]),
-            )))
+            let samples = frames as usize * channels;
+            let pcm = if self.spec.encoding == SampleEncoding::F32 {
+                DecodedPcm::F32(&self.silence_f32[..samples])
+            } else {
+                DecodedPcm::I16(&self.silence[..samples])
+            };
+            Ok(Some(DecodedBlock::pcm_block(self.spec, frames, pcm)))
         }
 
         fn seek_to_frame(&mut self, frame: u64) -> Result<u64, PlayerError> {
@@ -1327,14 +1474,24 @@ mod tests {
             _buffers: BufferConfig,
         ) -> Result<OutputSpec, PlayerError> {
             self.calls.lock().configures += 1;
+            let (format, valid_bits) = match input.encoding {
+                SampleEncoding::S16 => (DeviceFormat::S16Le, 16),
+                SampleEncoding::S32 => (DeviceFormat::S32Le, 32),
+                _ => return Err(PlayerError::UnsupportedFormat {
+                    rate_hz: input.rate_hz,
+                    channels: input.layout.channels,
+                    encoding: input.encoding,
+                    reason: "fake output supports only S16/S32",
+                }),
+            };
             self.frame_bytes
                 .store(input.bytes_per_frame() as u64, Ordering::Relaxed);
             Ok(OutputSpec {
                 device: "fake".to_owned(),
                 rate_hz: input.rate_hz,
                 layout: input.layout,
-                format: DeviceFormat::S16Le,
-                valid_bits: 16,
+                format,
+                valid_bits,
             })
         }
 
@@ -1526,6 +1683,11 @@ mod tests {
                         next_frame: 0,
                         block_frames,
                         silence,
+                        silence_f32: if spec.encoding == SampleEncoding::F32 {
+                            vec![0.25; block_frames as usize * spec.layout.channels as usize]
+                        } else {
+                            Vec::new()
+                        },
                         dsd_data,
                         seeks: Arc::clone(&seeks),
                         source: Some(source),
@@ -1539,6 +1701,7 @@ mod tests {
             Box::new(|_| Err(PlayerError::Output)),
             "fake".to_owned(),
             test_buffers(),
+            false,
             decoder_factory,
             event_tx,
             stall_timeout,
@@ -1700,7 +1863,7 @@ mod tests {
         let first = recv_event(&harness.events);
         assert!(matches!(first, PlayerEvent::Reconfiguring));
         let first = recv_event(&harness.events);
-        let PlayerEvent::Playing { track: first_id, output } = first else {
+        let PlayerEvent::Playing { track: first_id, output, .. } = first else {
             panic!("expected Playing, got {first:?}");
         };
         assert_eq!(output.rate_hz, 44_100);
@@ -2607,6 +2770,256 @@ mod tests {
         );
         drop(drained);
 
+        harness.commands.send(PlayerCommand::Quit).unwrap();
+        harness.join().unwrap();
+    }
+
+    #[test]
+    fn unplayable_track_reports_error_and_engine_survives() {
+        // Regression: a track that failed to open killed the worker silently
+        // — no Error event, every later command ignored, UI frozen until quit.
+        let mut plan = HashMap::new();
+        plan.insert(PathBuf::from("good.flac"), FakeTrack::Pcm(test_spec(44_100), 512));
+        let harness = spawn_engine(plan);
+        enqueue(&harness, "missing.mp3");
+        harness.commands.send(PlayerCommand::Play).unwrap();
+        let error = recv_until(&harness.events, |event| {
+            matches!(event, PlayerEvent::Error { kind: PlayerError::Decode, .. })
+        });
+        assert!(
+            matches!(error, PlayerEvent::Error { track: Some(1), .. }),
+            "error must name the failing track"
+        );
+        // The engine still accepts commands: a good track plays afterwards.
+        enqueue(&harness, "good.flac");
+        harness.commands.send(PlayerCommand::Play).unwrap();
+        recv_until(&harness.events, |event| {
+            matches!(event, PlayerEvent::Playing { track: 2, .. })
+        });
+        harness.commands.send(PlayerCommand::Quit).unwrap();
+        harness.join().unwrap();
+    }
+
+    #[test]
+    fn unsupported_f32_reports_error_and_next_plays() {
+        // An integer-only endpoint rejects f32 at configure time. The error
+        // must be visible immediately and a subsequent S16 track must play.
+        let mut plan = HashMap::new();
+        let mut float = test_spec(44_100);
+        float.encoding = SampleEncoding::F32;
+        plan.insert(PathBuf::from("float.mp3"), FakeTrack::Pcm(float, 512));
+        plan.insert(PathBuf::from("good.wav"), FakeTrack::Pcm(test_spec(44_100), 512));
+        let harness = spawn_engine(plan);
+        enqueue(&harness, "float.mp3");
+        enqueue(&harness, "good.wav");
+        harness.commands.send(PlayerCommand::Play).unwrap();
+        let error = recv_until(&harness.events, |event| {
+            matches!(event, PlayerEvent::Error { kind: PlayerError::UnsupportedFormat { .. }, .. })
+        });
+        assert!(matches!(error, PlayerEvent::Error { track: Some(1), .. }));
+        harness.commands.send(PlayerCommand::Next).unwrap();
+        recv_until(&harness.events, |event| {
+            matches!(event, PlayerEvent::Playing { track: 2, .. })
+        });
+        harness.commands.send(PlayerCommand::Quit).unwrap();
+        harness.join().unwrap();
+    }
+
+    #[test]
+    fn failing_auto_advance_reports_error_and_engine_survives() {
+        // Same regression through the automatic queue advance: the good first
+        // track ends, advancing into the broken one must report, not die.
+        let mut plan = HashMap::new();
+        plan.insert(PathBuf::from("a.flac"), FakeTrack::Pcm(test_spec(44_100), 512));
+        plan.insert(PathBuf::from("b.flac"), FakeTrack::Pcm(test_spec(44_100), 512));
+        let harness = spawn_engine(plan);
+        enqueue(&harness, "a.flac");
+        enqueue(&harness, "missing.mp3");
+        harness.commands.send(PlayerCommand::Play).unwrap();
+        recv_until(&harness.events, |event| {
+            matches!(event, PlayerEvent::Error { kind: PlayerError::Decode, .. })
+        });
+        // a.flac may finish before these arrive; the queue can empty and
+        // restart track ids, so accept the next Playing whatever its id.
+        enqueue(&harness, "b.flac");
+        harness.commands.send(PlayerCommand::Play).unwrap();
+        recv_until(&harness.events, |event| {
+            matches!(event, PlayerEvent::Playing { .. })
+        });
+        harness.commands.send(PlayerCommand::Quit).unwrap();
+        harness.join().unwrap();
+    }
+
+    #[test]
+    fn float_compatibility_quantizes_and_preserves_channel_order() {
+        let spec = StreamSpec { encoding: SampleEncoding::F32, ..test_spec(44_100) };
+        let output = OutputSpec {
+            device: "fake".to_owned(),
+            rate_hz: spec.rate_hz,
+            layout: spec.layout,
+            format: DeviceFormat::S32Le,
+            valid_bits: 32,
+        };
+        let samples = [-1.0, 1.0, 0.5, -0.5, 0.25, -0.25, 2.0, -2.0];
+        let block = DecodedBlock::pcm_block(spec, 4, DecodedPcm::F32(&samples));
+        let mut bytes = Vec::new();
+        pack_float_to_int(block, &output, &mut bytes).unwrap();
+        let actual: Vec<i32> = bytes
+            .chunks_exact(4)
+            .map(|chunk| i32::from_le_bytes(chunk.try_into().unwrap()))
+            .collect();
+        assert_eq!(actual, [
+            i32::MIN, i32::MAX, 1_073_741_824, -1_073_741_824,
+            536_870_912, -536_870_912, i32::MAX, i32::MIN,
+        ]);
+        assert_eq!(quantize_float(1.0 / 65_536.0, 16).unwrap(), 0);
+        assert_eq!(quantize_float(3.0 / 65_536.0, 16).unwrap(), 2);
+    }
+
+    #[test]
+    fn float_compatibility_packs_valid_bits_and_rejects_nonfinite() {
+        let spec = StreamSpec { encoding: SampleEncoding::F32, ..test_spec(44_100) };
+        let mut output = OutputSpec {
+            device: "fake".to_owned(),
+            rate_hz: spec.rate_hz,
+            layout: spec.layout,
+            format: DeviceFormat::S24In32High,
+            valid_bits: 24,
+        };
+        let samples = [-1.0, 0.5];
+        let mut bytes = Vec::new();
+        pack_float_to_int(
+            DecodedBlock::pcm_block(spec, 1, DecodedPcm::F32(&samples)),
+            &output,
+            &mut bytes,
+        )
+        .unwrap();
+        assert_eq!(&bytes[..4], &i32::MIN.to_le_bytes());
+        assert_eq!(&bytes[4..], &1_073_741_824_i32.to_le_bytes());
+        output.format = DeviceFormat::S24_3Le;
+        pack_float_to_int(
+            DecodedBlock::pcm_block(spec, 1, DecodedPcm::F32(&samples)),
+            &output,
+            &mut bytes,
+        )
+        .unwrap();
+        assert_eq!(bytes, [0, 0, 0x80, 0, 0, 0x40]);
+        output.format = DeviceFormat::S24In32Low;
+        pack_float_to_int(
+            DecodedBlock::pcm_block(spec, 1, DecodedPcm::F32(&samples)),
+            &output,
+            &mut bytes,
+        )
+        .unwrap();
+        assert_eq!(bytes, [(-8_388_608_i32).to_le_bytes(), 4_194_304_i32.to_le_bytes()].concat());
+        output.format = DeviceFormat::S16Le;
+        output.valid_bits = 16;
+        pack_float_to_int(
+            DecodedBlock::pcm_block(spec, 1, DecodedPcm::F32(&samples)),
+            &output,
+            &mut bytes,
+        )
+        .unwrap();
+        assert_eq!(bytes, [(-32_768_i16).to_le_bytes(), 16_384_i16.to_le_bytes()].concat());
+        assert!(matches!(
+            pack_float_to_int(
+                DecodedBlock::pcm_block(spec, 1, DecodedPcm::F32(&[f32::NAN, 0.0])),
+                &output,
+                &mut bytes,
+            ),
+            Err(PlayerError::Decode)
+        ));
+    }
+
+    #[test]
+    fn opt_in_float_fallback_plays_integer_bytes_and_marks_event() {
+        let mut float = test_spec(44_100);
+        float.encoding = SampleEncoding::F32;
+        let mut plan = HashMap::new();
+        plan.insert(PathBuf::from("float.mp3"), FakeTrack::Pcm(float, 512));
+        let harness = spawn_engine(plan);
+        harness.commands.send(PlayerCommand::SetFloatToInt(true)).unwrap();
+        enqueue(&harness, "float.mp3");
+        harness.commands.send(PlayerCommand::Play).unwrap();
+        let event = recv_until(&harness.events, |event| {
+            matches!(event, PlayerEvent::Playing { .. })
+        });
+        assert!(matches!(event, PlayerEvent::Playing { converted: true, output: OutputSpec { format: DeviceFormat::S32Le, .. }, .. }));
+        recv_until(&harness.events, |event| matches!(event, PlayerEvent::EndOfQueue));
+        let drained = harness.drained.lock();
+        assert_eq!(drained.as_slice(), [536_870_912_i32.to_le_bytes(); 1024].concat());
+        drop(drained);
+        harness.commands.send(PlayerCommand::Quit).unwrap();
+        harness.join().unwrap();
+    }
+
+    #[test]
+    fn converted_seek_reconfigures_and_remains_converted() {
+        let mut float = test_spec(44_100);
+        float.encoding = SampleEncoding::F32;
+        let mut plan = HashMap::new();
+        plan.insert(PathBuf::from("float.mp3"), FakeTrack::Pcm(float, 8192));
+        let harness = spawn_engine(plan);
+        harness.commands.send(PlayerCommand::SetFloatToInt(true)).unwrap();
+        enqueue(&harness, "float.mp3");
+        harness.commands.send(PlayerCommand::Play).unwrap();
+        recv_until(&harness.events, |event| {
+            matches!(event, PlayerEvent::Playing { converted: true, .. })
+        });
+        harness.commands.send(PlayerCommand::SeekFrame(1025)).unwrap();
+        recv_until(&harness.events, |event| {
+            matches!(event, PlayerEvent::Position { frame: 1025, .. })
+        });
+        assert_eq!(harness.calls.lock().starts, 2);
+        harness.commands.send(PlayerCommand::Quit).unwrap();
+        harness.join().unwrap();
+    }
+
+    #[test]
+    fn disabling_compatibility_does_not_convert_next_gapless_track() {
+        let mut float = test_spec(44_100);
+        float.encoding = SampleEncoding::F32;
+        let mut plan = HashMap::new();
+        plan.insert(PathBuf::from("first.mp3"), FakeTrack::Pcm(float, 100_000));
+        plan.insert(PathBuf::from("second.mp3"), FakeTrack::Pcm(float, 512));
+        let harness = spawn_engine(plan);
+        harness.commands.send(PlayerCommand::SetFloatToInt(true)).unwrap();
+        enqueue(&harness, "first.mp3");
+        enqueue(&harness, "second.mp3");
+        harness.commands.send(PlayerCommand::Play).unwrap();
+        recv_until(&harness.events, |event| {
+            matches!(event, PlayerEvent::Playing { track: 1, converted: true, .. })
+        });
+        harness.commands.send(PlayerCommand::SetFloatToInt(false)).unwrap();
+        let error = recv_until(&harness.events, |event| {
+            matches!(event, PlayerEvent::Error { track: Some(2), kind: PlayerError::UnsupportedFormat { .. } })
+        });
+        assert!(matches!(error, PlayerEvent::Error { track: Some(2), .. }));
+        harness.commands.send(PlayerCommand::Quit).unwrap();
+        harness.join().unwrap();
+    }
+
+    #[test]
+    fn adjacent_converted_tracks_stay_gapless_and_labeled() {
+        let mut float = test_spec(44_100);
+        float.encoding = SampleEncoding::F32;
+        let mut plan = HashMap::new();
+        plan.insert(PathBuf::from("first.mp3"), FakeTrack::Pcm(float, 512));
+        plan.insert(PathBuf::from("second.mp3"), FakeTrack::Pcm(float, 512));
+        let harness = spawn_engine(plan);
+        harness.commands.send(PlayerCommand::SetFloatToInt(true)).unwrap();
+        enqueue(&harness, "first.mp3");
+        enqueue(&harness, "second.mp3");
+        harness.commands.send(PlayerCommand::Play).unwrap();
+        recv_until(&harness.events, |event| {
+            matches!(event, PlayerEvent::Playing { track: 1, converted: true, .. })
+        });
+        recv_until(&harness.events, |event| {
+            matches!(event, PlayerEvent::Playing { track: 2, converted: true, .. })
+        });
+        recv_until(&harness.events, |event| matches!(event, PlayerEvent::EndOfQueue));
+        assert_eq!(harness.calls.lock().starts, 1, "same spec should keep one output stream");
+        assert_eq!(harness.drained.lock().as_slice(), [536_870_912_i32.to_le_bytes(); 2048].concat());
         harness.commands.send(PlayerCommand::Quit).unwrap();
         harness.join().unwrap();
     }

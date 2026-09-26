@@ -37,6 +37,26 @@ impl MediaSource for CoreSource {
     }
 }
 
+/// Which scratch buffer holds the current block; determines the encoding.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PcmKind {
+    I16,
+    I24,
+    I32,
+    F32,
+}
+
+impl PcmKind {
+    fn encoding(self) -> SampleEncoding {
+        match self {
+            Self::I16 => SampleEncoding::S16,
+            Self::I24 => SampleEncoding::S24,
+            Self::I32 => SampleEncoding::S32,
+            Self::F32 => SampleEncoding::F32,
+        }
+    }
+}
+
 pub struct SymphoniaDecoder {
     format: Box<dyn FormatReader>,
     decoder: Box<dyn AudioDecoder>,
@@ -47,6 +67,13 @@ pub struct SymphoniaDecoder {
     block_i24: Vec<i32>,
     block_i32: Vec<i32>,
     block_f32: Vec<f32>,
+    block_kind: PcmKind,
+    block_frames: u32,
+    /// The first block was decoded during `open` to learn the encoding and
+    /// is returned by the first `next_block` call.
+    primed: bool,
+    /// False only while probing the first block of an undeclared stream.
+    encoding_known: bool,
 }
 
 impl SymphoniaDecoder {
@@ -92,19 +119,42 @@ impl SymphoniaDecoder {
         )
         .map_err(|_| PlayerError::Decode)?;
 
-        let spec = spec_from_params(&codec_params)?;
-        validate_exact_spec(&spec)?;
-        Ok(Self {
+        let mut result = Self {
             format,
             decoder,
             track_id,
-            spec,
+            spec: spec_from_params(&codec_params)?,
             position: 0,
             block_i16: Vec::new(),
             block_i24: Vec::new(),
             block_i32: Vec::new(),
             block_f32: Vec::new(),
-        })
+            block_kind: PcmKind::I16,
+            block_frames: 0,
+            primed: false,
+            encoding_known: false,
+        };
+        // Establish the EXACT sample encoding before the engine negotiates
+        // the output: from the container's declared sample format when
+        // present, otherwise by decoding the first block (the same priming
+        // the FFmpeg decoder does). Claiming a fixed encoding here mis-
+        // configures the device and every block is then rejected at packing.
+        match codec_params.sample_format {
+            Some(format) => {
+                result.spec.encoding = encoding_of_sample_format(format)
+                    .ok_or(PlayerError::Decode)?;
+            }
+            None => {
+                if !result.decode_next()? {
+                    return Err(PlayerError::Decode);
+                }
+                result.spec.encoding = result.block_kind.encoding();
+                result.primed = true;
+            }
+        }
+        result.encoding_known = true;
+        validate_exact_spec(&result.spec)?;
+        Ok(result)
     }
 }
 
@@ -114,78 +164,27 @@ impl Decoder for SymphoniaDecoder {
     }
 
     fn next_block(&mut self) -> Result<Option<DecodedBlock<'_>>, PlayerError> {
-        loop {
-            let packet = match self.format.next_packet() {
-                Ok(Some(packet)) => packet,
-                Ok(None) => return Ok(None),
-                Err(_) => return Err(PlayerError::Decode),
-            };
-            if packet.track_id != self.track_id {
-                continue;
-            }
-
-            let decoded = self
-                .decoder
-                .decode(&packet)
-                .map_err(|_| PlayerError::Decode)?;
-            let frames = decoded.frames();
-            let spec = match decoded.spec().rate() {
-                rate if rate == self.spec.rate_hz => self.spec,
-                _ => return Err(PlayerError::Decode),
-            };
-            self.position += frames as u64;
-
-            match decoded {
-                symphonia::core::audio::GenericAudioBufferRef::S16(buffer) => {
-                    self.block_i16.clear();
-                    self.block_i16.reserve(buffer.samples_interleaved());
-                    buffer.copy_to_vec_interleaved(&mut self.block_i16);
-                    return Ok(Some(DecodedBlock::pcm_block(
-                        spec,
-                        frames as u32,
-                        DecodedPcm::I16(&self.block_i16),
-                    )));
-                }
-                symphonia::core::audio::GenericAudioBufferRef::S24(buffer) => {
-                    self.block_i24.clear();
-                    self.block_i24.reserve(buffer.samples_interleaved());
-                    for plane_index in 0..buffer.num_planes() {
-                        let plane = buffer.plane(plane_index).ok_or(PlayerError::Decode)?;
-                        for &sample in plane {
-                            self.block_i24.push(sample.inner());
-                        }
-                    }
-                    return Ok(Some(DecodedBlock::pcm_block(
-                        spec,
-                        frames as u32,
-                        DecodedPcm::I24(&self.block_i24),
-                    )));
-                }
-                symphonia::core::audio::GenericAudioBufferRef::S32(buffer) => {
-                    self.block_i32.clear();
-                    self.block_i32.reserve(buffer.samples_interleaved());
-                    buffer.copy_to_vec_interleaved(&mut self.block_i32);
-                    return Ok(Some(DecodedBlock::pcm_block(
-                        spec,
-                        frames as u32,
-                        DecodedPcm::I32(&self.block_i32),
-                    )));
-                }
-                symphonia::core::audio::GenericAudioBufferRef::F32(buffer) => {
-                    self.block_f32.clear();
-                    self.block_f32.reserve(buffer.samples_interleaved());
-                    buffer.copy_to_vec_interleaved(&mut self.block_f32);
-                    return Ok(Some(DecodedBlock::pcm_block(
-                        spec,
-                        frames as u32,
-                        DecodedPcm::F32(&self.block_f32),
-                    )));
-                }
-                _ => return Err(PlayerError::Decode),
-            }
+        if !self.primed && !self.decode_next()? {
+            return Ok(None);
         }
+        self.primed = false;
+        let spec = self.spec;
+        let frames = self.block_frames;
+        Ok(Some(match self.block_kind {
+            PcmKind::I16 => {
+                DecodedBlock::pcm_block(spec, frames, DecodedPcm::I16(&self.block_i16))
+            }
+            PcmKind::I24 => {
+                DecodedBlock::pcm_block(spec, frames, DecodedPcm::I24(&self.block_i24))
+            }
+            PcmKind::I32 => {
+                DecodedBlock::pcm_block(spec, frames, DecodedPcm::I32(&self.block_i32))
+            }
+            PcmKind::F32 => {
+                DecodedBlock::pcm_block(spec, frames, DecodedPcm::F32(&self.block_f32))
+            }
+        }))
     }
-
     fn seek_to_frame(&mut self, frame: u64) -> Result<u64, PlayerError> {
         let seeked = self
             .format
@@ -198,11 +197,78 @@ impl Decoder for SymphoniaDecoder {
             )
             .map_err(|_| PlayerError::Decode)?;
         self.decoder.reset();
+        self.primed = false;
         self.position = seeked.actual_ts.get() as u64;
         Ok(self.position)
     }
 }
 
+impl SymphoniaDecoder {
+    /// Decode one packet into the scratch buffers, recording its kind and
+    /// frame count. Returns `false` at end of stream.
+    fn decode_next(&mut self) -> Result<bool, PlayerError> {
+        loop {
+            let packet = match self.format.next_packet() {
+                Ok(Some(packet)) => packet,
+                Ok(None) => return Ok(false),
+                Err(_) => return Err(PlayerError::Decode),
+            };
+            if packet.track_id != self.track_id {
+                continue;
+            }
+
+            let decoded = self
+                .decoder
+                .decode(&packet)
+                .map_err(|_| PlayerError::Decode)?;
+            let frames = decoded.frames();
+            if decoded.spec().rate() != self.spec.rate_hz {
+                return Err(PlayerError::Decode);
+            }
+            self.position += frames as u64;
+
+            self.block_kind = match decoded {
+                symphonia::core::audio::GenericAudioBufferRef::S16(buffer) => {
+                    self.block_i16.clear();
+                    self.block_i16.reserve(buffer.samples_interleaved());
+                    buffer.copy_to_vec_interleaved(&mut self.block_i16);
+                    PcmKind::I16
+                }
+                symphonia::core::audio::GenericAudioBufferRef::S24(buffer) => {
+                    self.block_i24.clear();
+                    self.block_i24.reserve(buffer.samples_interleaved());
+                    for sample in buffer.iter_interleaved() {
+                        self.block_i24.push(sample.inner());
+                    }
+                    PcmKind::I24
+                }
+                symphonia::core::audio::GenericAudioBufferRef::S32(buffer) => {
+                    self.block_i32.clear();
+                    self.block_i32.reserve(buffer.samples_interleaved());
+                    buffer.copy_to_vec_interleaved(&mut self.block_i32);
+                    PcmKind::I32
+                }
+                symphonia::core::audio::GenericAudioBufferRef::F32(buffer) => {
+                    self.block_f32.clear();
+                    self.block_f32.reserve(buffer.samples_interleaved());
+                    buffer.copy_to_vec_interleaved(&mut self.block_f32);
+                    PcmKind::F32
+                }
+                _ => return Err(PlayerError::Decode),
+            };
+            // Once established, the encoding must not change mid-stream.
+            if self.encoding_known && self.block_kind.encoding() != self.spec.encoding {
+                return Err(PlayerError::Decode);
+            }
+            self.block_frames = frames as u32;
+            return Ok(true);
+        }
+    }
+}
+
+/// Rate and layout from codec parameters. The `encoding` is a placeholder:
+/// `open` always overwrites it from the declared sample format or the first
+/// decoded block before the spec reaches the output negotiation.
 fn spec_from_params(params: &AudioCodecParameters) -> Result<StreamSpec, PlayerError> {
     let rate = params.sample_rate.ok_or(PlayerError::Decode)?;
     let channels = params.channels.as_ref().ok_or(PlayerError::Decode)?;
@@ -219,6 +285,21 @@ fn spec_from_params(params: &AudioCodecParameters) -> Result<StreamSpec, PlayerE
         layout: ChannelLayout::new(count, mask),
         encoding: SampleEncoding::S16,
     })
+}
+
+/// Map a container-declared sample format to an exact-path encoding.
+/// `None`: unsigned, 8-bit or f64 samples have no exact output path here.
+fn encoding_of_sample_format(
+    format: symphonia::core::audio::sample::SampleFormat,
+) -> Option<SampleEncoding> {
+    use symphonia::core::audio::sample::SampleFormat;
+    match format {
+        SampleFormat::S16 => Some(SampleEncoding::S16),
+        SampleFormat::S24 => Some(SampleEncoding::S24),
+        SampleFormat::S32 => Some(SampleEncoding::S32),
+        SampleFormat::F32 => Some(SampleEncoding::F32),
+        _ => None,
+    }
 }
 
 #[cfg(feature = "ffmpeg-lgpl")]
@@ -343,5 +424,87 @@ mod tests {
         let mut decoder = SymphoniaDecoder::open(Box::new(source), Some("wav")).unwrap();
         assert!(decoder.next_block().unwrap().is_some());
         assert!(decoder.next_block().unwrap().is_none());
+    }
+
+    fn wav_header(tag: u16, bits: u16, block_align: u16, data_len: u32) -> Vec<u8> {
+        let mut bytes = Vec::with_capacity(44 + data_len as usize);
+        bytes.extend_from_slice(b"RIFF");
+        bytes.extend_from_slice(&(36 + data_len).to_le_bytes());
+        bytes.extend_from_slice(b"WAVEfmt ");
+        bytes.extend_from_slice(&16_u32.to_le_bytes());
+        bytes.extend_from_slice(&tag.to_le_bytes());
+        bytes.extend_from_slice(&2_u16.to_le_bytes());
+        bytes.extend_from_slice(&44_100_u32.to_le_bytes());
+        bytes.extend_from_slice(&(44_100_u32 * u32::from(block_align)).to_le_bytes());
+        bytes.extend_from_slice(&block_align.to_le_bytes());
+        bytes.extend_from_slice(&bits.to_le_bytes());
+        bytes.extend_from_slice(b"data");
+        bytes.extend_from_slice(&data_len.to_le_bytes());
+        bytes
+    }
+
+    fn f32_wav_fixture() -> Vec<u8> {
+        let samples: [f32; 4] = [0.0, 0.5, -0.5, 0.25];
+        let mut bytes = wav_header(3, 32, 8, (samples.len() * 4) as u32);
+        for sample in samples {
+            bytes.extend_from_slice(&sample.to_le_bytes());
+        }
+        bytes
+    }
+
+    fn s24_wav_fixture() -> Vec<u8> {
+        let samples: [i32; 4] = [0, 1, -1, 0x007F_FFFF];
+        let mut bytes = wav_header(1, 24, 6, (samples.len() * 3) as u32);
+        for sample in samples {
+            bytes.extend_from_slice(&sample.to_le_bytes()[..3]);
+        }
+        bytes
+    }
+
+    #[test]
+    fn f32_wav_reports_f32_and_streams_f32() {
+        // Regression: the spec used to hardcode S16, so the device was
+        // negotiated S16 and every f32 block was rejected at packing.
+        let source = MemorySource {
+            data: std::io::Cursor::new(f32_wav_fixture()),
+        };
+        let mut decoder = SymphoniaDecoder::open(Box::new(source), Some("wav")).unwrap();
+        assert_eq!(decoder.spec().encoding, SampleEncoding::F32);
+        let block = decoder.next_block().unwrap().unwrap();
+        assert_eq!(block.spec.pcm().unwrap().encoding, SampleEncoding::F32);
+        match block.pcm {
+            DecodedPcm::F32(samples) => assert_eq!(samples, [0.0, 0.5, -0.5, 0.25]),
+            other => panic!("expected f32 PCM, got {:?}", other.encoding()),
+        }
+    }
+
+    #[test]
+    fn s24_wav_reports_s24_and_streams_s24() {
+        let source = MemorySource {
+            data: std::io::Cursor::new(s24_wav_fixture()),
+        };
+        let mut decoder = SymphoniaDecoder::open(Box::new(source), Some("wav")).unwrap();
+        assert_eq!(decoder.spec().encoding, SampleEncoding::S24);
+        let block = decoder.next_block().unwrap().unwrap();
+        assert_eq!(block.spec.pcm().unwrap().encoding, SampleEncoding::S24);
+        match block.pcm {
+            DecodedPcm::I24(samples) => assert_eq!(samples, [0, 1, -1, 0x007F_FFFF]),
+            other => panic!("expected s24 PCM, got {:?}", other.encoding()),
+        }
+    }
+
+    #[test]
+    fn mp3_priming_reports_actual_f32_before_output_negotiation() {
+        // The MP3 container does not declare the decoded sample format. A
+        // generated sine fixture catches the old hardcoded-S16 spec: the
+        // engine must see F32 before opening the device.
+        let source = MemorySource {
+            data: std::io::Cursor::new(include_bytes!("fixtures/tone.mp3").to_vec()),
+        };
+        let mut decoder = SymphoniaDecoder::open(Box::new(source), Some("mp3")).unwrap();
+        assert_eq!(decoder.spec().encoding, SampleEncoding::F32);
+        let block = decoder.next_block().unwrap().unwrap();
+        assert!(matches!(block.pcm, DecodedPcm::F32(samples) if samples.iter().any(|&x| x != 0.0)));
+        assert_eq!(block.spec.pcm().unwrap().encoding, SampleEncoding::F32);
     }
 }
