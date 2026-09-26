@@ -1,0 +1,13 @@
+[package]
+name = "sointty-tui"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+sointty-core.workspace = true
+sointty-playlist.workspace = true
+crossbeam-channel.workspace = true
+ratatui.workspace = true
+crossterm.workspace = true

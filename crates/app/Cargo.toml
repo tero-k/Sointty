@@ -1,0 +1,39 @@
+[package]
+name = "sointty"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+sointty-core.workspace = true
+sointty-decode.workspace = true
+sointty-source.workspace = true
+sointty-tui.workspace = true
+sointty-playlist.workspace = true
+sointty-library = { workspace = true, optional = true }
+rtrb.workspace = true
+crossbeam-channel.workspace = true
+serde.workspace = true
+toml.workspace = true
+directories.workspace = true
+audio_thread_priority.workspace = true
+
+[target.'cfg(target_os = "linux")'.dependencies]
+sointty-output-alsa.workspace = true
+sointty-decode = { workspace = true, features = ["opus"] }
+
+[target.'cfg(windows)'.dependencies]
+sointty-output-wasapi.workspace = true
+
+[target.'cfg(target_os = "macos")'.dependencies]
+sointty-output-coreaudio.workspace = true
+
+[features]
+default = []
+library-index = ["dep:sointty-library"]
+# Opt-in; links only audited LGPL FFmpeg installations.
+ffmpeg-lgpl = ["sointty-decode/ffmpeg-lgpl"]
+
+[dev-dependencies]
+parking_lot.workspace = true

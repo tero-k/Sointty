@@ -1,0 +1,13 @@
+[package]
+name = "sointty-output-alsa"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[target.'cfg(target_os = "linux")'.dependencies]
+alsa.workspace = true
+rtrb.workspace = true
+
+[dependencies]
+sointty-core.workspace = true

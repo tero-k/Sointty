@@ -1,0 +1,23 @@
+[package]
+name = "sointty-decode"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+sointty-core.workspace = true
+symphonia.workspace = true
+lofty.workspace = true
+ogg = { workspace = true, optional = true }
+opus = { workspace = true, optional = true }
+ffmpeg-next = { workspace = true, optional = true }
+
+[features]
+# Ogg Opus decoding via native libopus; requires libopus present at build time
+# (pkg-config on Linux). Enabled by the app on Linux only.
+opus = ["dep:ogg", "dep:opus"]
+
+# Links system FFmpeg libraries (normally LGPL-2.1-or-later). Only audited
+# LGPL FFmpeg builds may be distributed; never enable GPL/nonfree libraries.
+ffmpeg-lgpl = ["dep:ffmpeg-next"]

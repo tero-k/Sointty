@@ -1,0 +1,23 @@
+# Rust build artifacts
+/target
+**/*.rs.bk
+
+# Local FFmpeg research/download artifacts (not part of the source tree)
+/ffmpeg_dl
+
+# Library index databases (created only when --index/--reindex is used)
+*.db
+*.db-journal
+*.db-wal
+*.db-shm
+
+# OS noise
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Editor/IDE
+.idea/
+.vscode/
+*.swp
+*.swo

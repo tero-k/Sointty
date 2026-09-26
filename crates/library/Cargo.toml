@@ -1,0 +1,15 @@
+[package]
+name = "sointty-library"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[features]
+default = []
+library-index = []
+
+[dependencies]
+sointty-core.workspace = true
+sointty-decode.workspace = true
+rusqlite.workspace = true
