@@ -2,6 +2,10 @@
 /target
 **/*.rs.bk
 
+
+# Staged release binaries (built locally, never committed)
+/dist
+*.exe
 # Local FFmpeg research/download artifacts (not part of the source tree)
 /ffmpeg_dl
 
