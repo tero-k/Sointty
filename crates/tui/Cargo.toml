@@ -11,3 +11,6 @@ sointty-playlist.workspace = true
 crossbeam-channel.workspace = true
 ratatui.workspace = true
 crossterm.workspace = true
+
+[dev-dependencies]
+parking_lot.workspace = true

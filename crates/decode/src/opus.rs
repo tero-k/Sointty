@@ -313,6 +313,9 @@ impl Decoder for OggOpusDecoder {
     fn spec(&self) -> StreamSpec {
         self.spec
     }
+    fn total_frames(&self) -> Option<u64> {
+        self.total_valid
+    }
 
     fn next_block(&mut self) -> Result<Option<DecodedBlock<'_>>, PlayerError> {
         if self.ended {

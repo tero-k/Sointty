@@ -39,7 +39,38 @@ fn file_kind(path: &Path) -> Option<BrowserItemKind> {
 }
 
 fn sort_by_name(items: &mut [BrowserItem]) {
-    items.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
+    // Case-insensitive like the visible browser, with a raw-name tiebreak so
+    // the order is fully deterministic even for case-variant duplicates.
+    items.sort_by(|a, b| {
+        a.name
+            .to_lowercase()
+            .cmp(&b.name.to_lowercase())
+            .then_with(|| a.name.cmp(&b.name))
+    });
+}
+
+/// Recursively collect every audio file under `dir`, ordered the way the
+/// visible browser lists them: directories first (descending into each),
+/// then files, each level sorted case-insensitively with a raw-name
+/// tiebreak. Playlist files (.m3u/.cue/...) are skipped so a folder add
+/// never duplicates tracks a playlist would expand to. Symlinks are never
+/// followed. Any unreadable descendant fails the whole collection: callers
+/// get either the complete list or an error, never a partial result.
+pub fn collect_audio_files(dir: &Path) -> io::Result<Vec<PathBuf>> {
+    let mut out = Vec::new();
+    collect_into(dir, &mut out)?;
+    Ok(out)
+}
+
+fn collect_into(dir: &Path, out: &mut Vec<PathBuf>) -> io::Result<()> {
+    for item in list_dir(dir)? {
+        match item.kind {
+            BrowserItemKind::Dir => collect_into(&item.path, out)?,
+            BrowserItemKind::Audio => out.push(item.path),
+            BrowserItemKind::Playlist => {}
+        }
+    }
+    Ok(())
 }
 
 /// Lists `dir`: subdirectories first, then audio and playlist files, each
@@ -177,4 +208,55 @@ mod tests {
 
         fs::remove_dir_all(&dir).unwrap();
     }
+    #[test]
+    fn collect_audio_files_recurses_and_skips_playlist_files() {
+        // A tree with nested audio plus CUE/M3U files must yield exactly the
+        // audio tracks, in deterministic browser order, with no duplicates
+        // from the playlist files.
+        let dir = temp_test_dir("collect");
+        fs::create_dir_all(dir.join("nested")).unwrap();
+        fs::write(dir.join("A.flac"), b"").unwrap();
+        fs::write(dir.join("nested").join("b.mp3"), b"").unwrap();
+        fs::write(dir.join("album.cue"), b"").unwrap();
+        fs::write(dir.join("album.m3u8"), b"").unwrap();
+        fs::write(dir.join("notes.txt"), b"").unwrap();
+
+        let collected = collect_audio_files(&dir).unwrap();
+        let names: Vec<&str> = collected
+            .iter()
+            .map(|path| path.file_name().unwrap().to_str().unwrap())
+            .collect();
+        // Directories descend first: nested/b.mp3 precedes the top-level
+        // A.flac, matching the visible browser's dir-first grouping.
+        assert_eq!(names, ["b.mp3", "A.flac"]);
+
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn collect_audio_files_deterministic_with_case_variants() {
+        let dir = temp_test_dir("collect-case");
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("b.FLAC"), b"").unwrap();
+        fs::write(dir.join("A.flac"), b"").unwrap();
+
+        let first = collect_audio_files(&dir).unwrap();
+        let second = collect_audio_files(&dir).unwrap();
+        assert_eq!(first, second);
+        let names: Vec<&str> = first
+            .iter()
+            .map(|path| path.file_name().unwrap().to_str().unwrap())
+            .collect();
+        assert_eq!(names, ["A.flac", "b.FLAC"]);
+
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn collect_audio_files_fails_on_missing_subtree() {
+        let dir = temp_test_dir("collect-missing");
+        // Never created: the whole collection must fail, no partial list.
+        assert!(collect_audio_files(&dir).is_err());
+    }
+
 }

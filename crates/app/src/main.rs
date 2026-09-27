@@ -1,24 +1,26 @@
 // Player engine is platform-agnostic; driven by ALSA wiring on Linux and by
 // unit tests everywhere.
-#[cfg(any(target_os = "linux", windows, test))]
+#[cfg(any(target_os = "linux", windows, target_os = "macos", test))]
 mod player;
+mod locations;
+mod playlists;
 
 use std::path::PathBuf;
 use std::process::ExitCode;
 
-#[cfg(any(target_os = "linux", windows))]
-use sointty_core::{BufferConfig, PlayerCommand, QueueEntry};
+#[cfg(any(target_os = "linux", windows, target_os = "macos"))]
+use sointty_core::{PlayerCommand, QueueEntry};
 use sointty_core::{DeviceId, PlayerError};
 
-#[cfg(any(target_os = "linux", windows))]
+#[cfg(any(target_os = "linux", windows, target_os = "macos"))]
 use player::PlayerEngine;
 #[cfg(target_os = "linux")]
 use sointty_output_alsa::AlsaOutput;
 #[cfg(windows)]
 use sointty_output_wasapi::WasapiOutput;
 
-#[cfg(target_os = "linux")]
-const DEFAULT_DEVICE: &str = "hw:0,0";
+/// Fallback output on OS-es with a system default device. Linux resolves
+/// the first `hw:` endpoint dynamically instead.
 #[cfg(not(target_os = "linux"))]
 const DEFAULT_DEVICE: &str = "default";
 
@@ -140,6 +142,8 @@ struct Config {
     period_frames: Option<u32>,
     buffer_frames: Option<u32>,
     float_to_int: Option<bool>,
+    /// Last successfully browsed directory; restored on the next launch.
+    last_browser_dir: Option<PathBuf>,
 }
 
 fn config_path() -> Option<PathBuf> {
@@ -163,6 +167,18 @@ fn load_config() -> Config {
     }
 }
 
+/// Load before mutating persistent settings. An invalid or unreadable file
+/// must stay untouched rather than being replaced by defaults.
+fn load_config_strict() -> Result<Config, String> {
+    let path = config_path().ok_or("no platform config directory available")?;
+    let text = match std::fs::read_to_string(&path) {
+        Ok(text) => text,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Config::default()),
+        Err(error) => return Err(format!("{}: {error}", path.display())),
+    };
+    toml::from_str(&text).map_err(|error| format!("{}: {error}", path.display()))
+}
+
 fn save_config(config: &Config) -> std::io::Result<()> {
     let Some(path) = config_path() else {
         return Ok(());
@@ -174,27 +190,65 @@ fn save_config(config: &Config) -> std::io::Result<()> {
     std::fs::write(&path, text)
 }
 
-/// Playback settings after applying config file and CLI overrides.
+/// Playback settings after applying config file and CLI overrides. Timing
+/// fields stay optional: `None` means the engine derives rate-relative
+/// defaults per track.
 struct Settings {
     device: DeviceId,
-    period_frames: u32,
-    buffer_frames: u32,
+    period_frames: Option<u32>,
+    buffer_frames: Option<u32>,
     float_to_int: bool,
 }
 
-fn resolve_settings(cli: &Cli, config: &Config) -> Settings {
-    Settings {
-        device: cli
-            .device
-            .clone()
-            .or_else(|| config.device.clone())
-            .unwrap_or_else(|| DEFAULT_DEVICE.to_owned()),
-        period_frames: cli.period_frames.or(config.period_frames).unwrap_or(2_205),
-        buffer_frames: cli.buffer_frames.or(config.buffer_frames).unwrap_or(8_820),
-        float_to_int: cli.float_to_int.or(config.float_to_int).unwrap_or(false),
-    }
+/// Linux automatic output: the first available direct `hw:` endpoint.
+#[cfg(any(target_os = "linux", test))]
+fn pick_linux_default(devices: &[(DeviceId, String)]) -> Result<DeviceId, PlayerError> {
+    devices
+        .iter()
+        .map(|(id, _)| id.clone())
+        .next()
+        .ok_or(PlayerError::InvalidInput(
+            "no direct hardware endpoint found; pass --device explicitly",
+        ))
 }
 
+fn resolve_settings(cli: &Cli, config: &Config) -> Result<Settings, PlayerError> {
+    let period_frames = cli.period_frames.or(config.period_frames);
+    let buffer_frames = cli.buffer_frames.or(config.buffer_frames);
+    if period_frames == Some(0) {
+        return Err(PlayerError::InvalidInput("period frames must be positive"));
+    }
+    if buffer_frames == Some(0) {
+        return Err(PlayerError::InvalidInput("buffer frames must be positive"));
+    }
+    if let Some(period) = period_frames {
+        let minimum = period.checked_mul(2).ok_or(PlayerError::InvalidInput(
+            "period frames too large for twice-period buffer",
+        ))?;
+        if let Some(buffer) = buffer_frames && buffer < minimum {
+            return Err(PlayerError::InvalidInput(
+                "buffer frames must be at least twice the period frames",
+            ));
+        }
+    }
+    #[cfg(target_os = "linux")]
+    let device = match cli.device.clone().or_else(|| config.device.clone()) {
+        Some(device) => device,
+        None => pick_linux_default(&list_devices()?)?,
+    };
+    #[cfg(not(target_os = "linux"))]
+    let device = cli
+        .device
+        .clone()
+        .or_else(|| config.device.clone())
+        .unwrap_or_else(|| DEFAULT_DEVICE.to_owned());
+    Ok(Settings {
+        device,
+        period_frames,
+        buffer_frames,
+        float_to_int: cli.float_to_int.or(config.float_to_int).unwrap_or(false),
+    })
+}
 /// Parse `/proc/asound/pcm` into selectable `hw:CARD,DEV` playback endpoints.
 /// Lines look like `00-00: ALC892 Analog : ALC892 Analog : playback 1 : capture 1`;
 /// entries without a playback stream are skipped.
@@ -231,8 +285,12 @@ fn list_devices() -> Result<Vec<(DeviceId, String)>, PlayerError> {
 fn list_devices() -> Result<Vec<(DeviceId, String)>, PlayerError> {
     WasapiOutput::list_devices()
 }
+#[cfg(target_os = "macos")]
+fn list_devices() -> Result<Vec<(DeviceId, String)>, PlayerError> {
+    sointty_output_coreaudio::CoreAudioOutput::list_devices()
+}
 
-#[cfg(any(target_os = "linux", windows))]
+#[cfg(any(target_os = "linux", windows, target_os = "macos"))]
 fn print_devices() -> Result<(), PlayerError> {
     for (id, name) in list_devices()? {
         println!("{id}\t{name}");
@@ -240,32 +298,25 @@ fn print_devices() -> Result<(), PlayerError> {
     Ok(())
 }
 
-#[cfg(not(any(target_os = "linux", windows)))]
-fn print_devices() -> Result<(), PlayerError> {
-    Err(PlayerError::InvalidInput(
-        "device listing is not available on this OS",
-    ))
-}
-
-#[cfg(any(target_os = "linux", windows))]
+#[cfg(any(target_os = "linux", windows, target_os = "macos"))]
 fn device_provider() -> sointty_tui::DeviceProvider {
     Box::new(|| list_devices().unwrap_or_default())
 }
 
 /// Persists a TUI device pick; other config fields are preserved.
-#[cfg(any(target_os = "linux", windows))]
+#[cfg(any(target_os = "linux", windows, target_os = "macos"))]
 fn device_saver() -> sointty_tui::DeviceSaver {
     Box::new(|device| {
-        let mut config = load_config();
+        let mut config = load_config_strict()?;
         config.device = Some(device.clone());
         save_config(&config).map_err(|error| error.to_string())
     })
 }
 
-#[cfg(any(target_os = "linux", windows))]
+#[cfg(any(target_os = "linux", windows, target_os = "macos"))]
 fn float_to_int_saver() -> sointty_tui::FloatCompatibilitySaver {
     Box::new(|enabled| {
-        let mut config = load_config();
+        let mut config = load_config_strict()?;
         config.float_to_int = Some(enabled);
         save_config(&config).map_err(|error| error.to_string())
     })
@@ -323,7 +374,7 @@ fn run_index_dispatch(cli: &Cli) -> Result<bool, PlayerError> {
     }
 }
 
-#[cfg(any(target_os = "linux", windows))]
+#[cfg(any(target_os = "linux", windows, target_os = "macos"))]
 fn is_playlist_path(path: &std::path::Path) -> bool {
     path.extension()
         .and_then(|ext| ext.to_str())
@@ -344,8 +395,34 @@ fn open_output(device: &DeviceId) -> Result<AlsaOutput, PlayerError> {
 fn open_output(device: &DeviceId) -> Result<WasapiOutput, PlayerError> {
     WasapiOutput::new(device)
 }
+#[cfg(target_os = "macos")]
+fn open_output(device: &DeviceId) -> Result<sointty_output_coreaudio::CoreAudioOutput, PlayerError> {
+    sointty_output_coreaudio::CoreAudioOutput::new(device)
+}
 
-#[cfg(any(target_os = "linux", windows))]
+/// Persists a TUI browser navigation; other config fields are preserved.
+/// A malformed existing config is never overwritten.
+#[cfg(any(target_os = "linux", windows, target_os = "macos"))]
+fn browser_dir_saver() -> sointty_tui::BrowserDirSaver {
+    Box::new(|dir| {
+        let mut config = load_config_strict()?;
+        config.last_browser_dir = Some(dir.to_path_buf());
+        save_config(&config).map_err(|error| error.to_string())
+    })
+}
+
+/// Persists DAC timing overrides; other config fields are preserved.
+#[cfg(any(target_os = "linux", windows, target_os = "macos"))]
+fn timing_saver() -> sointty_tui::TimingSaver {
+    Box::new(|period, buffer| {
+        let mut config = load_config_strict()?;
+        config.period_frames = period;
+        config.buffer_frames = buffer;
+        save_config(&config).map_err(|error| error.to_string())
+    })
+}
+
+#[cfg(any(target_os = "linux", windows, target_os = "macos"))]
 fn run(cli: Cli, settings: Settings) -> Result<(), PlayerError> {
     let (command_tx, command_rx) = crossbeam_channel::unbounded();
     let (event_tx, event_rx) = crossbeam_channel::unbounded();
@@ -363,11 +440,8 @@ fn run(cli: Cli, settings: Settings) -> Result<(), PlayerError> {
         output,
         Box::new(move |device| open_output(&device)),
         device,
-        BufferConfig {
-            period_frames: settings.period_frames,
-            buffer_frames: settings.buffer_frames,
-            ring_frames: settings.buffer_frames.saturating_mul(4).max(4096),
-        },
+        settings.period_frames,
+        settings.buffer_frames,
         settings.float_to_int,
         decoder_factory,
         event_tx,
@@ -401,29 +475,47 @@ fn run(cli: Cli, settings: Settings) -> Result<(), PlayerError> {
             .send(PlayerCommand::Play)
             .map_err(|_| PlayerError::Output)?;
     }
-    let tui = sointty_tui::run(
-        command_tx,
-        event_rx,
+    let config = load_config();
+    let loaded = playlists::load();
+    if let Some(error) = &loaded.read_only_error {
+        eprintln!("sointty: playlists read-only: {error}");
+    }
+    let home_dir = directories::BaseDirs::new().map(|dirs| dirs.home_dir().to_path_buf());
+    let options = sointty_tui::RunOptions {
         open_browser,
-        device_provider(),
-        settings.device.clone(),
-        device_saver(),
-        settings.float_to_int,
-        float_to_int_saver(),
-    );
+        initial_browser_dir: config.last_browser_dir.clone(),
+        home_dir,
+        current_device: settings.device.clone(),
+        float_to_int: settings.float_to_int,
+        timing: (settings.period_frames, settings.buffer_frames),
+        catalog: loaded.catalog,
+        catalog_error: loaded.read_only_error,
+    };
+    let hooks = sointty_tui::Hooks {
+        device_provider: device_provider(),
+        on_device_selected: device_saver(),
+        on_float_to_int_selected: float_to_int_saver(),
+        on_browser_dir: browser_dir_saver(),
+        on_catalog: Box::new(|catalog| playlists::save(catalog)),
+        on_timing: timing_saver(),
+        locations: Box::new(locations::list_locations),
+        map_drive: locations::map_drive_hook(),
+        disconnect_drive: locations::disconnect_drive_hook(),
+        mount_share: locations::mount_share_hook(),
+    };
+    let tui = sointty_tui::run(command_tx, event_rx, options, hooks);
     let player_result = player.join().unwrap_or(Err(PlayerError::Output));
     tui.map_err(|_| PlayerError::Output)?;
     player_result
 }
 
-#[cfg(not(any(target_os = "linux", windows)))]
+#[cfg(not(any(target_os = "linux", windows, target_os = "macos")))]
 fn run(cli: Cli, settings: Settings) -> Result<(), PlayerError> {
     let _ = (cli.files, settings.device, settings.period_frames, settings.buffer_frames, settings.float_to_int);
     Err(PlayerError::InvalidInput(
-        "audio output is not wired for this OS yet; use a Linux or Windows host",
+        "audio output is not wired for this OS yet; use a Linux, Windows or macOS host",
     ))
 }
-
 fn main() -> ExitCode {
     let result = parse_cli().and_then(|cli| {
         if cli.list_devices {
@@ -432,7 +524,7 @@ fn main() -> ExitCode {
         if run_index_dispatch(&cli)? {
             return Ok(());
         }
-        let settings = resolve_settings(&cli, &load_config());
+        let settings = resolve_settings(&cli, &load_config())?;
         run(cli, settings)
     });
     match result {
@@ -498,11 +590,12 @@ mod tests {
             period_frames: Some(512),
             buffer_frames: Some(2048),
             float_to_int: Some(false),
+            ..Config::default()
         };
-        let settings = resolve_settings(&cli, &config);
+        let settings = resolve_settings(&cli, &config).unwrap();
         assert_eq!(settings.device, "hw:1,0");
-        assert_eq!(settings.period_frames, 1024);
-        assert_eq!(settings.buffer_frames, 4096);
+        assert_eq!(settings.period_frames, Some(1024));
+        assert_eq!(settings.buffer_frames, Some(4096));
     }
 
     #[test]
@@ -513,13 +606,54 @@ mod tests {
             period_frames: None,
             buffer_frames: Some(16_384),
             float_to_int: Some(true),
+            ..Config::default()
         };
-        let settings = resolve_settings(&cli, &config);
+        let settings = resolve_settings(&cli, &config).unwrap();
         assert_eq!(settings.device, "usb-dac");
-        assert_eq!(settings.period_frames, 2_205);
-        assert_eq!(settings.buffer_frames, 16_384);
+        // Per-field overrides stay optional; the engine derives the missing
+        // period from the track's rate.
+        assert_eq!(settings.period_frames, None);
+        assert_eq!(settings.buffer_frames, Some(16_384));
         assert!(settings.float_to_int);
     }
+
+    #[test]
+    fn zero_or_undersized_timing_is_a_typed_error() {
+        let zero_period = parse(&["--period-frames", "0"]).unwrap();
+        assert!(matches!(
+            resolve_settings(&zero_period, &Config::default()),
+            Err(PlayerError::InvalidInput(_))
+        ));
+        let zero_buffer = parse(&["--buffer-frames", "0"]).unwrap();
+        assert!(matches!(
+            resolve_settings(&zero_buffer, &Config::default()),
+            Err(PlayerError::InvalidInput(_))
+        ));
+        let undersized = parse(&["--period-frames", "4096", "--buffer-frames", "4096"]).unwrap();
+        assert!(matches!(
+            resolve_settings(&undersized, &Config::default()),
+            Err(PlayerError::InvalidInput(_))
+        ));
+        // A single override is fine: the counterpart is rate-relative.
+        let single = parse(&["--period-frames", "1024"]).unwrap();
+        let settings = resolve_settings(&single, &Config::default()).unwrap();
+        assert_eq!(settings.period_frames, Some(1024));
+        assert_eq!(settings.buffer_frames, None);
+    }
+
+    #[test]
+    fn linux_default_is_first_hardware_endpoint() {
+        let devices = vec![
+            ("hw:0,0".to_owned(), "ALC892 Analog".to_owned()),
+            ("hw:1,0".to_owned(), "USB Audio".to_owned()),
+        ];
+        assert_eq!(pick_linux_default(&devices).unwrap(), "hw:0,0");
+        assert!(matches!(
+            pick_linux_default(&[]),
+            Err(PlayerError::InvalidInput(_))
+        ));
+    }
+
 
     #[test]
     fn config_round_trips_through_toml() {
@@ -528,6 +662,7 @@ mod tests {
             period_frames: Some(4_410),
             buffer_frames: None,
             float_to_int: Some(true),
+            last_browser_dir: Some(PathBuf::from("C:\\Music")),
         };
         let text = toml::to_string_pretty(&config).unwrap();
         let parsed: Config = toml::from_str(&text).unwrap();
@@ -535,16 +670,20 @@ mod tests {
         assert_eq!(parsed.period_frames, Some(4_410));
         assert_eq!(parsed.float_to_int, Some(true));
         assert_eq!(parsed.buffer_frames, None);
+        assert_eq!(parsed.last_browser_dir, Some(PathBuf::from("C:\\Music")));
+        // A pre-existing config without the field still parses.
+        let legacy: Config = toml::from_str("device = \"hw:0,0\"\n").unwrap();
+        assert_eq!(legacy.last_browser_dir, None);
     }
 
     #[test]
     fn float_compatibility_is_opt_in_with_cli_override() {
         let config = Config { float_to_int: Some(true), ..Config::default() };
-        assert!(!resolve_settings(&parse(&[]).unwrap(), &Config::default()).float_to_int);
-        assert!(resolve_settings(&parse(&[]).unwrap(), &config).float_to_int);
-        assert!(!resolve_settings(&parse(&["--no-float-to-int"]).unwrap(), &config).float_to_int);
+        assert!(!resolve_settings(&parse(&[]).unwrap(), &Config::default()).unwrap().float_to_int);
+        assert!(resolve_settings(&parse(&[]).unwrap(), &config).unwrap().float_to_int);
+        assert!(!resolve_settings(&parse(&["--no-float-to-int"]).unwrap(), &config).unwrap().float_to_int);
         let off = Config { float_to_int: Some(false), ..Config::default() };
-        assert!(resolve_settings(&parse(&["--allow-float-to-int"]).unwrap(), &off).float_to_int);
+        assert!(resolve_settings(&parse(&["--allow-float-to-int"]).unwrap(), &off).unwrap().float_to_int);
     }
 
     #[test]

@@ -62,6 +62,7 @@ pub struct SymphoniaDecoder {
     decoder: Box<dyn AudioDecoder>,
     track_id: u32,
     spec: StreamSpec,
+    total_frames: Option<u64>,
     position: u64,
     block_i16: Vec<i16>,
     block_i24: Vec<i32>,
@@ -97,8 +98,7 @@ impl SymphoniaDecoder {
                 MetadataOptions::default(),
             )
             .map_err(|_| PlayerError::Decode)?;
-
-        let (track_id, codec_params) = {
+        let (track_id, codec_params, total_frames) = {
             let track = format
                 .default_track(TrackType::Audio)
                 .or_else(|| format.first_track_known_codec(TrackType::Audio))
@@ -108,7 +108,7 @@ impl SymphoniaDecoder {
                 .clone()
                 .and_then(|params| params.audio().cloned())
                 .ok_or(PlayerError::Decode)?;
-            (track.id, codec_params)
+            (track.id, codec_params, track.num_frames)
         };
         let decoder = (symphonia::default::get_codecs()
             .get_audio_decoder(codec_params.codec)
@@ -132,6 +132,7 @@ impl SymphoniaDecoder {
             block_kind: PcmKind::I16,
             block_frames: 0,
             primed: false,
+            total_frames,
             encoding_known: false,
         };
         // Establish the EXACT sample encoding before the engine negotiates
@@ -161,6 +162,9 @@ impl SymphoniaDecoder {
 impl Decoder for SymphoniaDecoder {
     fn spec(&self) -> StreamSpec {
         self.spec
+    }
+    fn total_frames(&self) -> Option<u64> {
+        self.total_frames
     }
 
     fn next_block(&mut self) -> Result<Option<DecodedBlock<'_>>, PlayerError> {
@@ -403,6 +407,7 @@ mod tests {
             data: std::io::Cursor::new(wav_fixture()),
         };
         let mut decoder = SymphoniaDecoder::open(Box::new(source), Some("wav")).unwrap();
+        assert_eq!(decoder.total_frames(), Some(4));
         let block = decoder.next_block().unwrap().unwrap();
         let block_spec = block.spec.pcm().expect("PCM block");
         assert_eq!(block_spec.rate_hz, 44_100);

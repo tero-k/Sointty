@@ -6,6 +6,7 @@ use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
 
 use crossbeam_channel::{Receiver, Sender};
+use rand::{Rng, seq::SliceRandom};
 use sointty_core::{
     AudioOutput, BufferConfig, Decoder, DecodedBlock, DecodedPcm, DeviceFormat, DeviceId,
     DopPacker, OutputCounters, OutputSpec, PlayerCommand, PlayerError, PlayerEvent, QueueEntry,
@@ -91,6 +92,8 @@ struct Playback {
     decoder: Box<dyn Decoder>,
     producer: rtrb::Producer<u8>,
     output: OutputSpec,
+    /// Timing used for this stream (per-rate defaults plus any overrides).
+    buffers: BufferConfig,
     written_frames: u64,
     /// Absolute source frame the current range starts at (0 for whole-file
     /// tracks); seeks add the requested range-relative frame to this.
@@ -209,6 +212,7 @@ enum Pump {
 /// synthesized by the coordinator's stall monitor, not user commands.
 enum WorkerMsg {
     Enqueue(QueueEntry),
+    SetShuffle(bool),
     Play,
     Pause,
     Stop,
@@ -216,6 +220,10 @@ enum WorkerMsg {
     SeekFrame(u64),
     SelectDevice(DeviceId),
     SetFloatToInt(bool),
+    SetTiming {
+        period_frames: Option<u32>,
+        buffer_frames: Option<u32>,
+    },
     StallStop,
     Resume,
     Quit,
@@ -246,6 +254,17 @@ fn span_remaining(playback: &Playback) -> Option<u64> {
         .end_frames
         .map(|end| end.saturating_sub(playback.span_written))
 }
+/// Bound an advertised file length to the active CUE span. Without a file
+/// length, an explicit CUE end still supplies an exact progress endpoint.
+fn playback_total(playback: &Playback) -> Option<u64> {
+    let file_remaining = playback.decoder.total_frames()
+        .map(|total| total.saturating_sub(playback.start_sample));
+    match playback.end_frames {
+        Some(end) => Some(file_remaining.map_or(end, |remaining| remaining.min(end))),
+        None => file_remaining,
+    }
+}
+
 
 /// Push as many whole wire frames as the ring currently accepts. Returns
 /// `true` when the complete decoded block has entered the ring.
@@ -329,7 +348,16 @@ fn truncate_block(block: DecodedBlock<'_>, frames: u32) -> DecodedBlock<'_> {
 /// freezes command handling.
 struct Worker<O: AudioOutput> {
     queue: VecDeque<QueuedTrack>,
+    /// Shuffle applies to unprepared pending tracks; the imminent preopened
+    /// decoder remains fixed, preserving the gapless boundary.
+    shuffle: bool,
     current: Option<QueuedTrack>,
+    /// Track actually audible right now; during a gapless transition this
+    /// stays the old track until the boundary `Playing` event fires.
+    audible: Option<QueuedTrack>,
+    /// Monotonic ID source; never derived from queue contents, so duplicate
+    /// paths and re-enqueues always get fresh, increasing IDs.
+    next_track_id: TrackId,
     prepared: Option<PreparedNext>,
     boundary: Option<(TrackId, u64)>,
     playback: Option<Playback>,
@@ -340,7 +368,9 @@ struct Worker<O: AudioOutput> {
     output_factory: OutputFactory<O>,
     decoder_factory: DecoderFactory,
     device: DeviceId,
-    buffers: BufferConfig,
+    /// DAC timing overrides; `None` means the rate-relative default.
+    period_frames: Option<u32>,
+    buffer_frames: Option<u32>,
     float_to_int: bool,
     counters: Arc<OutputCounters>,
     events: Sender<PlayerEvent>,
@@ -398,12 +428,9 @@ impl<O: AudioOutput> Worker<O> {
                                 if self.may_be_cancel_abort(&error)
                                     && let Ok(msg) = self.msgs.recv_timeout(ABORT_GRACE)
                                 {
-                                    // A commanded transition (pause/stop/
-                                    // next/seek/device/quit) cancelled a
-                                    // blocked source read; treat the
-                                    // interrupted decode as a clean abort of
-                                    // the current operation, never as a
-                                    // decode failure.
+                                    // A commanded transition cancelled a
+                                    // blocked source read. Process the command
+                                    // instead of reporting a decode failure.
                                     if !self.handle_reporting(msg) {
                                         return Ok(());
                                     }
@@ -417,10 +444,13 @@ impl<O: AudioOutput> Worker<O> {
                                 } else {
                                     self.playback = None;
                                     self.suspended = None;
-                                    self.prepared = None;
+                                    self.unprepare();
                                     self.boundary = None;
                                     let _ = self.output.stop();
                                     self.clear_shared_stall();
+                                    self.current = None;
+                                    self.audible = None;
+                                    self.emit_queue_changed();
                                 }
                             }
                         }
@@ -453,23 +483,78 @@ impl<O: AudioOutput> Worker<O> {
     }
 
     /// Stop output, drop all playback state and report `error`. The worker
-    /// stays alive and keeps accepting commands.
+    /// stays alive and keeps accepting commands. A prepared-but-unplayed
+    /// next track returns to the queue front; it was never consumed.
     fn report_failure(&mut self, error: &PlayerError) {
         self.playback = None;
         self.suspended = None;
-        self.prepared = None;
+        self.unprepare();
         self.boundary = None;
         let _ = self.output.stop();
         self.clear_shared_stall();
         self.send_error(error);
+        self.current = None;
+        self.audible = None;
+        self.emit_queue_changed();
     }
 
+    /// Return a canceled prepared track to the queue front. Called on every
+    /// transition that discards the prepared decoder without playing it, so
+    /// Stop/Pause/Seek/SelectDevice never silently lose a queued track.
+    fn unprepare(&mut self) {
+        if let Some(prepared) = self.prepared.take() {
+            self.queue.push_front(prepared.track);
+        }
+    }
+
+    /// Snapshot the live queue for the UI: the audible track (which lags
+    /// `current` until a gapless boundary actually crosses) plus the pending
+    /// FIFO order — a swapped-in `current` awaiting its boundary, then the
+    /// prepared next, then the rest of the queue, without duplicates.
+    fn emit_queue_changed(&self) {
+        let to_item = |track: &QueuedTrack| sointty_core::QueueItem {
+            id: track.id,
+            entry: QueueEntry {
+                path: track.path.clone(),
+                cue_range: track.cue_range,
+            },
+        };
+        let audible_id = self.audible.as_ref().map(|track| track.id);
+        let mut pending = Vec::new();
+        let mut push_unique = |track: &QueuedTrack| {
+            if Some(track.id) != audible_id && !pending.iter().any(|item: &sointty_core::QueueItem| item.id == track.id) {
+                pending.push(to_item(track));
+            }
+        };
+        if let Some(current) = &self.current {
+            push_unique(current);
+        }
+        if let Some(prepared) = &self.prepared {
+            push_unique(&prepared.track);
+        }
+        for track in &self.queue {
+            push_unique(track);
+        }
+        self.emit(PlayerEvent::QueueChanged {
+            audible: self.audible.as_ref().map(to_item),
+            pending,
+        });
+    }
     /// Handle one coordinator message. Returns `Ok(false)` when the worker
     /// should shut down.
     fn handle(&mut self, msg: WorkerMsg) -> Result<bool, PlayerError> {
         let keep_going = match msg {
             WorkerMsg::Enqueue(entry) => {
                 self.enqueue(entry);
+                self.emit_queue_changed();
+                true
+            }
+            WorkerMsg::SetShuffle(enabled) => {
+                if enabled && !self.shuffle {
+                    self.queue.make_contiguous().shuffle(&mut rand::thread_rng());
+                }
+                self.shuffle = enabled;
+                self.emit_queue_changed();
                 true
             }
             WorkerMsg::Play => {
@@ -481,11 +566,14 @@ impl<O: AudioOutput> Worker<O> {
             WorkerMsg::Pause | WorkerMsg::Stop => {
                 self.playback = None;
                 self.suspended = None;
-                self.prepared = None;
+                self.unprepare();
                 self.boundary = None;
                 self.output.stop()?;
                 self.clear_shared_stall();
+                self.current = None;
+                self.audible = None;
                 self.emit(PlayerEvent::Paused);
+                self.emit_queue_changed();
                 true
             }
             WorkerMsg::Next => {
@@ -503,7 +591,7 @@ impl<O: AudioOutput> Worker<O> {
             WorkerMsg::SelectDevice(device) => {
                 self.playback = None;
                 self.suspended = None;
-                self.prepared = None;
+                self.unprepare();
                 self.boundary = None;
                 self.output.stop()?;
                 self.clear_shared_stall();
@@ -520,6 +608,15 @@ impl<O: AudioOutput> Worker<O> {
                 // Applies on the next configure. An already running stream
                 // keeps its established format until seek/next/restart.
                 self.float_to_int = enabled;
+                true
+            }
+            WorkerMsg::SetTiming {
+                period_frames,
+                buffer_frames,
+            } => {
+                // Applies on the next configure, like SetFloatToInt.
+                self.period_frames = period_frames;
+                self.buffer_frames = buffer_frames;
                 true
             }
             WorkerMsg::StallStop => {
@@ -543,30 +640,83 @@ impl<O: AudioOutput> Worker<O> {
     }
 
     fn enqueue(&mut self, entry: QueueEntry) {
-        let next = self.current.as_ref().map(|track| track.id).unwrap_or(0);
-        let queued = self.queue.iter().map(|track| track.id).max().unwrap_or(0);
-        let id = next.max(queued) + 1;
+        self.next_track_id += 1;
+        let id = self.next_track_id;
         let tags = sointty_decode::tags::read_tags(&entry.path).unwrap_or_default();
-        self.queue.push_back(QueuedTrack {
+        let track = QueuedTrack {
             id,
             path: entry.path,
             cue_range: entry.cue_range,
             tags,
-        });
+        };
+        if self.shuffle {
+            let index = rand::thread_rng().gen_range(0..=self.queue.len());
+            self.queue.insert(index, track);
+        } else {
+            self.queue.push_back(track);
+        }
     }
 
+    /// Buffer timing for one decoder. PCM derives rate-relative defaults and
+    /// applies each present override; with no overrides the default ring
+    /// stands, otherwise the ring covers 4 buffers (min 4096 frames). DSD
+    /// Auto keeps the fixed safe timing (native/DoP candidate rates differ);
+    fn buffers_for(&self, decoder: &dyn Decoder) -> Result<BufferConfig, PlayerError> {
+        let buffers = if decoder.dsd_spec().is_some() {
+            let period = self.period_frames.unwrap_or(2_205);
+            let buffer = self.buffer_frames.unwrap_or(8_820);
+            BufferConfig {
+                period_frames: period,
+                buffer_frames: buffer,
+                ring_frames: buffer.saturating_mul(4).max(4096),
+            }
+        } else {
+            let rate = decoder.spec().rate_hz;
+            if rate == 0 || rate.div_ceil(10).checked_mul(3).is_none() {
+                return Err(PlayerError::InvalidInput("decoded rate is invalid for DAC timing"));
+            }
+            let default = BufferConfig::default_for_rate(rate);
+            let period = self.period_frames.unwrap_or(default.period_frames);
+            let buffer = self.buffer_frames.unwrap_or(default.buffer_frames);
+            let ring = if self.period_frames.is_none() && self.buffer_frames.is_none() {
+                default.ring_frames
+            } else {
+                default.ring_frames.max(buffer.saturating_mul(4)).max(4096)
+            };
+            BufferConfig {
+                period_frames: period,
+                buffer_frames: buffer,
+                ring_frames: ring,
+            }
+        };
+        let minimum = buffers.period_frames.checked_mul(2).ok_or(PlayerError::InvalidInput(
+            "period frames too large for twice-period buffer",
+        ))?;
+        if buffers.period_frames == 0 || buffers.buffer_frames == 0 || buffers.buffer_frames < minimum {
+            return Err(PlayerError::InvalidInput(
+                "buffer frames must be at least twice the positive period frames",
+            ));
+        }
+        Ok(buffers)
+    }
     /// Exact F32 is always tried first. Only an explicit compatibility opt-in
     /// permits quantization to an exact-rate/layout integer device format.
+    /// Returns the output spec, the conversion flag, and the buffer timing
+    /// used, so the caller can size the ring and prefill consistently.
     fn configure_for_decoder(
         &mut self,
         decoder: &dyn Decoder,
-    ) -> Result<(OutputSpec, bool), PlayerError> {
+    ) -> Result<(OutputSpec, bool, BufferConfig), PlayerError> {
+        let buffers = self.buffers_for(decoder)?;
         if let Some(dsd) = decoder.dsd_spec() {
-            return self.output.configure_dsd(&dsd, self.buffers).map(|output| (output, false));
+            return self
+                .output
+                .configure_dsd(&dsd, buffers)
+                .map(|output| (output, false, buffers));
         }
         let decoded = decoder.spec();
-        let original = match self.output.configure(&decoded, self.buffers) {
-            Ok(output) => return Ok((output, false)),
+        let original = match self.output.configure(&decoded, buffers) {
+            Ok(output) => return Ok((output, false, buffers)),
             Err(error) if self.float_to_int
                 && decoded.encoding == SampleEncoding::F32
                 && matches!(error, PlayerError::UnsupportedFormat { .. }) => error,
@@ -574,8 +724,10 @@ impl<O: AudioOutput> Worker<O> {
         };
         for encoding in [SampleEncoding::S32, SampleEncoding::S24, SampleEncoding::S16] {
             let integer = StreamSpec { encoding, ..decoded };
-            match self.output.configure(&integer, self.buffers) {
-                Ok(output) if output.stream_compatible(&integer) => return Ok((output, true)),
+            match self.output.configure(&integer, buffers) {
+                Ok(output) if output.stream_compatible(&integer) => {
+                    return Ok((output, true, buffers));
+                }
                 Ok(_) => return Err(PlayerError::Output),
                 Err(PlayerError::UnsupportedFormat { .. }) => {}
                 Err(error) => return Err(error),
@@ -598,7 +750,9 @@ impl<O: AudioOutput> Worker<O> {
             } else {
                 let Some(track) = self.queue.pop_front() else {
                     self.current = None;
+                    self.audible = None;
                     self.emit(PlayerEvent::EndOfQueue);
+                    self.emit_queue_changed();
                     return Ok(());
                 };
                 let opened = match (self.decoder_factory)(&track.path) {
@@ -630,13 +784,14 @@ impl<O: AudioOutput> Worker<O> {
         self.current = Some(track.clone());
         self.publish_track(track.id, stall);
         self.emit(PlayerEvent::Reconfiguring);
-        let (output_spec, converted) = self.configure_for_decoder(decoder.as_ref())?;
+        let (output_spec, converted, buffers) = self.configure_for_decoder(decoder.as_ref())?;
         let (producer, consumer) =
-            rtrb::RingBuffer::new(self.ring_bytes(output_spec.bytes_per_frame()));
+            rtrb::RingBuffer::new(Self::ring_bytes(buffers, output_spec.bytes_per_frame()));
         let mut playback = Playback {
             decoder,
             producer,
             output: output_spec.clone(),
+            buffers,
             written_frames: 0,
             start_sample,
             end_frames,
@@ -658,13 +813,20 @@ impl<O: AudioOutput> Worker<O> {
             track: track.id,
             tags: track.tags.clone(),
         });
+        self.emit(PlayerEvent::Duration {
+            track: track.id,
+            total_frames: playback_total(&playback),
+        });
+        self.audible = Some(track);
         self.playback = Some(playback);
         self.preopen_next();
+        self.emit_queue_changed();
         Ok(())
     }
 
     fn seek(&mut self, frame: u64) -> Result<(), PlayerError> {
-        self.prepared = None;
+        self.unprepare();
+        self.emit_queue_changed();
         self.boundary = None;
         let Some(playback) = self.playback.take() else {
             return Ok(());
@@ -681,14 +843,15 @@ impl<O: AudioOutput> Worker<O> {
         self.output.stop()?;
         // `seek_to_frame` counts per-channel DSD bytes for DSD decoders, so
         // the seek target needs no unit conversion.
-        let (output_spec, converted) = self.configure_for_decoder(decoder.as_ref())?;
+        let (output_spec, converted, buffers) = self.configure_for_decoder(decoder.as_ref())?;
         let (producer, consumer) =
-            rtrb::RingBuffer::new(self.ring_bytes(output_spec.bytes_per_frame()));
+            rtrb::RingBuffer::new(Self::ring_bytes(buffers, output_spec.bytes_per_frame()));
         let packing = Packing::for_output(&output_spec, converted);
         let mut playback = Playback {
             decoder,
             producer,
             output: output_spec,
+            buffers,
             written_frames: 0,
             start_sample: playback.start_sample,
             end_frames: playback.end_frames,
@@ -748,13 +911,14 @@ impl<O: AudioOutput> Worker<O> {
         }
         decoder.seek_to_frame(target)?;
         self.emit(PlayerEvent::Reconfiguring);
-        let (output_spec, converted) = self.configure_for_decoder(decoder.as_ref())?;
+        let (output_spec, converted, buffers) = self.configure_for_decoder(decoder.as_ref())?;
         let (producer, consumer) =
-            rtrb::RingBuffer::new(self.ring_bytes(output_spec.bytes_per_frame()));
+            rtrb::RingBuffer::new(Self::ring_bytes(buffers, output_spec.bytes_per_frame()));
         let mut playback = Playback {
             decoder,
             producer,
             output: output_spec.clone(),
+            buffers,
             written_frames: resume_frame,
             start_sample: old.start_sample,
             end_frames: old.end_frames,
@@ -774,21 +938,24 @@ impl<O: AudioOutput> Worker<O> {
                 output: output_spec,
                 converted,
             });
+            self.emit(PlayerEvent::Duration {
+                track: track.id,
+                total_frames: self.playback.as_ref().and_then(playback_total),
+            });
         }
         Ok(())
     }
 
-    /// Open the next queued track ahead of time so an end-of-track
-    /// transition can reuse it. A failing track is reported and dropped,
-    /// retrying the following entry once; current playback is unaffected.
     fn preopen_next(&mut self) {
         if self.prepared.is_some() {
             return;
         }
+        let mut changed = false;
         for _ in 0..2 {
             let Some(track) = self.queue.pop_front() else {
-                return;
+                break;
             };
+            changed = true;
             match (self.decoder_factory)(&track.path) {
                 Ok(opened) => {
                     self.prepared = Some(PreparedNext {
@@ -796,7 +963,7 @@ impl<O: AudioOutput> Worker<O> {
                         decoder: opened.decoder,
                         stall: opened.stall,
                     });
-                    return;
+                    break;
                 }
                 Err(kind) => self.emit(PlayerEvent::Error {
                     track: Some(track.id),
@@ -804,15 +971,18 @@ impl<O: AudioOutput> Worker<O> {
                 }),
             }
         }
+        if changed {
+            self.emit_queue_changed();
+        }
     }
 
     /// Decode and buffer frames before the output starts. If a decoded block
     /// is larger than the ring, retain its suffix for `pump` to push after
     /// startup; never silently lose that block.
     fn prefill(&self, playback: &mut Playback) -> Result<(), PlayerError> {
-        let prefill_frames =
-            (2 * self.buffers.period_frames as u64).min(self.buffers.ring_frames as u64)
-                * playback.output.format.source_frames_per_wire_frame();
+        let prefill_frames = (2 * playback.buffers.period_frames as u64)
+            .min(playback.buffers.ring_frames as u64)
+            * playback.output.format.source_frames_per_wire_frame();
         while playback.written_frames < prefill_frames {
             let remaining = span_remaining(playback);
             if matches!(remaining, Some(0)) {
@@ -861,8 +1031,17 @@ impl<O: AudioOutput> Worker<O> {
                 output: playback.output.clone(),
                 converted: playback.packing.converted(),
             });
+            self.emit(PlayerEvent::Duration {
+                track,
+                total_frames: playback_total(playback),
+            });
         }
+        // The boundary Playing event is what makes the swapped-in track
+        // audible; refresh the queue snapshot only now.
+        self.audible = self.current.clone();
+        self.emit_queue_changed();
     }
+
 
     fn pump(&mut self) -> Result<Pump, PlayerError> {
         if self.counters.fault.load(Ordering::Relaxed) {
@@ -969,6 +1148,9 @@ impl<O: AudioOutput> Worker<O> {
                 self.publish_track(prepared.track.id, prepared.stall);
                 self.boundary = Some((prepared.track.id, boundary));
                 self.preopen_next();
+                // The swapped-in track is pending until its boundary
+                // `Playing` fires; show it in the queue snapshot now.
+                self.emit_queue_changed();
                 return Ok(Pump::Active);
             }
             self.prepared = Some(prepared);
@@ -997,8 +1179,8 @@ impl<O: AudioOutput> Worker<O> {
         Ok((start_sample, end_frames))
     }
 
-    fn ring_bytes(&self, frame_bytes: usize) -> usize {
-        self.buffers.ring_frames.max(1) as usize * frame_bytes
+    fn ring_bytes(buffers: BufferConfig, frame_bytes: usize) -> usize {
+        buffers.ring_frames.max(1) as usize * frame_bytes
     }
 
     fn publish_track(&self, id: TrackId, stall: Option<Arc<StallState>>) {
@@ -1043,7 +1225,9 @@ pub struct PlayerEngine<O: AudioOutput> {
     output_factory: OutputFactory<O>,
     decoder_factory: DecoderFactory,
     device: DeviceId,
-    buffers: BufferConfig,
+    /// DAC timing overrides; `None` derives rate-relative defaults per track.
+    period_frames: Option<u32>,
+    buffer_frames: Option<u32>,
     float_to_int: bool,
     events: Sender<PlayerEvent>,
     stall_timeout: Duration,
@@ -1054,7 +1238,8 @@ impl<O: AudioOutput + 'static> PlayerEngine<O> {
         output: O,
         output_factory: OutputFactory<O>,
         device: DeviceId,
-        buffers: BufferConfig,
+        period_frames: Option<u32>,
+        buffer_frames: Option<u32>,
         float_to_int: bool,
         decoder_factory: DecoderFactory,
         events: Sender<PlayerEvent>,
@@ -1065,8 +1250,9 @@ impl<O: AudioOutput + 'static> PlayerEngine<O> {
             output_factory,
             decoder_factory,
             device,
+            period_frames,
+            buffer_frames,
             float_to_int,
-            buffers,
             events,
             stall_timeout,
         }
@@ -1080,7 +1266,10 @@ impl<O: AudioOutput + 'static> PlayerEngine<O> {
         let shared = Arc::new(Mutex::new(TrackState::default()));
         let worker = Worker {
             queue: VecDeque::new(),
+            shuffle: false,
             current: None,
+            audible: None,
+            next_track_id: 0,
             prepared: None,
             boundary: None,
             playback: None,
@@ -1090,7 +1279,8 @@ impl<O: AudioOutput + 'static> PlayerEngine<O> {
             output_factory: self.output_factory,
             decoder_factory: self.decoder_factory,
             device: self.device,
-            buffers: self.buffers,
+            period_frames: self.period_frames,
+            buffer_frames: self.buffer_frames,
             float_to_int: self.float_to_int,
             counters: Arc::new(OutputCounters::default()),
             events: self.events.clone(),
@@ -1148,6 +1338,7 @@ impl Coordinator {
         let quit = matches!(command, PlayerCommand::Quit);
         let msg = match command {
             PlayerCommand::Enqueue(entry) => WorkerMsg::Enqueue(entry),
+            PlayerCommand::SetShuffle(enabled) => WorkerMsg::SetShuffle(enabled),
             PlayerCommand::Play => WorkerMsg::Play,
             PlayerCommand::Pause => {
                 self.cancel_current();
@@ -1170,6 +1361,13 @@ impl Coordinator {
                 WorkerMsg::SelectDevice(device)
             }
             PlayerCommand::SetFloatToInt(enabled) => WorkerMsg::SetFloatToInt(enabled),
+            PlayerCommand::SetTiming {
+                period_frames,
+                buffer_frames,
+            } => WorkerMsg::SetTiming {
+                period_frames,
+                buffer_frames,
+            },
             PlayerCommand::Quit => {
                 self.cancel_current();
                 WorkerMsg::Quit
@@ -1302,11 +1500,14 @@ mod tests {
         out
     }
 
+    /// Timing overrides the harness passes. The effective ring follows the
+    /// engine policy `max(default ring, 4 * buffer, 4096)`; at the tests'
+    /// 44.1 kHz the default ring is 44_100/4 = 11_025 frames.
     fn test_buffers() -> BufferConfig {
         BufferConfig {
             period_frames: 256,
             buffer_frames: 512,
-            ring_frames: 4096,
+            ring_frames: 11_025,
         }
     }
 
@@ -1374,6 +1575,10 @@ mod tests {
         fn spec(&self) -> StreamSpec {
             self.spec
         }
+        fn total_frames(&self) -> Option<u64> {
+            Some(self.total_frames)
+        }
+
 
         fn dsd_spec(&self) -> Option<DsdSpec> {
             self.dsd
@@ -1425,6 +1630,8 @@ mod tests {
         stops: usize,
         occupied_at_start: Vec<usize>,
         played_total: u64,
+        /// Buffer timing of every configure call, in order.
+        buffers_seen: Vec<BufferConfig>,
     }
 
     struct FakeOutput {
@@ -1471,9 +1678,13 @@ mod tests {
         fn configure(
             &mut self,
             input: &StreamSpec,
-            _buffers: BufferConfig,
+            buffers: BufferConfig,
         ) -> Result<OutputSpec, PlayerError> {
-            self.calls.lock().configures += 1;
+            {
+                let mut calls = self.calls.lock();
+                calls.configures += 1;
+                calls.buffers_seen.push(buffers);
+            }
             let (format, valid_bits) = match input.encoding {
                 SampleEncoding::S16 => (DeviceFormat::S16Le, 16),
                 SampleEncoding::S32 => (DeviceFormat::S32Le, 32),
@@ -1498,9 +1709,13 @@ mod tests {
         fn configure_dsd(
             &mut self,
             spec: &DsdSpec,
-            _buffers: BufferConfig,
+            buffers: BufferConfig,
         ) -> Result<OutputSpec, PlayerError> {
-            self.calls.lock().dsd_configures += 1;
+            {
+                let mut calls = self.calls.lock();
+                calls.dsd_configures += 1;
+                calls.buffers_seen.push(buffers);
+            }
             let channels = u64::from(spec.layout.channels);
             // Written frames count per-channel DSD bytes; convert to wire
             // bytes per written frame so played_frames tracks written_frames.
@@ -1619,6 +1834,27 @@ mod tests {
         stall_timeout: Duration,
         dsd_mode: DeviceFormat,
     ) -> Harness {
+        spawn_engine_timed(
+            plan,
+            stall_timeout,
+            dsd_mode,
+            Some(test_buffers().period_frames),
+            Some(test_buffers().buffer_frames),
+        )
+    }
+
+    /// Engine without timing overrides: per-rate Auto defaults.
+    fn spawn_engine_auto(plan: HashMap<PathBuf, FakeTrack>) -> Harness {
+        spawn_engine_timed(plan, Duration::from_secs(5), DeviceFormat::Dop24, None, None)
+    }
+
+    fn spawn_engine_timed(
+        plan: HashMap<PathBuf, FakeTrack>,
+        stall_timeout: Duration,
+        dsd_mode: DeviceFormat,
+        period_frames: Option<u32>,
+        buffer_frames: Option<u32>,
+    ) -> Harness {
         let (command_tx, command_rx) = crossbeam_channel::unbounded();
         let (event_tx, event_rx) = crossbeam_channel::unbounded();
         let calls = Arc::new(Mutex::new(FakeCalls::default()));
@@ -1700,7 +1936,8 @@ mod tests {
             output,
             Box::new(|_| Err(PlayerError::Output)),
             "fake".to_owned(),
-            test_buffers(),
+            period_frames,
+            buffer_frames,
             false,
             decoder_factory,
             event_tx,
@@ -1718,12 +1955,46 @@ mod tests {
         }
     }
 
+    /// Receive the next non-snapshot event. `QueueChanged` snapshots are
+    /// frequent and asynchronous; tests that care about them use
+    /// [`recv_queue_changed`].
     fn recv_event(events: &Receiver<PlayerEvent>) -> PlayerEvent {
-        events
-            .recv_timeout(Duration::from_secs(5))
-            .expect("player event within 5s")
+        loop {
+            let event = events
+                .recv_timeout(Duration::from_secs(5))
+                .expect("player event within 5s");
+            if !matches!(event, PlayerEvent::QueueChanged { .. }) {
+                return event;
+            }
+        }
     }
 
+    /// Receive the next `QueueChanged` snapshot, skipping anything else.
+    fn recv_queue_changed(events: &Receiver<PlayerEvent>) -> (Option<sointty_core::QueueItem>, Vec<sointty_core::QueueItem>) {
+        loop {
+            let event = events
+                .recv_timeout(Duration::from_secs(5))
+                .expect("player event within 5s");
+            if let PlayerEvent::QueueChanged { audible, pending } = event {
+                return (audible, pending);
+            }
+        }
+    }
+
+
+
+    /// Receive `QueueChanged` snapshots until `predicate` matches.
+    fn recv_queue_until(
+        events: &Receiver<PlayerEvent>,
+        predicate: impl Fn(&Option<sointty_core::QueueItem>, &[sointty_core::QueueItem]) -> bool,
+    ) -> (Option<sointty_core::QueueItem>, Vec<sointty_core::QueueItem>) {
+        loop {
+            let (audible, pending) = recv_queue_changed(events);
+            if predicate(&audible, &pending) {
+                return (audible, pending);
+            }
+        }
+    }
     /// Receive events until `predicate` matches; returns the matching event.
     fn recv_until(
         events: &Receiver<PlayerEvent>,
@@ -1996,19 +2267,21 @@ mod tests {
     #[test]
     fn decoded_block_larger_than_ring_is_not_dropped_or_stuck() {
         let mut plan = HashMap::new();
+        // The block must exceed the effective ring (11_025 frames at 44.1
+        // kHz with the harness timing overrides).
         plan.insert(
             PathBuf::from("large.flac"),
-            FakeTrack::PcmBlock(test_spec(44_100), 8192, 8192),
+            FakeTrack::PcmBlock(test_spec(44_100), 16_384, 16_384),
         );
         let harness = spawn_engine(plan);
         enqueue(&harness, "large.flac");
         harness.commands.send(PlayerCommand::Play).unwrap();
         recv_until(&harness.events, |event| matches!(event, PlayerEvent::EndOfQueue));
         let calls = harness.calls.lock();
-        assert_eq!(calls.played_total, 8192, "entire block reached the output");
+        assert_eq!(calls.played_total, 16_384, "entire block reached the output");
         assert!(calls.occupied_at_start[0] >= test_buffers().ring_frames as usize * FRAME_BYTES);
         drop(calls);
-        assert_eq!(harness.drained.lock().len(), 8192 * FRAME_BYTES);
+        assert_eq!(harness.drained.lock().len(), 16_384 * FRAME_BYTES);
         harness.commands.send(PlayerCommand::Quit).unwrap();
         harness.join().unwrap();
     }
@@ -2084,6 +2357,10 @@ mod tests {
         };
         assert_eq!(first_id, 1);
         recv_event(&harness.events); // Tags for track 1
+        assert!(matches!(
+            recv_event(&harness.events),
+            PlayerEvent::Duration { track: 1, total_frames: Some(1176) }
+        ));
 
         // Track 2 is announced only after track 1's full span (1176 frames)
         // has been consumed: the seamless boundary sits at the span end.
@@ -2091,6 +2368,7 @@ mod tests {
         // Playing, and EndOfQueue arrive back to back; collect them in one
         // loop.
         let mut second_playing = false;
+        let mut second_duration = None;
         let mut ended = false;
         for _ in 0..512 {
             match recv_event(&harness.events) {
@@ -2116,10 +2394,14 @@ mod tests {
                     ended = true;
                     break;
                 }
+                PlayerEvent::Duration { track: 2, total_frames } => {
+                    second_duration = total_frames;
+                }
                 _ => {}
             }
         }
         assert!(second_playing, "expected gapless Playing for track 2");
+        assert_eq!(second_duration, Some(1176));
         assert!(ended, "expected EndOfQueue");
         {
             let calls = harness.calls.lock();
@@ -3020,6 +3302,220 @@ mod tests {
         recv_until(&harness.events, |event| matches!(event, PlayerEvent::EndOfQueue));
         assert_eq!(harness.calls.lock().starts, 1, "same spec should keep one output stream");
         assert_eq!(harness.drained.lock().as_slice(), [536_870_912_i32.to_le_bytes(); 2048].concat());
+        harness.commands.send(PlayerCommand::Quit).unwrap();
+        harness.join().unwrap();
+    }
+    #[test]
+    fn duplicate_paths_get_distinct_monotonic_ids() {
+        let mut plan = HashMap::new();
+        plan.insert(PathBuf::from("a.flac"), FakeTrack::Pcm(test_spec(44_100), 512));
+        let harness = spawn_engine(plan);
+        enqueue(&harness, "a.flac");
+        enqueue(&harness, "a.flac");
+        let (_, pending) = recv_queue_changed(&harness.events);
+        let (_, pending2) = recv_queue_changed(&harness.events);
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending2.len(), 2);
+        assert_eq!(pending2[0].entry.path, PathBuf::from("a.flac"));
+        assert_eq!(pending2[1].entry.path, PathBuf::from("a.flac"));
+        assert!(pending2[0].id < pending2[1].id, "IDs must be distinct and increasing");
+        harness.commands.send(PlayerCommand::Quit).unwrap();
+        harness.join().unwrap();
+    }
+
+    #[test]
+    fn shuffle_snapshot_is_permutation_and_disabling_preserves_order() {
+        let harness = spawn_engine(HashMap::new());
+        for index in 0..12 {
+            enqueue(&harness, &format!("song-{index}.flac"));
+        }
+        let (_, original) = recv_queue_until(&harness.events, |_, pending| pending.len() == 12);
+        let ids: Vec<_> = original.iter().map(|item| item.id).collect();
+        harness.commands.send(PlayerCommand::SetShuffle(true)).unwrap();
+        let (_, shuffled) = recv_queue_changed(&harness.events);
+        let mut shuffled_ids: Vec<_> = shuffled.iter().map(|item| item.id).collect();
+        shuffled_ids.sort_unstable();
+        assert_eq!(shuffled_ids, ids, "shuffle retains every track exactly once");
+        harness.commands.send(PlayerCommand::SetShuffle(false)).unwrap();
+        let (_, unshuffled) = recv_queue_changed(&harness.events);
+        assert_eq!(unshuffled, shuffled, "turning random play off must not reshuffle pending");
+        enqueue(&harness, "new.flac");
+        let (_, appended) = recv_queue_changed(&harness.events);
+        assert_eq!(&appended[..12], &shuffled[..]);
+        assert_eq!(appended[12].entry.path, PathBuf::from("new.flac"));
+        harness.commands.send(PlayerCommand::Quit).unwrap();
+        harness.join().unwrap();
+    }
+
+    #[test]
+    fn shuffle_during_play_keeps_audible_and_prepared_next() {
+        let mut plan = HashMap::new();
+        for name in ["a.flac", "b.flac", "c.flac", "d.flac"] {
+            plan.insert(PathBuf::from(name), FakeTrack::Pcm(test_spec(44_100), 100_000));
+        }
+        let harness = spawn_engine(plan);
+        for name in ["a.flac", "b.flac", "c.flac", "d.flac"] {
+            enqueue(&harness, name);
+        }
+        harness.commands.send(PlayerCommand::Play).unwrap();
+        recv_until(&harness.events, |event| matches!(event, PlayerEvent::Playing { track: 1, .. }));
+        let (audible, pending) = recv_queue_until(&harness.events, |audible, pending| {
+            audible.as_ref().is_some_and(|track| track.id == 1) && pending.len() == 3
+        });
+        assert_eq!(audible.unwrap().id, 1);
+        assert_eq!(pending.iter().map(|item| item.id).collect::<Vec<_>>(), [2, 3, 4]);
+        harness.commands.send(PlayerCommand::SetShuffle(true)).unwrap();
+        let (audible, pending) = recv_queue_changed(&harness.events);
+        assert_eq!(audible.unwrap().id, 1);
+        assert_eq!(pending[0].id, 2, "preopened next must not be displaced");
+        let mut rest = [pending[1].id, pending[2].id];
+        rest.sort_unstable();
+        assert_eq!(rest, [3, 4]);
+        harness.commands.send(PlayerCommand::Next).unwrap();
+        recv_until(&harness.events, |event| matches!(event, PlayerEvent::Playing { track: 2, .. }));
+        harness.commands.send(PlayerCommand::Quit).unwrap();
+        harness.join().unwrap();
+    }
+
+    #[test]
+    fn snapshot_shows_prepared_track_and_audible_lags_gapless_boundary() {
+        // Two same-spec tracks: the second is preopened while the first
+        // plays. Before the boundary, the snapshot must show the OLD track
+        // as audible and the new one pending.
+        let mut plan = HashMap::new();
+        plan.insert(PathBuf::from("a.flac"), FakeTrack::Pcm(test_spec(44_100), 4096));
+        plan.insert(PathBuf::from("b.flac"), FakeTrack::Pcm(test_spec(44_100), 4096));
+        let harness = spawn_engine(plan);
+        enqueue(&harness, "a.flac");
+        enqueue(&harness, "b.flac");
+        harness.commands.send(PlayerCommand::Play).unwrap();
+        recv_until(&harness.events, |event| matches!(event, PlayerEvent::Playing { track: 1, .. }));
+        // Snapshots after start: audible 1; b (id 2) appears pending once
+        // preopened.
+        let (audible, pending) = recv_queue_until(&harness.events, |_, pending| {
+            pending.iter().any(|item| item.id == 2)
+        });
+        assert_eq!(audible.map(|item| item.id), Some(1));
+        assert_eq!(pending.iter().map(|item| item.id).collect::<Vec<_>>(), [2]);
+        // After the gapless boundary the new track becomes audible.
+        recv_until(&harness.events, |event| matches!(event, PlayerEvent::Playing { track: 2, .. }));
+        harness.commands.send(PlayerCommand::Quit).unwrap();
+        harness.join().unwrap();
+    }
+
+    #[test]
+    fn stop_returns_prepared_track_to_pending() {
+        let mut plan = HashMap::new();
+        plan.insert(PathBuf::from("a.flac"), FakeTrack::Pcm(test_spec(44_100), 100_000));
+        plan.insert(PathBuf::from("b.flac"), FakeTrack::Pcm(test_spec(44_100), 512));
+        let harness = spawn_engine(plan);
+        enqueue(&harness, "a.flac");
+        enqueue(&harness, "b.flac");
+        harness.commands.send(PlayerCommand::Play).unwrap();
+        recv_until(&harness.events, |event| matches!(event, PlayerEvent::Playing { track: 1, .. }));
+        // Wait until b is prepared (popped from the queue)...
+        let (audible, pending) = recv_queue_until(&harness.events, |_, pending| {
+            pending.iter().any(|item| item.id == 2)
+        });
+        assert_eq!(audible.map(|item| item.id), Some(1));
+        assert_eq!(pending.iter().map(|item| item.id).collect::<Vec<_>>(), [2]);
+        // ...then Stop must return the canceled prepared track to pending
+        // instead of dropping it.
+        harness.commands.send(PlayerCommand::Stop).unwrap();
+        let (_, pending) = recv_queue_changed(&harness.events);
+        assert_eq!(pending.iter().map(|item| item.id).collect::<Vec<_>>(), [2]);
+        harness.commands.send(PlayerCommand::Quit).unwrap();
+        harness.join().unwrap();
+    }
+
+    #[test]
+    fn queue_snapshot_clears_on_end_of_queue() {
+        let mut plan = HashMap::new();
+        plan.insert(PathBuf::from("a.flac"), FakeTrack::Pcm(test_spec(44_100), 512));
+        let harness = spawn_engine(plan);
+        enqueue(&harness, "a.flac");
+        harness.commands.send(PlayerCommand::Play).unwrap();
+        recv_until(&harness.events, |event| matches!(event, PlayerEvent::EndOfQueue));
+        let (audible, pending) = recv_queue_changed(&harness.events);
+        assert_eq!(audible, None);
+        assert!(pending.is_empty());
+        harness.commands.send(PlayerCommand::Quit).unwrap();
+        harness.join().unwrap();
+    }
+
+    #[test]
+    fn auto_timing_follows_each_tracks_rate() {
+        let mut plan = HashMap::new();
+        plan.insert(PathBuf::from("low.flac"), FakeTrack::Pcm(test_spec(44_100), 512));
+        plan.insert(PathBuf::from("high.flac"), FakeTrack::Pcm(test_spec(96_000), 512));
+        let harness = spawn_engine_auto(plan);
+        enqueue(&harness, "low.flac");
+        enqueue(&harness, "high.flac");
+        harness.commands.send(PlayerCommand::Play).unwrap();
+        recv_until(&harness.events, |event| matches!(event, PlayerEvent::EndOfQueue));
+        let calls = harness.calls.lock();
+        assert_eq!(
+            calls.buffers_seen[0],
+            BufferConfig { period_frames: 2_205, buffer_frames: 6_615, ring_frames: 11_025 },
+            "44.1 kHz auto timing"
+        );
+        assert_eq!(
+            calls.buffers_seen[1],
+            BufferConfig { period_frames: 4_800, buffer_frames: 14_400, ring_frames: 24_000 },
+            "96 kHz auto timing"
+        );
+        drop(calls);
+        harness.commands.send(PlayerCommand::Quit).unwrap();
+        harness.join().unwrap();
+    }
+
+    #[test]
+    fn custom_timing_pair_reaches_output() {
+        let mut plan = HashMap::new();
+        plan.insert(PathBuf::from("a.flac"), FakeTrack::Pcm(test_spec(44_100), 512));
+        let harness = spawn_engine_timed(
+            plan,
+            Duration::from_secs(5),
+            DeviceFormat::Dop24,
+            Some(1_024),
+            Some(4_096),
+        );
+        enqueue(&harness, "a.flac");
+        harness.commands.send(PlayerCommand::Play).unwrap();
+        recv_until(&harness.events, |event| matches!(event, PlayerEvent::Playing { .. }));
+        let calls = harness.calls.lock();
+        assert_eq!(calls.buffers_seen[0].period_frames, 1_024);
+        assert_eq!(calls.buffers_seen[0].buffer_frames, 4_096);
+        assert_eq!(calls.buffers_seen[0].ring_frames, 16_384);
+        drop(calls);
+        harness.commands.send(PlayerCommand::Quit).unwrap();
+        harness.join().unwrap();
+    }
+
+    #[test]
+    fn set_timing_command_applies_to_next_configure() {
+        let mut plan = HashMap::new();
+        plan.insert(PathBuf::from("a.flac"), FakeTrack::Pcm(test_spec(44_100), 100_000));
+        plan.insert(PathBuf::from("b.flac"), FakeTrack::Pcm(test_spec(44_100), 512));
+        let harness = spawn_engine(plan);
+        enqueue(&harness, "a.flac");
+        enqueue(&harness, "b.flac");
+        harness.commands.send(PlayerCommand::Play).unwrap();
+        recv_until(&harness.events, |event| matches!(event, PlayerEvent::Playing { track: 1, .. }));
+        harness
+            .commands
+            .send(PlayerCommand::SetTiming {
+                period_frames: Some(512),
+                buffer_frames: Some(2_048),
+            })
+            .unwrap();
+        harness.commands.send(PlayerCommand::Next).unwrap();
+        recv_until(&harness.events, |event| matches!(event, PlayerEvent::Playing { track: 2, .. }));
+        let calls = harness.calls.lock();
+        let last = calls.buffers_seen.last().unwrap();
+        assert_eq!(last.period_frames, 512);
+        assert_eq!(last.buffer_frames, 2_048);
+        drop(calls);
         harness.commands.send(PlayerCommand::Quit).unwrap();
         harness.join().unwrap();
     }

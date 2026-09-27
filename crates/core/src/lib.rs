@@ -262,9 +262,18 @@ pub struct CueRange {
 pub fn cd_frames_to_samples(cd_frames: u64, rate_hz: u32) -> u64 {
     cd_frames * u64::from(rate_hz) / 75
 }
+/// A queue entry paired with the engine-assigned track ID, so UIs can show
+/// the live queue without guessing IDs from their own sends.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct QueueItem {
+    pub id: TrackId,
+    pub entry: QueueEntry,
+}
 
 pub enum PlayerCommand {
     Enqueue(QueueEntry),
+    /// Randomize upcoming queue playback without interrupting the current track.
+    SetShuffle(bool),
     Play,
     Pause,
     Stop,
@@ -273,11 +282,28 @@ pub enum PlayerCommand {
     SelectDevice(DeviceId),
     /// Opt in to non-bit-perfect F32-to-integer output when exact F32 fails.
     SetFloatToInt(bool),
+    /// Override DAC timing; `None` restores the rate-relative default for
+    /// that field. Applies on the next output configure.
+    SetTiming {
+        period_frames: Option<u32>,
+        buffer_frames: Option<u32>,
+    },
     Quit,
 }
 
 #[derive(Debug, Clone)]
 pub enum PlayerEvent {
+    /// Live queue snapshot: the track actually audible now (still the old
+    /// one during a gapless transition) and the pending FIFO order.
+    QueueChanged {
+        audible: Option<QueueItem>,
+        pending: Vec<QueueItem>,
+    },
+    /// Source-frame length of the currently audible track, or unknown.
+    Duration {
+        track: TrackId,
+        total_frames: Option<u64>,
+    },
     Playing {
         track: TrackId,
         output: OutputSpec,
@@ -425,6 +451,11 @@ pub trait Decoder: Send {
     fn spec(&self) -> StreamSpec;
     fn next_block(&mut self) -> Result<Option<DecodedBlock<'_>>, PlayerError>;
     fn seek_to_frame(&mut self, frame: u64) -> Result<u64, PlayerError>;
+    /// Number of source frames in the file when known. For DSD this counts
+    /// per-channel DSD bytes, matching `Position` units.
+    fn total_frames(&self) -> Option<u64> {
+        None
+    }
     /// Some(..) when this decoder outputs a DSD bitstream; then `spec()` is
     /// not meaningful and every block carries `DecodedPcm::Dsd` with
     /// `DecodedSpec::Dsd`. DSD is never disguised as PCM.

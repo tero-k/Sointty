@@ -18,6 +18,7 @@ serde.workspace = true
 toml.workspace = true
 directories.workspace = true
 audio_thread_priority.workspace = true
+rand = "0.8"
 
 [target.'cfg(target_os = "linux")'.dependencies]
 sointty-output-alsa.workspace = true
@@ -25,6 +26,10 @@ sointty-decode = { workspace = true, features = ["opus"] }
 
 [target.'cfg(windows)'.dependencies]
 sointty-output-wasapi.workspace = true
+windows = { workspace = true, features = [
+    "Win32_Storage_FileSystem",
+    "Win32_NetworkManagement_WNet",
+] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 sointty-output-coreaudio.workspace = true
