@@ -12,6 +12,11 @@ v1 feature complete (see [`docs/PLAN.md`](docs/PLAN.md)). Verified on Windows
 with an iFi USB DAC; Linux and macOS backends are implemented and unit tested,
 hardware testing pending.
 
+![Sointty terminal UI while playing a 192 kHz file](docs/assets/tui-playback.png)
+
+The terminal shows the negotiated output, elapsed position, current navigation
+pane, selected playlist, and a context-sensitive key guide.
+
 ## Behavior
 
 - If the output device can't take the stream exactly as decoded, playback fails
@@ -45,8 +50,12 @@ sointty /path/to/album/                # play files or folders
 sointty playlist.m3u                   # playlists expand into tracks
 ```
 
-With no arguments, sointty opens a filesystem browser. Press `d` to pick the
-output device; the choice is saved.
+With no arguments, sointty opens a filesystem browser where you last left it
+(first launch: your home folder). A key guide stays visible at the bottom and
+changes with the active pane. Press `?` for full help, `m` for the menu, or `q`
+to quit immediately from any pane without backing out through menus. While
+typing in an input prompt, `q` is text; use `Ctrl+Q` to quit immediately.
+Press `d` to choose and save the output device.
 
 ### Keys
 
@@ -55,14 +64,34 @@ output device; the choice is saved.
 | `space` | play / pause |
 | `s` / `n` | stop / next track |
 | `←` / `→` | seek back / forward 10 s |
-| `b` | file browser (`Enter` plays, `Backspace` goes up) |
+| `b` | file browser (`Enter` plays, `a` adds to playlist, `A` adds the folder, `Backspace` goes up or shows drives at root) |
+| `p` | playlists: `↑`/`↓` highlight a list, `a` appends that whole list; `Tab` focuses songs, `a`/`Enter` appends one song, `A` appends the whole highlighted list |
+| `l` | locations: drives and network shares (map/mount via the OS) |
+| `f` | focus the visible saved playlist: `↑`/`↓` select, `a`/`Enter` appends one song, `A` appends the whole list; `Esc` returns to browser |
+| `Tab` | switch right pane between selected playlist and live queue (in the Playlists pane, switch between lists and songs) |
+| `r` | toggle random play for the live queue; the current song and preopened next song stay in place |
+| `m` / `?` | menu / full keyboard help |
 | `d` | choose output device |
 | `c` | allow F32→integer conversion (off by default) |
-| `q` / `Esc` | quit (`Esc` closes an open pane first) |
+| `q` | quit immediately from any non-input pane |
+| `Ctrl+Q` | quit immediately, including while typing in a prompt |
+| `Esc` | close the current pane or step back through menus; quit when no pane is open |
+
+Buffer timing (period/buffer frames) is adjustable under `m` → DAC settings;
+Auto derives timing from each track's sample rate.
+
+Playback shows elapsed/total time and a text progress bar. When the decoder
+cannot report a reliable length, the total reads `--:--` and the bar remains
+empty instead of estimating from file size.
 
 Settings live in `<config dir>/sointty/config.toml`
 (`%APPDATA%\sointty\sointty\config\config.toml` on Windows,
-`~/.config/sointty/config.toml` on Linux). Command-line flags override the file.
+`~/.config/sointty/config.toml` on Linux). Command-line flags override the
+file. Named playlists live in `<data dir>/sointty/playlists.toml`; adding
+tracks never touches the playback queue.
+Random play shuffles only upcoming queue entries, not saved playlists. Turning it
+off keeps the current queue order and appends future songs in order. The same
+toggle is available under `m` → Queue.
 
 ## Fidelity rules
 
