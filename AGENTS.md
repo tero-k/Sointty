@@ -9,3 +9,9 @@
   than device writes.
 - Run `cargo test --workspace` before committing; verify playback changes on
   real hardware when a device is available.
+- For GitHub work, preserve unrelated changes; stage only the files or hunks
+  belonging to the completed task, review the staged diff and run the required
+  checks before making a focused, imperative local commit. Use the effective
+  Git-configured user name and email as both author and committer, with no AI
+  co-author or identity override. Never push, merge, rewrite history, or
+  bypass signing and review requirements unless explicitly instructed.
