@@ -54,22 +54,40 @@ struct PreparedNext {
     stall: Option<Arc<StallState>>,
 }
 
+/// Which opted-in sample-format conversion (if any) the negotiated output
+/// path applies. Drives both packing and the `Playing` event's label.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Conversion {
+    None,
+    FloatToInt,
+    IntToFloat,
+}
+
+impl Conversion {
+    fn converted(self) -> bool {
+        !matches!(self, Self::None)
+    }
+}
+
 /// How decoded blocks become wire bytes for the current output. DoP keeps a
 /// persistent [`DopPacker`] so the marker phase survives block boundaries
 /// and seamless same-spec track swaps; every reconfigure/seek starts fresh.
 enum Packing {
     Pcm,
-    /// Explicitly opted-in, non-bit-perfect conversion on the decoder thread.
+    /// Explicitly opted-in, non-bit-perfect conversions on the decoder thread.
     FloatToInt,
+    IntToFloat,
     Dop(DopPacker),
     /// Native DSD groups consecutive time bytes per channel into ALSA slots.
     NativeDsd { channels: u16, slot_bytes: usize },
 }
 
 impl Packing {
-    fn for_output(output: &OutputSpec, converted: bool) -> Self {
-        if converted {
-            return Self::FloatToInt;
+    fn for_output(output: &OutputSpec, conversion: Conversion) -> Self {
+        match conversion {
+            Conversion::FloatToInt => return Self::FloatToInt,
+            Conversion::IntToFloat => return Self::IntToFloat,
+            Conversion::None => {}
         }
         match output.format {
             DeviceFormat::Dop24 => Self::Dop(DopPacker::new(output.layout.channels)),
@@ -83,8 +101,16 @@ impl Packing {
         }
     }
 
+    fn conversion(&self) -> Conversion {
+        match self {
+            Self::FloatToInt => Conversion::FloatToInt,
+            Self::IntToFloat => Conversion::IntToFloat,
+            _ => Conversion::None,
+        }
+    }
+
     fn converted(&self) -> bool {
-        matches!(self, Self::FloatToInt)
+        self.conversion().converted()
     }
 }
 
@@ -125,6 +151,7 @@ fn pack_block(
     match packing {
         Packing::Pcm => pack_exact(block, output, scratch),
         Packing::FloatToInt => pack_float_to_int(block, output, scratch),
+        Packing::IntToFloat => pack_int_to_float(block, output, scratch),
         Packing::Dop(packer) => {
             let DecodedPcm::Dsd(bytes) = &block.pcm else {
                 return Err(PlayerError::Decode);
@@ -195,6 +222,61 @@ fn pack_float_to_int(
     Ok(())
 }
 
+/// Compatibility-only integer-to-F32 conversion, the mirror of
+/// `pack_float_to_int`. S16 and S24 map exactly (both fit the F32 mantissa);
+/// S32 rounds to 24-bit precision. The f64 intermediate is exact, so the
+/// f32 cast is the only rounding. Runs on the decoder worker, never on the
+/// render thread.
+fn pack_int_to_float(
+    block: DecodedBlock<'_>,
+    output: &OutputSpec,
+    scratch: &mut Vec<u8>,
+) -> Result<(), PlayerError> {
+    let spec = block.spec.pcm().ok_or(PlayerError::Decode)?;
+    if output.format != DeviceFormat::F32Le
+        || output.valid_bits != 32
+        || output.rate_hz != spec.rate_hz
+        || output.layout != spec.layout
+    {
+        return Err(PlayerError::Decode);
+    }
+    let frames = block.frames as usize * spec.layout.channels as usize;
+    scratch.clear();
+    scratch.resize(frames * 4, 0);
+    let mut out_chunks = scratch.chunks_exact_mut(4);
+    match &block.pcm {
+        DecodedPcm::I16(samples) => {
+            if samples.len() != frames {
+                return Err(PlayerError::Decode);
+            }
+            for (&sample, out) in samples.iter().zip(&mut out_chunks) {
+                let value = f32::from(sample) / 32768.0;
+                out.copy_from_slice(&value.to_le_bytes());
+            }
+        }
+        DecodedPcm::I24(samples) => {
+            if samples.len() != frames {
+                return Err(PlayerError::Decode);
+            }
+            for (&sample, out) in samples.iter().zip(&mut out_chunks) {
+                let value = (f64::from(sample) / 8_388_608.0) as f32;
+                out.copy_from_slice(&value.to_le_bytes());
+            }
+        }
+        DecodedPcm::I32(samples) => {
+            if samples.len() != frames {
+                return Err(PlayerError::Decode);
+            }
+            for (&sample, out) in samples.iter().zip(&mut out_chunks) {
+                let value = (f64::from(sample) / 2_147_483_648.0) as f32;
+                out.copy_from_slice(&value.to_le_bytes());
+            }
+        }
+        _ => return Err(PlayerError::Decode),
+    }
+    Ok(())
+}
+
 /// A playback the coordinator suspended after a stall timeout: the decoder
 /// is kept so the track can resume at the frame the output had consumed.
 struct Suspended {
@@ -220,6 +302,7 @@ enum WorkerMsg {
     SeekFrame(u64),
     SelectDevice(DeviceId),
     SetFloatToInt(bool),
+    SetIntToFloat(bool),
     SetTiming {
         period_frames: Option<u32>,
         buffer_frames: Option<u32>,
@@ -372,6 +455,7 @@ struct Worker<O: AudioOutput> {
     period_frames: Option<u32>,
     buffer_frames: Option<u32>,
     float_to_int: bool,
+    int_to_float: bool,
     counters: Arc<OutputCounters>,
     events: Sender<PlayerEvent>,
     msgs: Receiver<WorkerMsg>,
@@ -610,6 +694,11 @@ impl<O: AudioOutput> Worker<O> {
                 self.float_to_int = enabled;
                 true
             }
+            WorkerMsg::SetIntToFloat(enabled) => {
+                // Applies on the next configure, like SetFloatToInt.
+                self.int_to_float = enabled;
+                true
+            }
             WorkerMsg::SetTiming {
                 period_frames,
                 buffer_frames,
@@ -699,34 +788,47 @@ impl<O: AudioOutput> Worker<O> {
         }
         Ok(buffers)
     }
-    /// Exact F32 is always tried first. Only an explicit compatibility opt-in
-    /// permits quantization to an exact-rate/layout integer device format.
-    /// Returns the output spec, the conversion flag, and the buffer timing
-    /// used, so the caller can size the ring and prefill consistently.
+    /// The exact decoded format is always tried first. Only an explicit
+    /// compatibility opt-in permits conversion: F32 decoded streams may
+    /// quantize to an exact-rate/layout integer device format
+    /// (`float_to_int`), and integer streams may widen to F32
+    /// (`int_to_float`, exact for S16/S24). Returns the output spec, the
+    /// conversion in use, and the buffer timing, so the caller can size the
+    /// ring and prefill consistently.
     fn configure_for_decoder(
         &mut self,
         decoder: &dyn Decoder,
-    ) -> Result<(OutputSpec, bool, BufferConfig), PlayerError> {
+    ) -> Result<(OutputSpec, Conversion, BufferConfig), PlayerError> {
         let buffers = self.buffers_for(decoder)?;
         if let Some(dsd) = decoder.dsd_spec() {
             return self
                 .output
                 .configure_dsd(&dsd, buffers)
-                .map(|output| (output, false, buffers));
+                .map(|output| (output, Conversion::None, buffers));
         }
         let decoded = decoder.spec();
         let original = match self.output.configure(&decoded, buffers) {
-            Ok(output) => return Ok((output, false, buffers)),
-            Err(error) if self.float_to_int
-                && decoded.encoding == SampleEncoding::F32
-                && matches!(error, PlayerError::UnsupportedFormat { .. }) => error,
+            Ok(output) => return Ok((output, Conversion::None, buffers)),
+            Err(error) if matches!(error, PlayerError::UnsupportedFormat { .. }) => error,
             Err(error) => return Err(error),
         };
-        for encoding in [SampleEncoding::S32, SampleEncoding::S24, SampleEncoding::S16] {
-            let integer = StreamSpec { encoding, ..decoded };
-            match self.output.configure(&integer, buffers) {
-                Ok(output) if output.stream_compatible(&integer) => {
-                    return Ok((output, true, buffers));
+        if decoded.encoding == SampleEncoding::F32 && self.float_to_int {
+            for encoding in [SampleEncoding::S32, SampleEncoding::S24, SampleEncoding::S16] {
+                let integer = StreamSpec { encoding, ..decoded };
+                match self.output.configure(&integer, buffers) {
+                    Ok(output) if output.stream_compatible(&integer) => {
+                        return Ok((output, Conversion::FloatToInt, buffers));
+                    }
+                    Ok(_) => return Err(PlayerError::Output),
+                    Err(PlayerError::UnsupportedFormat { .. }) => {}
+                    Err(error) => return Err(error),
+                }
+            }
+        } else if decoded.encoding != SampleEncoding::F32 && self.int_to_float {
+            let float = StreamSpec { encoding: SampleEncoding::F32, ..decoded };
+            match self.output.configure(&float, buffers) {
+                Ok(output) if output.stream_compatible(&float) => {
+                    return Ok((output, Conversion::IntToFloat, buffers));
                 }
                 Ok(_) => return Err(PlayerError::Output),
                 Err(PlayerError::UnsupportedFormat { .. }) => {}
@@ -784,7 +886,7 @@ impl<O: AudioOutput> Worker<O> {
         self.current = Some(track.clone());
         self.publish_track(track.id, stall);
         self.emit(PlayerEvent::Reconfiguring);
-        let (output_spec, converted, buffers) = self.configure_for_decoder(decoder.as_ref())?;
+        let (output_spec, conversion, buffers) = self.configure_for_decoder(decoder.as_ref())?;
         let (producer, consumer) =
             rtrb::RingBuffer::new(Self::ring_bytes(buffers, output_spec.bytes_per_frame()));
         let mut playback = Playback {
@@ -799,7 +901,7 @@ impl<O: AudioOutput> Worker<O> {
             scratch: Vec::new(),
             pending_offset: 0,
             pending_frames: 0,
-            packing: Packing::for_output(&output_spec, converted),
+            packing: Packing::for_output(&output_spec, conversion),
         };
         self.counters = Arc::new(OutputCounters::default());
         self.prefill(&mut playback)?;
@@ -807,7 +909,7 @@ impl<O: AudioOutput> Worker<O> {
         self.emit(PlayerEvent::Playing {
             track: track.id,
             output: output_spec,
-            converted,
+            converted: conversion.converted(),
         });
         self.emit(PlayerEvent::Tags {
             track: track.id,
@@ -843,10 +945,10 @@ impl<O: AudioOutput> Worker<O> {
         self.output.stop()?;
         // `seek_to_frame` counts per-channel DSD bytes for DSD decoders, so
         // the seek target needs no unit conversion.
-        let (output_spec, converted, buffers) = self.configure_for_decoder(decoder.as_ref())?;
+        let (output_spec, conversion, buffers) = self.configure_for_decoder(decoder.as_ref())?;
         let (producer, consumer) =
             rtrb::RingBuffer::new(Self::ring_bytes(buffers, output_spec.bytes_per_frame()));
-        let packing = Packing::for_output(&output_spec, converted);
+        let packing = Packing::for_output(&output_spec, conversion);
         let mut playback = Playback {
             decoder,
             producer,
@@ -911,7 +1013,7 @@ impl<O: AudioOutput> Worker<O> {
         }
         decoder.seek_to_frame(target)?;
         self.emit(PlayerEvent::Reconfiguring);
-        let (output_spec, converted, buffers) = self.configure_for_decoder(decoder.as_ref())?;
+        let (output_spec, conversion, buffers) = self.configure_for_decoder(decoder.as_ref())?;
         let (producer, consumer) =
             rtrb::RingBuffer::new(Self::ring_bytes(buffers, output_spec.bytes_per_frame()));
         let mut playback = Playback {
@@ -926,7 +1028,7 @@ impl<O: AudioOutput> Worker<O> {
             scratch: Vec::new(),
             pending_offset: 0,
             pending_frames: 0,
-            packing: Packing::for_output(&output_spec, converted),
+            packing: Packing::for_output(&output_spec, conversion),
         };
         self.counters = Arc::new(OutputCounters::default());
         self.prefill(&mut playback)?;
@@ -936,7 +1038,7 @@ impl<O: AudioOutput> Worker<O> {
             self.emit(PlayerEvent::Playing {
                 track: track.id,
                 output: output_spec,
-                converted,
+                converted: conversion.converted(),
             });
             self.emit(PlayerEvent::Duration {
                 track: track.id,
@@ -1127,7 +1229,12 @@ impl<O: AudioOutput> Worker<O> {
                 (None, None) => playback.decoder.spec() == prepared.decoder.spec(),
                 _ => false,
             };
-            if same_spec && (self.float_to_int || !playback.packing.converted()) {
+            let mode_still_on = match playback.packing.conversion() {
+                Conversion::None => true,
+                Conversion::FloatToInt => self.float_to_int,
+                Conversion::IntToFloat => self.int_to_float,
+            };
+            if same_spec && mode_still_on {
                 // CUE never applies to DSD; hand the track to start_next,
                 // which reports the error and skips it.
                 if prepared.decoder.dsd_spec().is_some() && prepared.track.cue_range.is_some() {
@@ -1229,6 +1336,7 @@ pub struct PlayerEngine<O: AudioOutput> {
     period_frames: Option<u32>,
     buffer_frames: Option<u32>,
     float_to_int: bool,
+    int_to_float: bool,
     events: Sender<PlayerEvent>,
     stall_timeout: Duration,
 }
@@ -1241,6 +1349,7 @@ impl<O: AudioOutput + 'static> PlayerEngine<O> {
         period_frames: Option<u32>,
         buffer_frames: Option<u32>,
         float_to_int: bool,
+        int_to_float: bool,
         decoder_factory: DecoderFactory,
         events: Sender<PlayerEvent>,
         stall_timeout: Duration,
@@ -1253,6 +1362,7 @@ impl<O: AudioOutput + 'static> PlayerEngine<O> {
             period_frames,
             buffer_frames,
             float_to_int,
+            int_to_float,
             events,
             stall_timeout,
         }
@@ -1282,6 +1392,7 @@ impl<O: AudioOutput + 'static> PlayerEngine<O> {
             period_frames: self.period_frames,
             buffer_frames: self.buffer_frames,
             float_to_int: self.float_to_int,
+            int_to_float: self.int_to_float,
             counters: Arc::new(OutputCounters::default()),
             events: self.events.clone(),
             msgs: msg_rx,
@@ -1361,6 +1472,7 @@ impl Coordinator {
                 WorkerMsg::SelectDevice(device)
             }
             PlayerCommand::SetFloatToInt(enabled) => WorkerMsg::SetFloatToInt(enabled),
+            PlayerCommand::SetIntToFloat(enabled) => WorkerMsg::SetIntToFloat(enabled),
             PlayerCommand::SetTiming {
                 period_frames,
                 buffer_frames,
@@ -1637,6 +1749,9 @@ mod tests {
     struct FakeOutput {
         calls: Arc<Mutex<FakeCalls>>,
         stop_flag: Arc<AtomicBool>,
+        /// True: the fake endpoint is float-only (like macOS internal
+        /// speakers), so integer streams negotiate the int-to-F32 fallback.
+        float_only: bool,
         drain: Option<std::thread::JoinHandle<()>>,
         /// Scripted result of `configure_dsd`: DoP or native DSD format.
         dsd_mode: DeviceFormat,
@@ -1652,6 +1767,7 @@ mod tests {
         fn new(
             calls: Arc<Mutex<FakeCalls>>,
             dsd_mode: DeviceFormat,
+            float_only: bool,
             drained: Arc<Mutex<Vec<u8>>>,
         ) -> Self {
             Self {
@@ -1659,6 +1775,7 @@ mod tests {
                 stop_flag: Arc::new(AtomicBool::new(false)),
                 drain: None,
                 dsd_mode,
+                float_only,
                 frame_bytes: Arc::new(AtomicU64::new(FRAME_BYTES as u64)),
                 drained,
             }
@@ -1685,14 +1802,15 @@ mod tests {
                 calls.configures += 1;
                 calls.buffers_seen.push(buffers);
             }
-            let (format, valid_bits) = match input.encoding {
-                SampleEncoding::S16 => (DeviceFormat::S16Le, 16),
-                SampleEncoding::S32 => (DeviceFormat::S32Le, 32),
+            let (format, valid_bits) = match (input.encoding, self.float_only) {
+                (SampleEncoding::S16, false) => (DeviceFormat::S16Le, 16),
+                (SampleEncoding::S32, false) => (DeviceFormat::S32Le, 32),
+                (SampleEncoding::F32, true) => (DeviceFormat::F32Le, 32),
                 _ => return Err(PlayerError::UnsupportedFormat {
                     rate_hz: input.rate_hz,
                     channels: input.layout.channels,
                     encoding: input.encoding,
-                    reason: "fake output supports only S16/S32",
+                    reason: "fake output supports only S16/S32, or only F32 in float-only mode",
                 }),
             };
             self.frame_bytes
@@ -1838,6 +1956,7 @@ mod tests {
             plan,
             stall_timeout,
             dsd_mode,
+            false,
             Some(test_buffers().period_frames),
             Some(test_buffers().buffer_frames),
         )
@@ -1845,13 +1964,26 @@ mod tests {
 
     /// Engine without timing overrides: per-rate Auto defaults.
     fn spawn_engine_auto(plan: HashMap<PathBuf, FakeTrack>) -> Harness {
-        spawn_engine_timed(plan, Duration::from_secs(5), DeviceFormat::Dop24, None, None)
+        spawn_engine_timed(plan, Duration::from_secs(5), DeviceFormat::Dop24, false, None, None)
+    }
+
+    /// Engine whose fake endpoint is float-only (macOS internal speakers).
+    fn spawn_engine_float_only(plan: HashMap<PathBuf, FakeTrack>) -> Harness {
+        spawn_engine_timed(
+            plan,
+            Duration::from_secs(5),
+            DeviceFormat::Dop24,
+            true,
+            Some(test_buffers().period_frames),
+            Some(test_buffers().buffer_frames),
+        )
     }
 
     fn spawn_engine_timed(
         plan: HashMap<PathBuf, FakeTrack>,
         stall_timeout: Duration,
         dsd_mode: DeviceFormat,
+        float_only: bool,
         period_frames: Option<u32>,
         buffer_frames: Option<u32>,
     ) -> Harness {
@@ -1861,7 +1993,7 @@ mod tests {
         let seeks = Arc::new(Mutex::new(Vec::new()));
         let release = Arc::new(AtomicBool::new(true));
         let drained = Arc::new(Mutex::new(Vec::new()));
-        let output = FakeOutput::new(Arc::clone(&calls), dsd_mode, Arc::clone(&drained));
+        let output = FakeOutput::new(Arc::clone(&calls), dsd_mode, float_only, Arc::clone(&drained));
         let decoder_factory: DecoderFactory = Box::new({
             let seeks = Arc::clone(&seeks);
             let release = Arc::clone(&release);
@@ -1938,6 +2070,7 @@ mod tests {
             "fake".to_owned(),
             period_frames,
             buffer_frames,
+            false,
             false,
             decoder_factory,
             event_tx,
@@ -3236,6 +3369,106 @@ mod tests {
     }
 
     #[test]
+    fn int_to_float_packing_is_exact_for_16_and_24_bit() {
+        let spec = StreamSpec { encoding: SampleEncoding::S16, ..test_spec(44_100) };
+        let output = OutputSpec {
+            device: "fake".to_owned(),
+            rate_hz: spec.rate_hz,
+            layout: spec.layout,
+            format: DeviceFormat::F32Le,
+            valid_bits: 32,
+        };
+        // Exact: 16-bit values land on binary fractions the F32 mantissa
+        // represents exactly.
+        let s16 = [i16::MIN, i16::MAX, 8192, -16384];
+        let mut bytes = Vec::new();
+        pack_int_to_float(
+            DecodedBlock::pcm_block(spec, 2, DecodedPcm::I16(&s16)),
+            &output,
+            &mut bytes,
+        )
+        .unwrap();
+        let actual: Vec<f32> = bytes
+            .chunks_exact(4)
+            .map(|chunk| f32::from_le_bytes(chunk.try_into().unwrap()))
+            .collect();
+        assert_eq!(actual, [-1.0, 32_767.0 / 32_768.0, 0.25, -0.5]);
+
+        // 24-bit: 2^24 - 1 needs 24 significant bits, still exact in F32.
+        let s24 = [-8_388_608, 8_388_607];
+        pack_int_to_float(
+            DecodedBlock::pcm_block(spec, 1, DecodedPcm::I24(&s24)),
+            &output,
+            &mut bytes,
+        )
+        .unwrap();
+        let actual: Vec<f32> = bytes
+            .chunks_exact(4)
+            .map(|chunk| f32::from_le_bytes(chunk.try_into().unwrap()))
+            .collect();
+        assert_eq!(actual, [-1.0, 8_388_607.0 / 8_388_608.0]);
+
+        // 32-bit: the low 8 bits round away (24-bit mantissa); the top 24
+        // bits survive exactly.
+        let s32 = [i32::MIN, i32::MAX, 0x0100_00ff, -0x0100_00ff];
+        pack_int_to_float(
+            DecodedBlock::pcm_block(spec, 2, DecodedPcm::I32(&s32)),
+            &output,
+            &mut bytes,
+        )
+        .unwrap();
+        let actual: Vec<f32> = bytes
+            .chunks_exact(4)
+            .map(|chunk| f32::from_le_bytes(chunk.try_into().unwrap()))
+            .collect();
+        assert_eq!(actual[0], -1.0);
+        assert_eq!(actual[1], 1.0 - 1.0 / 2_147_483_648.0_f32);
+        assert_eq!(
+            actual[2],
+            (f64::from(0x0100_00ff) / 2_147_483_648.0) as f32
+        );
+        assert_ne!(f64::from(actual[2]) * 2_147_483_648.0, f64::from(0x0100_00ff));
+    }
+
+    #[test]
+    fn opt_in_int_to_float_fallback_plays_float_bytes_and_marks_event() {
+        let spec = StreamSpec { encoding: SampleEncoding::S16, ..test_spec(44_100) };
+        let mut plan = HashMap::new();
+        plan.insert(PathBuf::from("int.flac"), FakeTrack::Pcm(spec, 512));
+        let harness = spawn_engine_float_only(plan);
+        harness.commands.send(PlayerCommand::SetIntToFloat(true)).unwrap();
+        enqueue(&harness, "int.flac");
+        harness.commands.send(PlayerCommand::Play).unwrap();
+        let event = recv_until(&harness.events, |event| {
+            matches!(event, PlayerEvent::Playing { .. })
+        });
+        assert!(matches!(event, PlayerEvent::Playing { converted: true, output: OutputSpec { format: DeviceFormat::F32Le, .. }, .. }));
+        recv_until(&harness.events, |event| matches!(event, PlayerEvent::EndOfQueue));
+        let drained = harness.drained.lock();
+        assert!(!drained.is_empty());
+        assert_eq!(drained.len() % 4, 0);
+        drop(drained);
+        harness.commands.send(PlayerCommand::Quit).unwrap();
+        harness.join().unwrap();
+    }
+
+    #[test]
+    fn float_only_endpoint_without_opt_in_stays_strict() {
+        let spec = StreamSpec { encoding: SampleEncoding::S16, ..test_spec(44_100) };
+        let mut plan = HashMap::new();
+        plan.insert(PathBuf::from("int.flac"), FakeTrack::Pcm(spec, 512));
+        let harness = spawn_engine_float_only(plan);
+        enqueue(&harness, "int.flac");
+        harness.commands.send(PlayerCommand::Play).unwrap();
+        let error = recv_until(&harness.events, |event| {
+            matches!(event, PlayerEvent::Error { kind: PlayerError::UnsupportedFormat { .. }, .. })
+        });
+        assert!(matches!(error, PlayerEvent::Error { .. }));
+        harness.commands.send(PlayerCommand::Quit).unwrap();
+        harness.join().unwrap();
+    }
+
+    #[test]
     fn converted_seek_reconfigures_and_remains_converted() {
         let mut float = test_spec(44_100);
         float.encoding = SampleEncoding::F32;
@@ -3477,6 +3710,7 @@ mod tests {
             plan,
             Duration::from_secs(5),
             DeviceFormat::Dop24,
+            false,
             Some(1_024),
             Some(4_096),
         );

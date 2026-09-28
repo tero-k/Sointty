@@ -30,6 +30,7 @@ struct Cli {
     period_frames: Option<u32>,
     buffer_frames: Option<u32>,
     float_to_int: Option<bool>,
+    int_to_float: Option<bool>,
     list_devices: bool,
     /// Enable the library index at the default data dir.
     index: bool,
@@ -48,6 +49,7 @@ fn parse_cli_args(args: impl IntoIterator<Item = String>) -> Result<Cli, PlayerE
     let mut period_frames = None;
     let mut buffer_frames = None;
     let mut float_to_int = None;
+    let mut int_to_float = None;
     let mut list_devices = false;
     let mut index = false;
     let mut reindex = Vec::new();
@@ -71,6 +73,8 @@ fn parse_cli_args(args: impl IntoIterator<Item = String>) -> Result<Cli, PlayerE
             }
             "--allow-float-to-int" => float_to_int = Some(true),
             "--no-float-to-int" => float_to_int = Some(false),
+            "--allow-int-to-float" => int_to_float = Some(true),
+            "--no-int-to-float" => int_to_float = Some(false),
             "--list-devices" => {
                 list_devices = true;
             }
@@ -92,7 +96,8 @@ fn parse_cli_args(args: impl IntoIterator<Item = String>) -> Result<Cli, PlayerE
             "--help" | "-h" => {
                 println!(
                     r#"Usage: sointty [--device DEVICE] [--period-frames N] [--buffer-frames N]
-               [--allow-float-to-int|--no-float-to-int] [--list-devices]
+               [--allow-float-to-int|--no-float-to-int]
+               [--allow-int-to-float|--no-int-to-float] [--list-devices]
                [--index] [--reindex DIR]... [FILE|PLAYLIST]...
 
 --device DEVICE       audio output device (default: "hw:0,0" on Linux, "default" elsewhere;
@@ -100,16 +105,21 @@ fn parse_cli_args(args: impl IntoIterator<Item = String>) -> Result<Cli, PlayerE
 --allow-float-to-int  opt in to F32-to-integer conversion if exact F32 is unavailable
                       (converted playback is NOT bit-perfect)
 --no-float-to-int     force strict mode for this run
+--allow-int-to-float  opt in to integer-to-F32 conversion if the endpoint offers no
+                      exact integer format (e.g. macOS internal speakers, which are
+                      float-only); S16/S24 convert exactly, S32 loses low bits
+--no-int-to-float     force strict mode for this run
 --list-devices        list audio output devices and exit
 --index               enable the library index at the default data dir
 --reindex DIR         scan DIR into the library index (repeat for more roots);
                       prints scan stats, then plays any files given, else exits
 
 Settings persist in <config dir>/sointty/config.toml; CLI flags override the file.
-In the TUI, press 'd' to pick output and 'c' to toggle F32 compatibility.
+In the TUI, press 'd' to pick output, 'c' for F32 compatibility, 'i' for
+integer-to-F32 compatibility.
 
 Keys: space play/pause, s stop, n next, left/right seek 10 s,
-      b browser, d output, c F32-to-integer compatibility, q quit.
+      b browser, d output, c F32-to-integer, i integer-to-F32, q quit.
 Playlists (.m3u, .m3u8, .pls, .xspf, .cue) are expanded into tracks.
 With no files, sointty opens the filesystem browser."#
                 );
@@ -126,6 +136,7 @@ With no files, sointty opens the filesystem browser."#
         period_frames,
         buffer_frames,
         float_to_int,
+        int_to_float,
         list_devices,
         index,
         reindex,
@@ -142,6 +153,7 @@ struct Config {
     period_frames: Option<u32>,
     buffer_frames: Option<u32>,
     float_to_int: Option<bool>,
+    int_to_float: Option<bool>,
     /// Last successfully browsed directory; restored on the next launch.
     last_browser_dir: Option<PathBuf>,
 }
@@ -198,6 +210,7 @@ struct Settings {
     period_frames: Option<u32>,
     buffer_frames: Option<u32>,
     float_to_int: bool,
+    int_to_float: bool,
 }
 
 /// Linux automatic output: the first available direct `hw:` endpoint.
@@ -247,6 +260,7 @@ fn resolve_settings(cli: &Cli, config: &Config) -> Result<Settings, PlayerError>
         period_frames,
         buffer_frames,
         float_to_int: cli.float_to_int.or(config.float_to_int).unwrap_or(false),
+        int_to_float: cli.int_to_float.or(config.int_to_float).unwrap_or(false),
     })
 }
 /// Parse `/proc/asound/pcm` into selectable `hw:CARD,DEV` playback endpoints.
@@ -318,6 +332,15 @@ fn float_to_int_saver() -> sointty_tui::FloatCompatibilitySaver {
     Box::new(|enabled| {
         let mut config = load_config_strict()?;
         config.float_to_int = Some(enabled);
+        save_config(&config).map_err(|error| error.to_string())
+    })
+}
+
+#[cfg(any(target_os = "linux", windows, target_os = "macos"))]
+fn int_to_float_saver() -> sointty_tui::FloatCompatibilitySaver {
+    Box::new(|enabled| {
+        let mut config = load_config_strict()?;
+        config.int_to_float = Some(enabled);
         save_config(&config).map_err(|error| error.to_string())
     })
 }
@@ -443,6 +466,7 @@ fn run(cli: Cli, settings: Settings) -> Result<(), PlayerError> {
         settings.period_frames,
         settings.buffer_frames,
         settings.float_to_int,
+        settings.int_to_float,
         decoder_factory,
         event_tx,
         player::DEFAULT_STALL_TIMEOUT,
@@ -487,6 +511,7 @@ fn run(cli: Cli, settings: Settings) -> Result<(), PlayerError> {
         home_dir,
         current_device: settings.device.clone(),
         float_to_int: settings.float_to_int,
+        int_to_float: settings.int_to_float,
         timing: (settings.period_frames, settings.buffer_frames),
         catalog: loaded.catalog,
         catalog_error: loaded.read_only_error,
@@ -495,6 +520,7 @@ fn run(cli: Cli, settings: Settings) -> Result<(), PlayerError> {
         device_provider: device_provider(),
         on_device_selected: device_saver(),
         on_float_to_int_selected: float_to_int_saver(),
+        on_int_to_float_selected: int_to_float_saver(),
         on_browser_dir: browser_dir_saver(),
         on_catalog: Box::new(|catalog| playlists::save(catalog)),
         on_timing: timing_saver(),
@@ -511,7 +537,7 @@ fn run(cli: Cli, settings: Settings) -> Result<(), PlayerError> {
 
 #[cfg(not(any(target_os = "linux", windows, target_os = "macos")))]
 fn run(cli: Cli, settings: Settings) -> Result<(), PlayerError> {
-    let _ = (cli.files, settings.device, settings.period_frames, settings.buffer_frames, settings.float_to_int);
+    let _ = (cli.files, settings.device, settings.period_frames, settings.buffer_frames, settings.float_to_int, settings.int_to_float);
     Err(PlayerError::InvalidInput(
         "audio output is not wired for this OS yet; use a Linux, Windows or macOS host",
     ))
@@ -662,6 +688,7 @@ mod tests {
             period_frames: Some(4_410),
             buffer_frames: None,
             float_to_int: Some(true),
+            int_to_float: Some(false),
             last_browser_dir: Some(PathBuf::from("C:\\Music")),
         };
         let text = toml::to_string_pretty(&config).unwrap();
@@ -671,6 +698,7 @@ mod tests {
         assert_eq!(parsed.float_to_int, Some(true));
         assert_eq!(parsed.buffer_frames, None);
         assert_eq!(parsed.last_browser_dir, Some(PathBuf::from("C:\\Music")));
+        assert_eq!(parsed.int_to_float, Some(false));
         // A pre-existing config without the field still parses.
         let legacy: Config = toml::from_str("device = \"hw:0,0\"\n").unwrap();
         assert_eq!(legacy.last_browser_dir, None);
@@ -684,6 +712,16 @@ mod tests {
         assert!(!resolve_settings(&parse(&["--no-float-to-int"]).unwrap(), &config).unwrap().float_to_int);
         let off = Config { float_to_int: Some(false), ..Config::default() };
         assert!(resolve_settings(&parse(&["--allow-float-to-int"]).unwrap(), &off).unwrap().float_to_int);
+    }
+
+    #[test]
+    fn int_to_float_compatibility_is_opt_in_with_cli_override() {
+        let config = Config { int_to_float: Some(true), ..Config::default() };
+        assert!(!resolve_settings(&parse(&[]).unwrap(), &Config::default()).unwrap().int_to_float);
+        assert!(resolve_settings(&parse(&[]).unwrap(), &config).unwrap().int_to_float);
+        assert!(!resolve_settings(&parse(&["--no-int-to-float"]).unwrap(), &config).unwrap().int_to_float);
+        let off = Config { int_to_float: Some(false), ..Config::default() };
+        assert!(resolve_settings(&parse(&["--allow-int-to-float"]).unwrap(), &off).unwrap().int_to_float);
     }
 
     #[test]

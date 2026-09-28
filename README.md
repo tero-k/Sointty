@@ -20,10 +20,12 @@ pane, selected playlist, and a context-sensitive key guide.
 ## Behavior
 
 - If the output device can't take the stream exactly as decoded, playback fails
-  with a typed error instead of a silent conversion. An explicit opt-in
-  (`--allow-float-to-int`, or `c` in the TUI) enables F32→integer conversion
-  for float-decoding formats on integer-only devices; converted output is
-  labeled `NOT bit-perfect` in the UI.
+  with a typed error instead of a silent conversion. Two explicit opt-ins relax
+  this: `--allow-float-to-int` (TUI `c`) enables F32→integer conversion for
+  float-decoding formats on integer-only devices, and `--allow-int-to-float`
+  (TUI `i`) enables integer→F32 conversion on float-only endpoints such as the
+  macOS internal speakers (S16/S24 convert exactly; S32 loses its low 8 bits).
+  Converted output is labeled `NOT bit-perfect` in the UI.
 - The negotiated format (rate, channels, packing, valid bits) is shown on
   screen as established with the device, not as requested.
 - Tracks with an identical stream specification play gaplessly through one
@@ -73,6 +75,7 @@ Press `d` to choose and save the output device.
 | `m` / `?` | menu / full keyboard help |
 | `d` | choose output device |
 | `c` | allow F32→integer conversion (off by default) |
+| `i` | allow integer→F32 conversion for float-only devices (off by default) |
 | `q` | quit immediately from any non-input pane |
 | `Ctrl+Q` | quit immediately, including while typing in a prompt |
 | `Esc` | close the current pane or step back through menus; quit when no pane is open |
@@ -102,6 +105,9 @@ toggle is available under `m` → Queue.
   initialization; mismatches raise `UnsupportedFormat`.
 - F32→integer conversion, when enabled, is round-to-nearest-even with clipping
   and no dither, and runs on the decoder thread, not the render thread.
+- Integer→F32 conversion, when enabled, divides by the full-scale integer
+  range with no dither and likewise runs on the decoder thread. S16 and S24
+  values land exactly in the F32 mantissa; S32 rounds to 24-bit precision.
 - DSD is a separate stream type: native DSD or DoP on ALSA, never converted to
   PCM.
 - No `cpal`, no ALSA `plug`/`plughw`/`default`, no WASAPI shared mode, no

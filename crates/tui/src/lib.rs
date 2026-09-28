@@ -14,8 +14,8 @@ use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::widgets::{Block, Borders, List, ListItem, ListState, Paragraph};
 use sointty_core::{
-    BufferConfig, DeviceId, OutputSpec, PlayerCommand, PlayerEvent, QueueEntry, QueueItem,
-    TrackId, TrackTags,
+    BufferConfig, DeviceFormat, DeviceId, OutputSpec, PlayerCommand, PlayerEvent, QueueEntry,
+    QueueItem, TrackId, TrackTags,
 };
 
 mod browser;
@@ -115,7 +115,8 @@ pub struct TuiState {
     /// the picker opens. Lets the UI show names instead of endpoint IDs.
     device_names: Vec<(DeviceId, String)>,
     float_to_int: bool,
-    /// Whether the last established output used F32-to-integer conversion.
+    int_to_float: bool,
+    /// Whether the last established output used an opted-in conversion.
     converted: bool,
     /// Negotiated output for the current stream, when playing.
     output_spec: Option<OutputSpec>,
@@ -141,6 +142,7 @@ impl TuiState {
     fn new(
         device: DeviceId,
         float_to_int: bool,
+        int_to_float: bool,
         timing: (Option<u32>, Option<u32>),
         catalog: PlaylistCatalog,
         catalog_error: Option<String>,
@@ -158,6 +160,7 @@ impl TuiState {
             device,
             device_names: Vec::new(),
             float_to_int,
+            int_to_float,
             converted: false,
             output_spec: None,
             timing,
@@ -376,6 +379,7 @@ pub struct RunOptions {
     pub home_dir: Option<PathBuf>,
     pub current_device: DeviceId,
     pub float_to_int: bool,
+    pub int_to_float: bool,
     /// DAC timing overrides from CLI/config (None = Auto).
     pub timing: (Option<u32>, Option<u32>),
     pub catalog: PlaylistCatalog,
@@ -389,6 +393,7 @@ pub struct Hooks {
     pub device_provider: DeviceProvider,
     pub on_device_selected: DeviceSaver,
     pub on_float_to_int_selected: FloatCompatibilitySaver,
+    pub on_int_to_float_selected: FloatCompatibilitySaver,
     pub on_browser_dir: BrowserDirSaver,
     pub on_catalog: PlaylistSaver,
     pub on_timing: TimingSaver,
@@ -426,6 +431,7 @@ impl App {
             state: TuiState::new(
                 options.current_device,
                 options.float_to_int,
+                options.int_to_float,
                 options.timing,
                 options.catalog,
                 options.catalog_error,
@@ -610,6 +616,24 @@ impl App {
 
     fn open_settings(&mut self) {
         self.pane = Some(Pane::Settings(SettingsPane { selected: 0 }));
+    }
+
+    fn toggle_float_to_int(&mut self) {
+        let enabled = !self.state.float_to_int;
+        let _ = self.commands.send(PlayerCommand::SetFloatToInt(enabled));
+        self.state.float_to_int = enabled;
+        if let Err(error) = (self.hooks.on_float_to_int_selected)(enabled) {
+            self.state.status = format!("F32 compatibility not saved: {error}");
+        }
+    }
+
+    fn toggle_int_to_float(&mut self) {
+        let enabled = !self.state.int_to_float;
+        let _ = self.commands.send(PlayerCommand::SetIntToFloat(enabled));
+        self.state.int_to_float = enabled;
+        if let Err(error) = (self.hooks.on_int_to_float_selected)(enabled) {
+            self.state.status = format!("integer-to-F32 compatibility not saved: {error}");
+        }
     }
 
     fn toggle_menu(&mut self) {
@@ -1129,12 +1153,13 @@ impl App {
             "f focus visible playlist | a/Enter song | A whole list",
             "r random queue ON/OFF | Tab queue/playlist | d device",
             "browser: a add item | A add folder | Backspace up/drives",
-            "c F32->int (NOT bit-perfect) | ? help | Esc back | q quit",
+            "c F32->int | i int->F32 (NOT bit-perfect) | ? help | Esc back",
             "Ctrl+Q quits even while typing in an input prompt.",
             "",
             "Fidelity: playback is always the exact native format; nothing is",
-            "resampled, remixed or converted unless F32->integer compatibility",
-            "is explicitly enabled (it is OFF by default and clearly labeled).",
+            "resampled, remixed or converted unless F32->integer (c) or",
+            "integer->F32 (i) compatibility is explicitly enabled (both are",
+            "OFF by default and clearly labeled when active).",
         ];
         let items = lines
             .iter()
@@ -1524,12 +1549,11 @@ impl App {
                 return false;
             }
             KeyCode::Char('c') => {
-                let enabled = !self.state.float_to_int;
-                let _ = self.commands.send(PlayerCommand::SetFloatToInt(enabled));
-                self.state.float_to_int = enabled;
-                if let Err(error) = (self.hooks.on_float_to_int_selected)(enabled) {
-                    self.state.status = format!("F32 compatibility not saved: {error}");
-                }
+                self.toggle_float_to_int();
+                return false;
+            }
+            KeyCode::Char('i') => {
+                self.toggle_int_to_float();
                 return false;
             }
             _ => {}
@@ -1716,21 +1740,14 @@ impl App {
                     settings.selected = settings.selected.saturating_sub(1)
                 }
                 KeyCode::Down | KeyCode::Char('j') => {
-                    settings.selected = (settings.selected + 1).min(3);
+                    settings.selected = (settings.selected + 1).min(4);
                 }
                 KeyCode::Enter => match settings.selected {
                     0 => self.toggle_devices(),
                     1 => self.set_timing(None, None),
                     2 => self.start_input("Period frames:", InputAction::TimingPeriod),
-                    3 => {
-                        let enabled = !self.state.float_to_int;
-                        let _ = self.commands.send(PlayerCommand::SetFloatToInt(enabled));
-                        self.state.float_to_int = enabled;
-                        if let Err(error) = (self.hooks.on_float_to_int_selected)(enabled) {
-                            self.state.status =
-                                format!("F32 compatibility not saved: {error}");
-                        }
-                    }
+                    3 => self.toggle_float_to_int(),
+                    4 => self.toggle_int_to_float(),
                     _ => {}
                 },
                 _ => {}
@@ -1783,7 +1800,12 @@ impl App {
             }
             PlayerEvent::Playing { track, output, converted } => {
                 state.status = if converted {
-                    "playing (F32 converted; not bit-perfect)".to_owned()
+                    let direction = if output.format == DeviceFormat::F32Le {
+                        "integer->F32 converted"
+                    } else {
+                        "F32->integer converted"
+                    };
+                    format!("playing ({direction}; not bit-perfect)")
                 } else {
                     "playing (bit-perfect)".to_owned()
                 };
@@ -1999,7 +2021,7 @@ fn key_hints(app: &App) -> [&'static str; 3] {
     };
     [
         "q Quit | ? Help | Space Play/Pause | s Stop | n Next | ←/→ Seek | r Random",
-        "b Browse | p Lists | l Locations | d DAC | m Menu | c F32->int | Tab View",
+        "b Browse | p Lists | l Locations | d DAC | m Menu | c F32->int | i int->F32",
         context,
     ]
 }
@@ -2026,7 +2048,7 @@ fn draw(frame: &mut ratatui::Frame<'_>, app: &App) {
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Length(3),
-            Constraint::Length(if track.is_empty() { 11 } else { 12 }),
+            Constraint::Length(if track.is_empty() { 12 } else { 13 }),
             Constraint::Min(3),
             Constraint::Length(5),
         ])
@@ -2049,7 +2071,11 @@ fn draw(frame: &mut ratatui::Frame<'_>, app: &App) {
                 output.rate_hz, output.layout.channels, output.format, output.valid_bits
             ),
             if state.converted {
-                "converted F32→integer (NOT bit-perfect)".to_owned()
+                if output.format == DeviceFormat::F32Le {
+                    "converted integer→F32 (NOT bit-perfect)".to_owned()
+                } else {
+                    "converted F32→integer (NOT bit-perfect)".to_owned()
+                }
             } else {
                 "decoder PCM preserved (bit-perfect)".to_owned()
             },
@@ -2078,7 +2104,7 @@ fn draw(frame: &mut ratatui::Frame<'_>, app: &App) {
     let bar_width = usize::from(bottom[1].width.saturating_sub(2)).saturating_sub(12);
     let bar = progress_bar(state.frame, state.total_frames, bar_width);
     let playback = Paragraph::new(format!(
-        "status: {}{}\nposition: {} frames\ndevice: {}\noutput: {}\nfidelity: {}\n{}\nF32→integer compatibility: {}\ntime: {} / {}\n{}",
+        "status: {}{}\nposition: {} frames\ndevice: {}\noutput: {}\nfidelity: {}\n{}\nF32→integer compatibility: {}\ninteger→F32 compatibility: {}\ntime: {} / {}\n{}",
         state.status,
         if track.is_empty() {
             String::new()
@@ -2091,6 +2117,11 @@ fn draw(frame: &mut ratatui::Frame<'_>, app: &App) {
         fidelity,
         timing_line,
         if state.float_to_int {
+            "ON (non-bit-perfect when used)"
+        } else {
+            "OFF (strict)"
+        },
+        if state.int_to_float {
             "ON (non-bit-perfect when used)"
         } else {
             "OFF (strict)"
@@ -2354,6 +2385,10 @@ fn draw(frame: &mut ratatui::Frame<'_>, app: &App) {
                             "F32→integer compatibility: {} (OFF = strict bit-perfect)",
                             if state.float_to_int { "ON" } else { "OFF" }
                         ),
+                        format!(
+                            "Integer→F32 compatibility: {} (OFF = strict bit-perfect)",
+                            if state.int_to_float { "ON" } else { "OFF" }
+                        ),
                     ];
                     let items: Vec<ListItem> = rows.into_iter().map(ListItem::new).collect();
                     let list = List::new(items)
@@ -2390,6 +2425,7 @@ mod tests {
         sent: Receiver<PlayerCommand>,
         saved_devices: Arc<Mutex<Vec<DeviceId>>>,
         saved_float: Arc<Mutex<Vec<bool>>>,
+        saved_int_float: Arc<Mutex<Vec<bool>>>,
         saved_dirs: Arc<Mutex<Vec<PathBuf>>>,
         saved_catalogs: Arc<Mutex<Vec<PlaylistCatalog>>>,
         saved_timing: Arc<Mutex<Vec<(Option<u32>, Option<u32>)>>>,
@@ -2400,6 +2436,7 @@ mod tests {
             device_provider: Box::new(move || devices.clone()),
             on_device_selected: Box::new(|_| Ok(())),
             on_float_to_int_selected: Box::new(|_| Ok(())),
+            on_int_to_float_selected: Box::new(|_| Ok(())),
             on_browser_dir: Box::new(|_| Ok(())),
             on_catalog: Box::new(|_| Ok(())),
             on_timing: Box::new(|_, _| Ok(())),
@@ -2417,6 +2454,7 @@ mod tests {
             home_dir: None,
             current_device: "dev1".to_owned(),
             float_to_int: false,
+            int_to_float: false,
             timing: (None, None),
             catalog: PlaylistCatalog::default(),
             catalog_error: None,
@@ -2427,12 +2465,14 @@ mod tests {
         let (commands, sent) = crossbeam_channel::unbounded();
         let saved_devices = Arc::new(Mutex::new(Vec::new()));
         let saved_float = Arc::new(Mutex::new(Vec::new()));
+        let saved_int_float = Arc::new(Mutex::new(Vec::new()));
         let saved_dirs = Arc::new(Mutex::new(Vec::new()));
         let saved_catalogs = Arc::new(Mutex::new(Vec::new()));
         let saved_timing = Arc::new(Mutex::new(Vec::new()));
         let hooks = {
             let devices_sink = Arc::clone(&saved_devices);
             let float_sink = Arc::clone(&saved_float);
+            let int_float_sink = Arc::clone(&saved_int_float);
             let dirs_sink = Arc::clone(&saved_dirs);
             let catalogs_sink = Arc::clone(&saved_catalogs);
             let timing_sink = Arc::clone(&saved_timing);
@@ -2444,6 +2484,10 @@ mod tests {
                 }),
                 on_float_to_int_selected: Box::new(move |enabled| {
                     float_sink.lock().push(enabled);
+                    Ok(())
+                }),
+                on_int_to_float_selected: Box::new(move |enabled| {
+                    int_float_sink.lock().push(enabled);
                     Ok(())
                 }),
                 on_browser_dir: Box::new(move |dir| {
@@ -2469,6 +2513,7 @@ mod tests {
             sent,
             saved_devices,
             saved_float,
+            saved_int_float,
             saved_dirs,
             saved_catalogs,
             saved_timing,
@@ -2629,6 +2674,19 @@ mod tests {
     }
 
     #[test]
+    fn int_to_float_toggle_is_explicit_and_saved() {
+        let mut h = harness(Vec::new());
+        assert!(!h.app.state.int_to_float);
+        h.key(KeyCode::Char('i'));
+        assert!(matches!(h.sent.recv().unwrap(), PlayerCommand::SetIntToFloat(true)));
+        assert!(h.app.state.int_to_float);
+        h.key(KeyCode::Char('i'));
+        assert!(matches!(h.sent.recv().unwrap(), PlayerCommand::SetIntToFloat(false)));
+        assert!(!h.app.state.int_to_float);
+        assert_eq!(*h.saved_int_float.lock(), vec![true, false]);
+    }
+
+    #[test]
     fn converted_playback_is_labeled_non_bit_perfect() {
         let mut h = harness(Vec::new());
         h.app.state.float_to_int = true;
@@ -2646,6 +2704,25 @@ mod tests {
         assert!(h.app.state.status.contains("not bit-perfect"));
         h.app.apply_event(PlayerEvent::EndOfQueue);
         assert!(h.app.state.converted, "last output must still be labeled converted");
+    }
+
+    #[test]
+    fn converted_float_output_is_labeled_integer_to_f32() {
+        let mut h = harness(Vec::new());
+        h.app.state.int_to_float = true;
+        h.app.apply_event(PlayerEvent::Playing {
+            track: 1,
+            output: sointty_core::OutputSpec {
+                device: "dev1".to_owned(),
+                rate_hz: 44_100,
+                layout: sointty_core::ChannelLayout::discrete(2),
+                format: sointty_core::DeviceFormat::F32Le,
+                valid_bits: 32,
+            },
+            converted: true,
+        });
+        assert!(h.app.state.status.contains("integer->F32"));
+        assert!(h.app.state.status.contains("not bit-perfect"));
     }
 
     // ---- remembered browsing -------------------------------------------------

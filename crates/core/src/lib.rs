@@ -282,6 +282,10 @@ pub enum PlayerCommand {
     SelectDevice(DeviceId),
     /// Opt in to non-bit-perfect F32-to-integer output when exact F32 fails.
     SetFloatToInt(bool),
+    /// Opt in to integer-to-F32 output when the endpoint offers no exact
+    /// integer format. S16/S24 convert exactly (both fit the F32 mantissa);
+    /// S32 rounds to 24-bit precision.
+    SetIntToFloat(bool),
     /// Override DAC timing; `None` restores the rate-relative default for
     /// that field. Applies on the next output configure.
     SetTiming {
@@ -307,7 +311,8 @@ pub enum PlayerEvent {
     Playing {
         track: TrackId,
         output: OutputSpec,
-        /// True only when samples were converted from F32 to integer PCM.
+        /// True only when samples underwent an opted-in format conversion
+        /// (F32→integer or integer→F32) instead of the exact path.
         converted: bool,
     },
     Position {
