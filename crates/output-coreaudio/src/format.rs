@@ -97,13 +97,21 @@ fn classify(candidate: CandidateFormat, spec: &StreamSpec) -> Option<DeviceForma
                 None
             }
         }
-        SampleEncoding::S24 if signed_int && !float && bits == 24 => {
-            // Core Audio's canonical 24-bit container is 24-in-32; a true
-            // packed 24-bit format is the fallback.
-            match (container_bits, aligned_high, packed) {
-                (32, true, _) => Some(DeviceFormat::S24In32High),
-                (32, false, _) => Some(DeviceFormat::S24In32Low),
-                (24, false, true) => Some(DeviceFormat::S24_3Le),
+        SampleEncoding::S24 if signed_int && !float => {
+            // Core Audio's canonical 24-bit container is 24-in-32 aligned
+            // high. A signed 32-bit slot also preserves a 24-bit stream
+            // exactly when samples are written top-aligned with zero low
+            // bits: the exact integer widening the fidelity contract
+            // permits, and the only option on devices (e.g. some USB DACs)
+            // that offer no 24-bit container.
+            //
+            // Packed 3-byte 24-bit formats are deliberately NOT matched:
+            // drivers accept the physical-format property but the HAL IO
+            // path keeps running 4-byte frames, so playback comes out
+            // garbled and fast (observed on an iFi USB DAC).
+            match (bits, container_bits, aligned_high) {
+                (24, 32, true) | (32, 32, _) => Some(DeviceFormat::S24In32High),
+                (24, 32, false) => Some(DeviceFormat::S24In32Low),
                 _ => None,
             }
         }
@@ -127,9 +135,9 @@ fn classify(candidate: CandidateFormat, spec: &StreamSpec) -> Option<DeviceForma
 
 /// Pick the offered physical format that preserves `spec` exactly.
 ///
-/// For 24-bit input the preference order is Core Audio's canonical
-/// packed-in-32 high-aligned container, then true packed 24-bit, then (least
-/// preferred, but still exact) low-aligned 24-in-32.
+/// For 24-bit input the preference order is a high-aligned container
+/// (canonical 24-in-32 or a widened 32-bit slot), then (least preferred,
+/// but still exact) low-aligned 24-in-32.
 pub(crate) fn pick_physical_format(
     candidates: &[CandidateFormat],
     spec: &StreamSpec,
@@ -146,18 +154,16 @@ pub(crate) fn pick_physical_format(
 
     match spec.encoding {
         SampleEncoding::S24 => {
-            let wanted = [
-                DeviceFormat::S24In32High,
-                DeviceFormat::S24_3Le,
-                DeviceFormat::S24In32Low,
-            ];
+            let wanted = [DeviceFormat::S24In32High, DeviceFormat::S24In32Low];
             wanted.iter().find_map(|&format| {
                 candidates.iter().enumerate().find_map(|(index, &c)| {
                     if classify(c, spec) == Some(format) {
                         Some(MatchedFormat {
                             index,
                             format,
-                            valid_bits: c.bits_per_channel as u8,
+                            // The stream's 24 valid bits, not the container
+                            // width (which may be a widened 32-bit slot).
+                            valid_bits: 24,
                         })
                     } else {
                         None
@@ -247,11 +253,27 @@ mod tests {
     }
 
     #[test]
-    fn s24_falls_back_to_packed24() {
+    fn s24_rejects_packed24_only_device() {
+        // Packed 3-byte formats are not matched on macOS: drivers accept
+        // the property but the IO path keeps running 4-byte frames.
         let offered = vec![lpcm(44100.0, 2, SIGNED_PACKED, 6, 24)];
-        let m = pick_physical_format(&offered, &spec(44100, 2, SampleEncoding::S24)).unwrap();
-        assert_eq!(m.format, DeviceFormat::S24_3Le);
+        assert!(pick_physical_format(&offered, &spec(44100, 2, SampleEncoding::S24)).is_none());
     }
+
+    #[test]
+    fn s24_widens_exactly_into_s32_slot() {
+        // Devices without a 24-bit container (iFi USB DAC): the signed
+        // 32-bit slot carries the samples top-aligned, low byte zero.
+        let offered = vec![
+            lpcm(44100.0, 2, SIGNED_PACKED, 6, 24), // packed 24, ignored
+            lpcm(44100.0, 2, SIGNED_PACKED, 8, 32),
+        ];
+        let m = pick_physical_format(&offered, &spec(44100, 2, SampleEncoding::S24)).unwrap();
+        assert_eq!(m.index, 1);
+        assert_eq!(m.format, DeviceFormat::S24In32High);
+        assert_eq!(m.valid_bits, 24);
+    }
+
 
     #[test]
     fn s24_low_aligned_last_resort() {
