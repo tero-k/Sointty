@@ -68,6 +68,19 @@ type IoBlockDyn = dyn Fn(
 // Property helpers (all unsafe FFI contained here)
 // ---------------------------------------------------------------------------
 
+/// Open the opt-in diagnostic log (`SOINTTY_COREAUDIO_LOG` env var) for
+/// format-negotiation forensics. Off by default; the only use outside
+/// configure is the documented one-time buffer-geometry dump on the first
+/// IO callback.
+fn debug_log() -> Option<std::fs::File> {
+    let path = std::env::var_os("SOINTTY_COREAUDIO_LOG")?;
+    std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+        .ok()
+}
+
 fn prop_addr(
     selector: u32,
     scope: u32,
@@ -413,6 +426,16 @@ impl CoreAudioOutput {
             return Err(Self::unsupported(input, "device has no output streams"));
         };
 
+        let mut log = debug_log();
+        if let Some(log) = &mut log {
+            use std::io::Write;
+            let _ = writeln!(
+                log,
+                "configure: {} Hz / {} ch / {:?}",
+                input.rate_hz, input.layout.channels, input.encoding
+            );
+        }
+
         let offered_address = prop_addr(
             kAudioStreamPropertyAvailablePhysicalFormats,
             kAudioObjectPropertyScopeGlobal,
@@ -423,6 +446,24 @@ impl CoreAudioOutput {
         // range after the format description).
         let offered: Vec<AudioStreamRangedDescription> = get_data(stream, &offered_address)
             .map_err(|_| Self::unsupported(input, "could not query available physical formats"))?;
+        if let Some(log) = &mut log {
+            use std::io::Write;
+            for d in &offered {
+                let a = &d.mFormat;
+                let _ = writeln!(
+                    log,
+                    "  offered: rate={} range=[{}, {}] flags=0x{:x} bpf={} ch={} bits={} id=0x{:x}",
+                    a.mSampleRate,
+                    d.mSampleRateRange.mMinimum,
+                    d.mSampleRateRange.mMaximum,
+                    a.mFormatFlags,
+                    a.mBytesPerFrame,
+                    a.mChannelsPerFrame,
+                    a.mBitsPerChannel,
+                    a.mFormatID,
+                );
+            }
+        }
         let candidates: Vec<CandidateFormat> = offered
             .iter()
             .map(|d| {
@@ -470,6 +511,11 @@ impl CoreAudioOutput {
             .map_err(|_| Self::unsupported(input, "could not read back the physical format"))?;
         // Fidelity contract: every field must come back exactly as requested.
         // (mReserved is required to be 0 by the HAL.)
+        if let Some(log) = &mut log {
+            use std::io::Write;
+            let _ = writeln!(log, "  chosen: {chosen:?}");
+            let _ = writeln!(log, "  readback: {readback:?}");
+        }
         if readback != chosen {
             return Err(Self::unsupported(
                 input,
@@ -488,15 +534,62 @@ impl CoreAudioOutput {
             Ok(()) => {
                 // SAFETY: documented UInt32 property.
                 let actual: u32 = get_value(self.device, &buffer_address).unwrap_or(0);
-                eprintln!(
-                    "sointty-output-coreaudio: device buffer frame size {actual} (requested {})",
-                    buffers.buffer_frames
-                );
+                if let Some(log) = &mut log {
+                    use std::io::Write;
+                    let _ = writeln!(
+                        log,
+                        "  buffer frame size {actual} (requested {})",
+                        buffers.buffer_frames
+                    );
+                }
             }
-            Err(_) => eprintln!(
-                "sointty-output-coreaudio: device rejected buffer frame size {}; using device default",
-                buffers.buffer_frames
-            ),
+            Err(_) => {
+                if let Some(log) = &mut log {
+                    use std::io::Write;
+                    let _ = writeln!(
+                        log,
+                        "  buffer frame size {} rejected; device default in use",
+                        buffers.buffer_frames
+                    );
+                }
+            }
+        }
+
+        // (e) Changing the buffer frame size can make a driver reset the
+        // stream to a default format/rate. Re-verify both and re-apply the
+        // physical format once; a second mismatch is a hard error because the
+        // device would otherwise render a different rate/layout than the
+        // ring carries (audible as wrong speed or garbled samples).
+        // SAFETY: documented Float64 property.
+        let settled_rate: f64 = get_value(self.device, &rate_address)
+            .map_err(|_| Self::unsupported(input, "could not re-read the nominal sample rate"))?;
+        // SAFETY: documented single-ASBD property on a stream.
+        let settled: AudioStreamBasicDescription = get_value(stream, &physical_address)
+            .map_err(|_| Self::unsupported(input, "could not re-read the physical format"))?;
+        if let Some(log) = &mut log {
+            use std::io::Write;
+            let _ = writeln!(log, "  settled rate={settled_rate} format={settled:?}");
+        }
+        if settled != chosen || settled_rate != wanted_rate {
+            // SAFETY: documented Float64 property.
+            set_value(self.device, &rate_address, &wanted_rate)
+                .map_err(|_| Self::unsupported(input, "device rejected the nominal sample rate"))?;
+            // SAFETY: documented single-ASBD property on a stream.
+            set_value(stream, &physical_address, &chosen)
+                .map_err(|_| Self::unsupported(input, "device rejected the exact physical format"))?;
+            // SAFETY: documented single-ASBD property on a stream.
+            let final_readback: AudioStreamBasicDescription = get_value(stream, &physical_address)
+                .map_err(|_| Self::unsupported(input, "could not read back the physical format"))?;
+            if let Some(log) = &mut log {
+                use std::io::Write;
+                let _ = writeln!(log, "  re-applied; final readback: {final_readback:?}");
+            }
+            if final_readback != chosen {
+                return Err(Self::unsupported(
+                    input,
+                    "device does not keep the exact physical format",
+                ));
+            }
         }
 
         let spec = OutputSpec {
@@ -554,12 +647,15 @@ impl AudioOutput for CoreAudioOutput {
         let promoted = Cell::new(false);
         let rt_handle: Cell<Option<audio_thread_priority::RtPriorityHandle>> = Cell::new(None);
         let consumer = RtConsumer(std::cell::UnsafeCell::new(pcm));
+        let log_path = std::env::var_os("SOINTTY_COREAUDIO_LOG");
         let io_block = move |_: NonNull<AudioTimeStamp>,
                              _: NonNull<AudioBufferList>,
                              _: NonNull<AudioTimeStamp>,
                              out: NonNull<AudioBufferList>,
                              _: NonNull<AudioTimeStamp>| {
-            io_proc(&consumer, &counters, frame_bytes, rate_hz, &promoted, &rt_handle, out);
+            io_proc(
+                &consumer, &counters, frame_bytes, rate_hz, &promoted, &rt_handle, &log_path, out,
+            );
         };
         let block: RcBlock<IoBlockDyn> = RcBlock::new(io_block);
 
@@ -641,8 +737,9 @@ impl RtConsumer {
 /// RT discipline: no heap allocation, no locks, no formatting, no channel
 /// sends — only `rtrb` lock-free pops, atomic counter updates, raw memory
 /// writes into the buffers the HAL provided, and the one-time
-/// best-effort thread-priority promotion (whose single eprintln happens on
-/// the first invocation, before any sustained rendering, only on failure).
+/// best-effort thread-priority promotion on the first invocation (whose
+/// eprintln and, when `SOINTTY_COREAUDIO_LOG` is set, buffer-geometry dump
+/// happen once, before any sustained rendering).
 #[allow(clippy::too_many_arguments)]
 fn io_proc(
     consumer: &RtConsumer,
@@ -651,8 +748,15 @@ fn io_proc(
     rate_hz: u32,
     promoted: &Cell<bool>,
     rt_handle: &Cell<Option<audio_thread_priority::RtPriorityHandle>>,
+    log_path: &Option<std::ffi::OsString>,
     out: NonNull<AudioBufferList>,
 ) {
+    // SAFETY: the HAL guarantees `out` points at a valid AudioBufferList for
+    // the current IO cycle, with `mNumberBuffers` buffers whose `mData` is
+    // either null (stream disabled) or writable for `mDataByteSize` bytes.
+    // The flexible `mBuffers` array is the documented C pattern.
+    let list = unsafe { out.as_ref() };
+
     if !promoted.replace(true) {
         // Best-effort MMCSS/time-constraint promotion of the render thread.
         // The handle is held in the `Cell` for the lifetime of the stream; the
@@ -663,6 +767,22 @@ fn io_proc(
                 "sointty-output-coreaudio: failed to promote render thread to real-time: {err}"
             ),
         }
+        if let Some(path) = log_path
+            && let Ok(mut log) = std::fs::OpenOptions::new().create(true).append(true).open(path)
+        {
+            use std::io::Write;
+            let _ = writeln!(
+                log,
+                "  io: buffers={} frame_bytes={frame_bytes}",
+                list.mNumberBuffers
+            );
+            for i in 0..list.mNumberBuffers as usize {
+                // SAFETY: `i < mNumberBuffers`, inside the flexible array
+                // the HAL allocated.
+                let buffer = unsafe { list.mBuffers.as_ptr().add(i).read() };
+                let _ = writeln!(log, "  io: buffer[{i}] bytes={}", buffer.mDataByteSize);
+            }
+        }
     }
 
     if frame_bytes == 0 {
@@ -670,11 +790,6 @@ fn io_proc(
     }
     let frame_bytes = frame_bytes as usize;
 
-    // SAFETY: the HAL guarantees `out` points at a valid AudioBufferList for
-    // the current IO cycle, with `mNumberBuffers` buffers whose `mData` is
-    // either null (stream disabled) or writable for `mDataByteSize` bytes.
-    // The flexible `mBuffers` array is the documented C pattern.
-    let list = unsafe { out.as_ref() };
     for i in 0..list.mNumberBuffers as usize {
         // SAFETY: `i < mNumberBuffers`, inside the flexible array the HAL
         // allocated.
