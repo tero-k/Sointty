@@ -23,11 +23,14 @@ pub(crate) const FLAG_IS_ALIGNED_HIGH: u32 = 1 << 4;
 /// `kAudioFormatFlagIsNonInterleaved`
 pub(crate) const FLAG_IS_NON_INTERLEAVED: u32 = 1 << 5;
 
-/// Platform-independent mirror of the `AudioStreamBasicDescription` fields we
-/// match on. The macOS HAL layer converts the real struct into this.
+/// Platform-independent mirror of the `AudioStreamRangedDescription` fields
+/// we match on. The macOS HAL layer converts the real struct into this.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub(crate) struct CandidateFormat {
-    pub sample_rate: f64,
+    /// Inclusive supported sample-rate range. A single fixed rate has
+    /// `rate_min == rate_max`.
+    pub rate_min: f64,
+    pub rate_max: f64,
     pub format_id: u32,
     pub format_flags: u32,
     pub bytes_per_frame: u32,
@@ -46,16 +49,18 @@ impl CandidateFormat {
 
     /// Common invariants for every bit-perfect candidate: linear PCM, native
     /// (little) endian, interleaved (the ring carries interleaved frames),
-    /// exact channel count, exact sample rate.
-    ///
-    /// Note: `kAudioStreamAnyRate` (0.0) listings are rejected here — the
-    /// fidelity contract requires an exact rate, never a negotiated one.
+    /// exact channel count, and the exact sample rate inside the offered
+    /// range. The HAL sets the requested rate on the physical format and
+    /// verifies it by readback, so a range match is still an exact-rate
+    /// guarantee.
     fn base_matches(self, spec: &StreamSpec) -> bool {
+        let rate = f64::from(spec.rate_hz);
         self.format_id == K_AUDIO_FORMAT_LINEAR_PCM
             && self.format_flags & FLAG_IS_BIG_ENDIAN == 0
             && self.format_flags & FLAG_IS_NON_INTERLEAVED == 0
             && self.channels_per_frame == u32::from(spec.layout.channels)
-            && self.sample_rate == f64::from(spec.rate_hz)
+            && self.rate_min <= rate
+            && rate <= self.rate_max
     }
 }
 
@@ -180,8 +185,20 @@ mod tests {
     }
 
     fn lpcm(rate: f64, channels: u32, flags: u32, bytes_per_frame: u32, bits: u32) -> CandidateFormat {
+        lpcm_ranged(rate, rate, channels, flags, bytes_per_frame, bits)
+    }
+
+    fn lpcm_ranged(
+        rate_min: f64,
+        rate_max: f64,
+        channels: u32,
+        flags: u32,
+        bytes_per_frame: u32,
+        bits: u32,
+    ) -> CandidateFormat {
         CandidateFormat {
-            sample_rate: rate,
+            rate_min,
+            rate_max,
             format_id: K_AUDIO_FORMAT_LINEAR_PCM,
             format_flags: flags,
             bytes_per_frame,
@@ -244,9 +261,18 @@ mod tests {
     }
 
     #[test]
-    fn rejects_any_rate_listing() {
-        let offered = vec![lpcm(0.0, 2, SIGNED_PACKED, 4, 16)]; // kAudioStreamAnyRate
-        assert!(pick_physical_format(&offered, &spec(44100, 2, SampleEncoding::S16)).is_none());
+    fn matches_ranged_listing_containing_the_exact_rate() {
+        // kAudioStreamAnyRate hardware offers min/max ranges; the HAL pins
+        // the exact rate on the physical format and verifies the readback.
+        let offered = vec![lpcm_ranged(44100.0, 192000.0, 2, SIGNED_PACKED, 4, 16)];
+        let m = pick_physical_format(&offered, &spec(96000, 2, SampleEncoding::S16)).unwrap();
+        assert_eq!(m.format, DeviceFormat::S16Le);
+    }
+
+    #[test]
+    fn rejects_range_excluding_the_rate() {
+        let offered = vec![lpcm_ranged(44100.0, 48000.0, 2, SIGNED_PACKED, 4, 16)];
+        assert!(pick_physical_format(&offered, &spec(96000, 2, SampleEncoding::S16)).is_none());
     }
 
     #[test]

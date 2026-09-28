@@ -45,6 +45,7 @@ use objc2_core_audio::{
     kAudioObjectPropertyName, kAudioObjectPropertyScopeGlobal,
     kAudioObjectPropertyScopeOutput, kAudioObjectSystemObject,
     kAudioStreamPropertyAvailablePhysicalFormats, kAudioStreamPropertyPhysicalFormat,
+    AudioStreamRangedDescription,
 };
 use objc2_core_audio_types::{AudioBufferList, AudioStreamBasicDescription, AudioTimeStamp};
 use sointty_core::{
@@ -417,18 +418,32 @@ impl CoreAudioOutput {
             kAudioObjectPropertyScopeGlobal,
             kAudioObjectPropertyElementMain,
         );
-        // SAFETY: documented array-of-ASBD property on a stream.
-        let offered: Vec<AudioStreamBasicDescription> = get_data(stream, &offered_address)
+        // SAFETY: documented array-of-AudioStreamRangedDescription property
+        // on a stream (NOT plain ASBDs: each entry carries a sample-rate
+        // range after the format description).
+        let offered: Vec<AudioStreamRangedDescription> = get_data(stream, &offered_address)
             .map_err(|_| Self::unsupported(input, "could not query available physical formats"))?;
         let candidates: Vec<CandidateFormat> = offered
             .iter()
-            .map(|a| CandidateFormat {
-                sample_rate: a.mSampleRate,
-                format_id: a.mFormatID,
-                format_flags: a.mFormatFlags,
-                bytes_per_frame: a.mBytesPerFrame,
-                channels_per_frame: a.mChannelsPerFrame,
-                bits_per_channel: a.mBitsPerChannel,
+            .map(|d| {
+                let a = &d.mFormat;
+                // When mSampleRate is kAudioStreamAnyRate (0.0) the supported
+                // rates are the inclusive range; otherwise the range
+                // degenerates to mSampleRate itself.
+                let (rate_min, rate_max) = if a.mSampleRate == 0.0 {
+                    (d.mSampleRateRange.mMinimum, d.mSampleRateRange.mMaximum)
+                } else {
+                    (a.mSampleRate, a.mSampleRate)
+                };
+                CandidateFormat {
+                    rate_min,
+                    rate_max,
+                    format_id: a.mFormatID,
+                    format_flags: a.mFormatFlags,
+                    bytes_per_frame: a.mBytesPerFrame,
+                    channels_per_frame: a.mChannelsPerFrame,
+                    bits_per_channel: a.mBitsPerChannel,
+                }
             })
             .collect();
         let Some(matched) = pick_physical_format(&candidates, input) else {
@@ -437,7 +452,10 @@ impl CoreAudioOutput {
                 "no offered physical format preserves the stream exactly",
             ));
         };
-        let chosen = offered[matched.index];
+        // Pin the exact requested rate on the chosen physical format; the
+        // readback below verifies the hardware settled on it.
+        let mut chosen = offered[matched.index].mFormat;
+        chosen.mSampleRate = wanted_rate;
 
         let physical_address = prop_addr(
             kAudioStreamPropertyPhysicalFormat,
