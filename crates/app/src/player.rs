@@ -457,9 +457,21 @@ struct Worker<O: AudioOutput> {
     float_to_int: bool,
     int_to_float: bool,
     counters: Arc<OutputCounters>,
+    /// Last total observed for the current output run. Keep `xruns`
+    /// cumulative so the backend can report its final count at stop.
+    reported_xruns: u64,
     events: Sender<PlayerEvent>,
     msgs: Receiver<WorkerMsg>,
     shared: Arc<Mutex<TrackState>>,
+}
+
+fn new_xruns(counters: &OutputCounters, reported: &mut u64) -> bool {
+    let total = counters.xruns();
+    if total == *reported {
+        return false;
+    }
+    *reported = total;
+    true
 }
 
 impl<O: AudioOutput> Worker<O> {
@@ -904,6 +916,7 @@ impl<O: AudioOutput> Worker<O> {
             packing: Packing::for_output(&output_spec, conversion),
         };
         self.counters = Arc::new(OutputCounters::default());
+        self.reported_xruns = 0;
         self.prefill(&mut playback)?;
         self.output.start(consumer, Arc::clone(&self.counters))?;
         self.emit(PlayerEvent::Playing {
@@ -964,6 +977,7 @@ impl<O: AudioOutput> Worker<O> {
             packing,
         };
         self.counters = Arc::new(OutputCounters::default());
+        self.reported_xruns = 0;
         self.prefill(&mut playback)?;
         self.output.start(consumer, Arc::clone(&self.counters))?;
         self.playback = Some(playback);
@@ -1031,6 +1045,7 @@ impl<O: AudioOutput> Worker<O> {
             packing: Packing::for_output(&output_spec, conversion),
         };
         self.counters = Arc::new(OutputCounters::default());
+        self.reported_xruns = 0;
         self.prefill(&mut playback)?;
         self.output.start(consumer, Arc::clone(&self.counters))?;
         self.playback = Some(playback);
@@ -1149,7 +1164,7 @@ impl<O: AudioOutput> Worker<O> {
         if self.counters.fault.load(Ordering::Relaxed) {
             return Err(PlayerError::Output);
         }
-        if self.counters.xruns.swap(0, Ordering::Relaxed) > 0 {
+        if new_xruns(&self.counters, &mut self.reported_xruns) {
             if let Some(track) = &self.current {
                 self.emit(PlayerEvent::Underrun { track: track.id });
             }
@@ -1394,6 +1409,7 @@ impl<O: AudioOutput + 'static> PlayerEngine<O> {
             float_to_int: self.float_to_int,
             int_to_float: self.int_to_float,
             counters: Arc::new(OutputCounters::default()),
+            reported_xruns: 0,
             events: self.events.clone(),
             msgs: msg_rx,
             shared: Arc::clone(&shared),
@@ -1563,6 +1579,22 @@ mod tests {
     };
 
     const FRAME_BYTES: usize = 4; // S16 stereo
+
+    #[test]
+    fn underrun_reports_each_new_total_without_erasing_diagnostic_count() {
+        let counters = OutputCounters::default();
+        let mut reported = 0;
+        assert!(!new_xruns(&counters, &mut reported));
+
+        counters.xruns.fetch_add(2, Ordering::Relaxed);
+        assert!(new_xruns(&counters, &mut reported));
+        assert!(!new_xruns(&counters, &mut reported));
+        assert_eq!(counters.xruns(), 2);
+
+        counters.xruns.fetch_add(1, Ordering::Relaxed);
+        assert!(new_xruns(&counters, &mut reported));
+        assert_eq!(counters.xruns(), 3);
+    }
 
     /// What the fake decoder factory builds for a queued path: PCM with a
     /// total frame count, or DSD with a total per-channel DSD byte count.
