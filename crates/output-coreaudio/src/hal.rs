@@ -31,14 +31,15 @@ use std::cell::Cell;
 use std::ffi::{CStr, c_char, c_void};
 use std::ptr::NonNull;
 use std::sync::Arc;
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use block2::RcBlock;
 use objc2_core_audio::{
     AudioDeviceCreateIOProcIDWithBlock, AudioDeviceDestroyIOProcID, AudioDeviceStart,
     AudioDeviceStop, AudioObjectGetPropertyData, AudioObjectGetPropertyDataSize,
     AudioObjectID, AudioObjectPropertyAddress, AudioObjectSetPropertyData,
-    AudioDeviceIOProcID, kAudioDevicePropertyBufferFrameSize, kAudioDevicePropertyHogMode,
+    AudioDeviceIOProcID, kAudioDevicePropertyActualSampleRate,
+    kAudioDevicePropertyBufferFrameSize, kAudioDevicePropertyHogMode,
     kAudioDevicePropertyNominalSampleRate, kAudioDevicePropertyStreams,
     kAudioHardwareNoError, kAudioHardwarePropertyDefaultOutputDevice,
     kAudioHardwarePropertyDevices, kAudioObjectPropertyElementMain,
@@ -255,6 +256,8 @@ pub struct CoreAudioOutput {
     /// Retained handle to the render counters so `stop` can record the final
     /// played/xrun totals in the diagnostic log. Not read on the RT path.
     counters: Option<Arc<OutputCounters>>,
+    /// First frame not supplied by the ring (diagnostics only).
+    first_xrun_frame: Option<Arc<AtomicU64>>,
 }
 
 // SAFETY: see the struct documentation. The HAL retains its own copy of the
@@ -297,6 +300,7 @@ impl CoreAudioOutput {
             hog_acquired: false,
             spec: None,
             counters: None,
+            first_xrun_frame: None,
         })
     }
 
@@ -595,6 +599,19 @@ impl CoreAudioOutput {
                 ));
             }
         }
+        if let Some(log) = &mut log {
+            use std::io::Write;
+            // A nominal-rate readback is not a measurement of the running
+            // hardware clock. This property is optional on some endpoints.
+            let address = prop_addr(
+                kAudioDevicePropertyActualSampleRate,
+                kAudioObjectPropertyScopeGlobal,
+                kAudioObjectPropertyElementMain,
+            );
+            // SAFETY: actual sample rate is a Float64 property on the device.
+            let actual_rate: Result<f64, i32> = get_value(self.device, &address);
+            let _ = writeln!(log, "  actual rate before start: {actual_rate:?}");
+        }
 
         let spec = OutputSpec {
             device: self.device_id.clone(),
@@ -652,14 +669,19 @@ impl AudioOutput for CoreAudioOutput {
         let rt_handle: Cell<Option<audio_thread_priority::RtPriorityHandle>> = Cell::new(None);
         let consumer = RtConsumer(std::cell::UnsafeCell::new(pcm));
         let log_path = std::env::var_os("SOINTTY_COREAUDIO_LOG");
-        self.counters = Some(Arc::clone(&counters));
+        self.counters = log_path.as_ref().map(|_| Arc::clone(&counters));
+        let first_xrun_frame = log_path
+            .as_ref()
+            .map(|_| Arc::new(AtomicU64::new(u64::MAX)));
+        self.first_xrun_frame = first_xrun_frame.clone();
         let io_block = move |_: NonNull<AudioTimeStamp>,
                              _: NonNull<AudioBufferList>,
                              _: NonNull<AudioTimeStamp>,
                              out: NonNull<AudioBufferList>,
                              _: NonNull<AudioTimeStamp>| {
             io_proc(
-                &consumer, &counters, frame_bytes, rate_hz, &promoted, &rt_handle, &log_path, out,
+                &consumer, &counters, first_xrun_frame.as_deref(), frame_bytes, rate_hz,
+                &promoted, &rt_handle, &log_path, out,
             );
         };
         let block: RcBlock<IoBlockDyn> = RcBlock::new(io_block);
@@ -716,14 +738,16 @@ impl AudioOutput for CoreAudioOutput {
         // Drop our block reference only after the HAL released its copy.
         self.block = None;
         self.release_hog();
-        // Diagnostic: the final render totals answer "did it underrun?" from
-        // the log alone. Off unless SOINTTY_COREAUDIO_LOG is set; never on
-        // the RT path.
+        // Diagnostic counters are read only after the callback is stopped.
+        let first_xrun_frame = self.first_xrun_frame.take().and_then(|first| {
+            let frame = first.load(Ordering::Relaxed);
+            (frame != u64::MAX).then_some(frame)
+        });
         if let (Some(mut log), Some(counters)) = (debug_log(), self.counters.take()) {
             use std::io::Write;
             let _ = writeln!(
                 log,
-                "  stop: played_frames={} xruns={}",
+                "  stop: played_frames={} xruns={} first_xrun_frame={first_xrun_frame:?}",
                 counters.played_frames.load(Ordering::Relaxed),
                 counters.xruns.load(Ordering::Relaxed),
             );
@@ -761,6 +785,7 @@ impl RtConsumer {
 fn io_proc(
     consumer: &RtConsumer,
     counters: &OutputCounters,
+    first_xrun_frame: Option<&AtomicU64>,
     frame_bytes: u32,
     rate_hz: u32,
     promoted: &Cell<bool>,
@@ -839,6 +864,15 @@ fn io_proc(
             // count exactly one xrun per underrun buffer.
             // SAFETY: `written < needed <= capacity`.
             unsafe { std::ptr::write_bytes(dst.add(written), 0, needed - written) };
+            if let Some(first) = first_xrun_frame {
+                let frame = counters.played_frames.load(Ordering::Relaxed) + complete_frames as u64;
+                let _ = first.compare_exchange(
+                    u64::MAX,
+                    frame,
+                    Ordering::Relaxed,
+                    Ordering::Relaxed,
+                );
+            }
             counters.xruns.fetch_add(1, Ordering::Relaxed);
         }
         counters
