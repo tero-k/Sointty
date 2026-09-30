@@ -13,6 +13,9 @@ ogg = { workspace = true, optional = true }
 opus = { workspace = true, optional = true }
 ffmpeg-next = { workspace = true, optional = true }
 
+[dev-dependencies]
+sointty-source.workspace = true
+
 [features]
 # Ogg Opus decoding via native libopus; requires libopus present at build time
 # (pkg-config on Linux). Enabled by the app on Linux only.
