@@ -252,6 +252,9 @@ pub struct CoreAudioOutput {
     block: Option<RcBlock<IoBlockDyn>>,
     hog_acquired: bool,
     spec: Option<OutputSpec>,
+    /// Retained handle to the render counters so `stop` can record the final
+    /// played/xrun totals in the diagnostic log. Not read on the RT path.
+    counters: Option<Arc<OutputCounters>>,
 }
 
 // SAFETY: see the struct documentation. The HAL retains its own copy of the
@@ -293,6 +296,7 @@ impl CoreAudioOutput {
             block: None,
             hog_acquired: false,
             spec: None,
+            counters: None,
         })
     }
 
@@ -648,6 +652,7 @@ impl AudioOutput for CoreAudioOutput {
         let rt_handle: Cell<Option<audio_thread_priority::RtPriorityHandle>> = Cell::new(None);
         let consumer = RtConsumer(std::cell::UnsafeCell::new(pcm));
         let log_path = std::env::var_os("SOINTTY_COREAUDIO_LOG");
+        self.counters = Some(Arc::clone(&counters));
         let io_block = move |_: NonNull<AudioTimeStamp>,
                              _: NonNull<AudioBufferList>,
                              _: NonNull<AudioTimeStamp>,
@@ -711,6 +716,18 @@ impl AudioOutput for CoreAudioOutput {
         // Drop our block reference only after the HAL released its copy.
         self.block = None;
         self.release_hog();
+        // Diagnostic: the final render totals answer "did it underrun?" from
+        // the log alone. Off unless SOINTTY_COREAUDIO_LOG is set; never on
+        // the RT path.
+        if let (Some(mut log), Some(counters)) = (debug_log(), self.counters.take()) {
+            use std::io::Write;
+            let _ = writeln!(
+                log,
+                "  stop: played_frames={} xruns={}",
+                counters.played_frames.load(Ordering::Relaxed),
+                counters.xruns.load(Ordering::Relaxed),
+            );
+        }
         match first_error {
             Some(err) => Err(err),
             None => Ok(()),
