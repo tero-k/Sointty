@@ -29,9 +29,10 @@
 
 use std::cell::Cell;
 use std::ffi::{CStr, c_char, c_void};
+use std::mem::MaybeUninit;
 use std::ptr::NonNull;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 
 use block2::RcBlock;
 use objc2_core_audio::{
@@ -65,14 +66,36 @@ type IoBlockDyn = dyn Fn(
     NonNull<AudioTimeStamp>,
 );
 
+const LOGGED_BUFFERS: usize = 8;
+
+/// One render thread's best-effort diagnostics. The HAL writes only atomics;
+/// `stop` formats and writes the log after the IO block has been destroyed.
+struct RenderReport {
+    first_xrun_frame: AtomicU64,
+    promotion_failed: AtomicBool,
+    buffer_count: AtomicU32,
+    buffer_bytes: [AtomicU32; LOGGED_BUFFERS],
+    frame_bytes: u32,
+}
+
+impl RenderReport {
+    fn new(frame_bytes: u32) -> Self {
+        Self {
+            first_xrun_frame: AtomicU64::new(u64::MAX),
+            promotion_failed: AtomicBool::new(false),
+            buffer_count: AtomicU32::new(0),
+            buffer_bytes: std::array::from_fn(|_| AtomicU32::new(0)),
+            frame_bytes,
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Property helpers (all unsafe FFI contained here)
 // ---------------------------------------------------------------------------
 
 /// Open the opt-in diagnostic log (`SOINTTY_COREAUDIO_LOG` env var) for
-/// format-negotiation forensics. Off by default; the only use outside
-/// configure is the documented one-time buffer-geometry dump on the first
-/// IO callback.
+/// format-negotiation forensics. Never called on the HAL render thread.
 fn debug_log() -> Option<std::fs::File> {
     let path = std::env::var_os("SOINTTY_COREAUDIO_LOG")?;
     std::fs::OpenOptions::new()
@@ -256,8 +279,8 @@ pub struct CoreAudioOutput {
     /// Retained handle to the render counters so `stop` can record the final
     /// played/xrun totals in the diagnostic log. Not read on the RT path.
     counters: Option<Arc<OutputCounters>>,
-    /// First frame not supplied by the ring (diagnostics only).
-    first_xrun_frame: Option<Arc<AtomicU64>>,
+    /// Retained until `stop` can read it after the callback is destroyed.
+    report: Option<Arc<RenderReport>>,
 }
 
 // SAFETY: see the struct documentation. The HAL retains its own copy of the
@@ -300,7 +323,7 @@ impl CoreAudioOutput {
             hog_acquired: false,
             spec: None,
             counters: None,
-            first_xrun_frame: None,
+            report: None,
         })
     }
 
@@ -662,26 +685,31 @@ impl AudioOutput for CoreAudioOutput {
         let frame_bytes = spec.bytes_per_frame() as u32;
         let rate_hz = spec.rate_hz;
 
-        // Everything the RT callback needs is captured here, before start;
-        // the callback body performs no allocation, no locking, and no
-        // formatting beyond the one-time best-effort promotion report.
+        // Capture everything the callback needs before starting the device.
+        // Only the one-time thread-priority request is performed in the
+        // callback in addition to bulk ring reads and HAL buffer writes.
         let promoted = Cell::new(false);
         let rt_handle: Cell<Option<audio_thread_priority::RtPriorityHandle>> = Cell::new(None);
         let consumer = RtConsumer(std::cell::UnsafeCell::new(pcm));
-        let log_path = std::env::var_os("SOINTTY_COREAUDIO_LOG");
-        self.counters = log_path.as_ref().map(|_| Arc::clone(&counters));
-        let first_xrun_frame = log_path
-            .as_ref()
-            .map(|_| Arc::new(AtomicU64::new(u64::MAX)));
-        self.first_xrun_frame = first_xrun_frame.clone();
+        let log_enabled = std::env::var_os("SOINTTY_COREAUDIO_LOG").is_some();
+        self.counters = log_enabled.then(|| Arc::clone(&counters));
+        let report = Arc::new(RenderReport::new(frame_bytes));
+        self.report = Some(Arc::clone(&report));
         let io_block = move |_: NonNull<AudioTimeStamp>,
                              _: NonNull<AudioBufferList>,
                              _: NonNull<AudioTimeStamp>,
                              out: NonNull<AudioBufferList>,
                              _: NonNull<AudioTimeStamp>| {
             io_proc(
-                &consumer, &counters, first_xrun_frame.as_deref(), frame_bytes, rate_hz,
-                &promoted, &rt_handle, &log_path, out,
+                &consumer,
+                &counters,
+                &report,
+                frame_bytes,
+                rate_hz,
+                &promoted,
+                &rt_handle,
+                log_enabled,
+                out,
             );
         };
         let block: RcBlock<IoBlockDyn> = RcBlock::new(io_block);
@@ -738,19 +766,49 @@ impl AudioOutput for CoreAudioOutput {
         // Drop our block reference only after the HAL released its copy.
         self.block = None;
         self.release_hog();
-        // Diagnostic counters are read only after the callback is stopped.
-        let first_xrun_frame = self.first_xrun_frame.take().and_then(|first| {
-            let frame = first.load(Ordering::Relaxed);
-            (frame != u64::MAX).then_some(frame)
-        });
-        if let (Some(mut log), Some(counters)) = (debug_log(), self.counters.take()) {
+        // The HAL callback has stopped; filesystem I/O and error reporting
+        // are safe here, never on its render thread.
+        let report = self.report.take();
+        let mut promotion_logged = false;
+        if let (Some(mut log), Some(counters), Some(report)) =
+            (debug_log(), self.counters.take(), report.as_ref())
+        {
             use std::io::Write;
+            let buffer_count = report.buffer_count.load(Ordering::Acquire);
+            if buffer_count > 0 {
+                let _ = writeln!(
+                    log,
+                    "  io: buffers={buffer_count} frame_bytes={}",
+                    report.frame_bytes
+                );
+                for i in 0..(buffer_count as usize).min(LOGGED_BUFFERS) {
+                    let bytes = report.buffer_bytes[i].load(Ordering::Relaxed);
+                    let _ = writeln!(log, "  io: buffer[{i}] bytes={bytes}");
+                }
+                if buffer_count as usize > LOGGED_BUFFERS {
+                    let _ = writeln!(log, "  io: remaining buffer sizes omitted");
+                }
+            }
+            if report.promotion_failed.load(Ordering::Relaxed) {
+                promotion_logged = writeln!(log, "  io: render-thread promotion failed").is_ok();
+            }
+            let first_xrun_frame = match report.first_xrun_frame.load(Ordering::Relaxed) {
+                u64::MAX => None,
+                frame => Some(frame),
+            };
             let _ = writeln!(
                 log,
                 "  stop: played_frames={} xruns={} first_xrun_frame={first_xrun_frame:?}",
                 counters.played_frames.load(Ordering::Relaxed),
                 counters.xruns.load(Ordering::Relaxed),
             );
+        }
+        if report
+            .as_ref()
+            .is_some_and(|report| report.promotion_failed.load(Ordering::Relaxed))
+            && !promotion_logged
+        {
+            eprintln!("sointty-output-coreaudio: failed to promote render thread to real-time");
         }
         match first_error {
             Some(err) => Err(err),
@@ -766,31 +824,31 @@ impl AudioOutput for CoreAudioOutput {
 struct RtConsumer(std::cell::UnsafeCell<rtrb::Consumer<u8>>);
 
 impl RtConsumer {
-    fn pop(&self) -> Result<u8, rtrb::PopError> {
-        // SAFETY: exclusively accessed from the serial IO callback; `start`
-        // moves the only handle into the block and never touches it again.
-        unsafe { &mut *self.0.get() }.pop()
+    fn pop_partial_slice_uninit<'a>(
+        &self,
+        dst: &'a mut [MaybeUninit<u8>],
+    ) -> (&'a mut [u8], &'a mut [MaybeUninit<u8>]) {
+        // SAFETY: the HAL invokes this block serially; the block holds the
+        // only consumer handle. `dst` is the current HAL output buffer.
+        unsafe { &mut *self.0.get() }.pop_partial_slice_uninit(dst)
     }
 }
 
 /// Real-time render callback. Runs on the HAL's render thread.
 ///
-/// RT discipline: no heap allocation, no locks, no formatting, no channel
-/// sends — only `rtrb` lock-free pops, atomic counter updates, raw memory
-/// writes into the buffers the HAL provided, and the one-time
-/// best-effort thread-priority promotion on the first invocation (whose
-/// eprintln and, when `SOINTTY_COREAUDIO_LOG` is set, buffer-geometry dump
-/// happen once, before any sustained rendering).
+/// No filesystem I/O, formatting or locks: copies ring bytes directly into
+/// HAL buffers and stores diagnostic atomics. Thread priority is requested
+/// once, before sustained rendering; failures are reported by `stop`.
 #[allow(clippy::too_many_arguments)]
 fn io_proc(
     consumer: &RtConsumer,
     counters: &OutputCounters,
-    first_xrun_frame: Option<&AtomicU64>,
+    report: &RenderReport,
     frame_bytes: u32,
     rate_hz: u32,
     promoted: &Cell<bool>,
     rt_handle: &Cell<Option<audio_thread_priority::RtPriorityHandle>>,
-    log_path: &Option<std::ffi::OsString>,
+    log_enabled: bool,
     out: NonNull<AudioBufferList>,
 ) {
     // SAFETY: the HAL guarantees `out` points at a valid AudioBufferList for
@@ -800,30 +858,22 @@ fn io_proc(
     let list = unsafe { out.as_ref() };
 
     if !promoted.replace(true) {
-        // Best-effort MMCSS/time-constraint promotion of the render thread.
-        // The handle is held in the `Cell` for the lifetime of the stream; the
-        // HAL's thread priority reverts when the thread dies.
+        // Best-effort time-constraint promotion. Report failures after the
+        // render block is destroyed, not via stderr on the HAL thread.
         match audio_thread_priority::promote_current_thread_to_real_time(0, rate_hz) {
             Ok(handle) => rt_handle.set(Some(handle)),
-            Err(err) => eprintln!(
-                "sointty-output-coreaudio: failed to promote render thread to real-time: {err}"
-            ),
+            Err(_) => report.promotion_failed.store(true, Ordering::Relaxed),
         }
-        if let Some(path) = log_path
-            && let Ok(mut log) = std::fs::OpenOptions::new().create(true).append(true).open(path)
-        {
-            use std::io::Write;
-            let _ = writeln!(
-                log,
-                "  io: buffers={} frame_bytes={frame_bytes}",
-                list.mNumberBuffers
-            );
-            for i in 0..list.mNumberBuffers as usize {
-                // SAFETY: `i < mNumberBuffers`, inside the flexible array
-                // the HAL allocated.
+        if log_enabled {
+            for i in 0..(list.mNumberBuffers as usize).min(LOGGED_BUFFERS) {
+                // SAFETY: `i < mNumberBuffers`, inside the HAL's flexible
+                // buffer array. Only the byte count is retained.
                 let buffer = unsafe { list.mBuffers.as_ptr().add(i).read() };
-                let _ = writeln!(log, "  io: buffer[{i}] bytes={}", buffer.mDataByteSize);
+                report.buffer_bytes[i].store(buffer.mDataByteSize, Ordering::Relaxed);
             }
+            report
+                .buffer_count
+                .store(list.mNumberBuffers, Ordering::Release);
         }
     }
 
@@ -842,31 +892,21 @@ fn io_proc(
         }
         let frames = capacity / frame_bytes;
         let needed = frames * frame_bytes;
-        // SAFETY: `needed <= mDataByteSize`; the buffer is exclusively ours
-        // for this cycle.
-        let dst = buffer.mData.cast::<u8>();
-        let mut written = 0usize;
-        while written < needed {
-            match consumer.pop() {
-                Ok(byte) => {
-                    // SAFETY: `written < needed <= capacity`.
-                    unsafe { std::ptr::write(dst.add(written), byte) };
-                    written += 1;
-                }
-                // Underrun: stop consuming; the remainder is zero-filled and
-                // counted as an xrun below.
-                Err(rtrb::PopError::Empty) => break,
-            }
-        }
-        let complete_frames = written / frame_bytes;
-        if written < needed {
-            // Zero-fill the remainder (including any partial frame) and
-            // count exactly one xrun per underrun buffer.
-            // SAFETY: `written < needed <= capacity`.
-            unsafe { std::ptr::write_bytes(dst.add(written), 0, needed - written) };
-            if let Some(first) = first_xrun_frame {
+        // SAFETY: `needed <= mDataByteSize`, and this callback alone owns the
+        // writable HAL output buffer. Its old contents may be uninitialized;
+        // `pop_partial_slice_uninit` initializes only the copied prefix.
+        let dst = unsafe {
+            std::slice::from_raw_parts_mut(buffer.mData.cast::<MaybeUninit<u8>>(), needed)
+        };
+        let (filled, shortage) = consumer.pop_partial_slice_uninit(dst);
+        let complete_frames = filled.len() / frame_bytes;
+        if !shortage.is_empty() {
+            // The HAL requires the rest of its output buffer to be silent.
+            // SAFETY: this is the writable suffix not filled from the ring.
+            unsafe { std::ptr::write_bytes(shortage.as_mut_ptr(), 0, shortage.len()) };
+            if log_enabled {
                 let frame = counters.played_frames.load(Ordering::Relaxed) + complete_frames as u64;
-                let _ = first.compare_exchange(
+                let _ = report.first_xrun_frame.compare_exchange(
                     u64::MAX,
                     frame,
                     Ordering::Relaxed,
@@ -878,5 +918,77 @@ fn io_proc(
         counters
             .played_frames
             .fetch_add(complete_frames as u64, Ordering::Relaxed);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use objc2_core_audio_types::AudioBuffer;
+
+    #[test]
+    fn callback_bulk_copies_wrapped_frames_and_silences_only_shortage() {
+        let (mut producer, consumer) = rtrb::RingBuffer::<u8>::new(48);
+        let bytes: Vec<u8> = (0..56u8)
+            .map(|n| n.wrapping_mul(17).wrapping_add(3))
+            .collect();
+        for &byte in &bytes[..40] {
+            producer.push(byte).unwrap();
+        }
+
+        let consumer = RtConsumer(std::cell::UnsafeCell::new(consumer));
+        let counters = OutputCounters::default();
+        let report = RenderReport::new(8);
+        let promoted = Cell::new(true); // No OS priority request in this test.
+        let rt_handle = Cell::new(None);
+        let mut output = vec![MaybeUninit::<u8>::uninit(); 40];
+        let mut list = AudioBufferList {
+            mNumberBuffers: 1,
+            mBuffers: [AudioBuffer {
+                mNumberChannels: 2,
+                mDataByteSize: 40,
+                mData: output.as_mut_ptr().cast(),
+            }],
+        };
+
+        io_proc(
+            &consumer,
+            &counters,
+            &report,
+            8,
+            96_000,
+            &promoted,
+            &rt_handle,
+            true,
+            NonNull::from(&mut list),
+        );
+        // SAFETY: io_proc wrote all 40 bytes, either from the ring or as zeroes.
+        let first: Vec<u8> = output.iter().map(|b| unsafe { b.assume_init() }).collect();
+        assert_eq!(first, bytes[..40]);
+        assert_eq!(counters.xruns(), 0);
+
+        // The 48-byte ring wraps after the initial 40-byte read. Only two
+        // frames remain for the next five-frame HAL buffer.
+        for &byte in &bytes[40..] {
+            producer.push(byte).unwrap();
+        }
+        io_proc(
+            &consumer,
+            &counters,
+            &report,
+            8,
+            96_000,
+            &promoted,
+            &rt_handle,
+            true,
+            NonNull::from(&mut list),
+        );
+        // SAFETY: io_proc wrote the 16-byte prefix and zero-filled the rest.
+        let second: Vec<u8> = output.iter().map(|b| unsafe { b.assume_init() }).collect();
+        assert_eq!(&second[..16], &bytes[40..]);
+        assert_eq!(&second[16..], &[0; 24]);
+        assert_eq!(counters.played_frames(), 7);
+        assert_eq!(counters.xruns(), 1);
+        assert_eq!(report.first_xrun_frame.load(Ordering::Relaxed), 7);
     }
 }
