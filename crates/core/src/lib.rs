@@ -793,6 +793,32 @@ mod tests {
     }
 
     #[test]
+    fn packs_signed_s24_into_high_bits_of_s32_without_changing_amplitude() {
+        let output = OutputSpec {
+            device: "hw:1,0".to_owned(),
+            rate_hz: 48_000,
+            layout: layout(),
+            format: DeviceFormat::S24In32High,
+            valid_bits: 24,
+        };
+        let mut bytes = Vec::new();
+        pack_exact(
+            DecodedBlock::pcm_block(
+                spec(SampleEncoding::S24),
+                2,
+                DecodedPcm::I24(&[0x400000, -0x400000, 0x7fffff, -0x800000]),
+            ),
+            &output,
+            &mut bytes,
+        )
+        .unwrap();
+        assert_eq!(
+            bytes,
+            [0, 0, 0, 0x40, 0, 0, 0, 0xc0, 0, 0xff, 0xff, 0x7f, 0, 0, 0, 0x80]
+        );
+    }
+
+    #[test]
     fn requires_direct_hw_device_name() {
         assert!(validate_device_selection("hw:1,0").is_ok());
         assert!(matches!(

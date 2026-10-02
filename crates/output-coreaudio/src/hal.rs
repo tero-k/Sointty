@@ -1,10 +1,10 @@
 //! macOS CoreAudio HAL backend (`sointty-output-coreaudio`).
 //!
-//! Bit-perfect exclusive access is achieved through the HAL's hog mode rather
-//! than a mode switch: while we hold `kAudioDevicePropertyHogMode` no other
-//! client (including the system mixer) can use the device, and the stream's
-//! *physical* format is set to the exact decoded rate/channels/encoding — no
-//! resampling, remixing, or sample conversion anywhere.
+//! Bit-perfect exclusive access requires hog mode and matching stream formats:
+//! while we hold `kAudioDevicePropertyHogMode` no other client can use the
+//! device. Both the physical (hardware) and virtual (IOProc) formats must
+//! match the exact decoded rate/channels/encoding so the HAL has no format
+//! conversion to perform.
 //!
 //! # Unsafe FFI containment
 //!
@@ -47,7 +47,7 @@ use objc2_core_audio::{
     kAudioObjectPropertyName, kAudioObjectPropertyScopeGlobal,
     kAudioObjectPropertyScopeOutput, kAudioObjectSystemObject,
     kAudioStreamPropertyAvailablePhysicalFormats, kAudioStreamPropertyPhysicalFormat,
-    AudioStreamRangedDescription,
+    kAudioStreamPropertyVirtualFormat, AudioStreamRangedDescription,
 };
 use objc2_core_audio_types::{AudioBufferList, AudioStreamBasicDescription, AudioTimeStamp};
 use sointty_core::{
@@ -554,6 +554,42 @@ impl CoreAudioOutput {
             ));
         }
 
+        // IOProcs exchange buffers in the stream's *virtual* format, not its
+        // physical (hardware) format. Sending signed PCM to a float virtual
+        // stream is audible garbage even if physical readback and ring
+        // counters are perfect. Require the callback's ASBD to be exactly
+        // the one used by the worker to pack its bytes.
+        let virtual_address = prop_addr(
+            kAudioStreamPropertyVirtualFormat,
+            kAudioObjectPropertyScopeGlobal,
+            kAudioObjectPropertyElementMain,
+        );
+        // SAFETY: documented single-ASBD property on an output stream.
+        let virtual_before: AudioStreamBasicDescription = get_value(stream, &virtual_address)
+            .map_err(|_| Self::unsupported(input, "could not read the IOProc virtual format"))?;
+        if let Some(log) = &mut log {
+            use std::io::Write;
+            let _ = writeln!(log, "  virtual before: {virtual_before:?}");
+        }
+        if virtual_before != chosen {
+            // SAFETY: virtual format is the format the HAL presents to IOProcs.
+            set_value(stream, &virtual_address, &chosen)
+                .map_err(|_| Self::unsupported(input, "device rejected the exact IOProc virtual format"))?;
+        }
+        // SAFETY: documented single-ASBD property on an output stream.
+        let virtual_readback: AudioStreamBasicDescription = get_value(stream, &virtual_address)
+            .map_err(|_| Self::unsupported(input, "could not read back the IOProc virtual format"))?;
+        if let Some(log) = &mut log {
+            use std::io::Write;
+            let _ = writeln!(log, "  virtual readback: {virtual_readback:?}");
+        }
+        if virtual_readback != chosen {
+            return Err(Self::unsupported(
+                input,
+                "IOProc virtual format does not match the packed PCM format",
+            ));
+        }
+
         // (d) Device buffer frame size: best-effort, actual is reported.
         let buffer_address = prop_addr(
             kAudioDevicePropertyBufferFrameSize,
@@ -586,39 +622,51 @@ impl CoreAudioOutput {
             }
         }
 
-        // (e) Changing the buffer frame size can make a driver reset the
-        // stream to a default format/rate. Re-verify both and re-apply the
-        // physical format once; a second mismatch is a hard error because the
-        // device would otherwise render a different rate/layout than the
-        // ring carries (audible as wrong speed or garbled samples).
+        // (e) A buffer-size change (or setting the virtual ASBD) can reset
+        // the hardware rate or either format. The worker's packed bytes must
+        // match the IOProc virtual format, while the physical format must
+        // also preserve them without HAL conversion.
         // SAFETY: documented Float64 property.
         let settled_rate: f64 = get_value(self.device, &rate_address)
             .map_err(|_| Self::unsupported(input, "could not re-read the nominal sample rate"))?;
-        // SAFETY: documented single-ASBD property on a stream.
+        // SAFETY: documented single-ASBD properties on the output stream.
         let settled: AudioStreamBasicDescription = get_value(stream, &physical_address)
             .map_err(|_| Self::unsupported(input, "could not re-read the physical format"))?;
+        let settled_virtual: AudioStreamBasicDescription = get_value(stream, &virtual_address)
+            .map_err(|_| Self::unsupported(input, "could not re-read the IOProc virtual format"))?;
         if let Some(log) = &mut log {
             use std::io::Write;
-            let _ = writeln!(log, "  settled rate={settled_rate} format={settled:?}");
+            let _ = writeln!(
+                log,
+                "  settled rate={settled_rate} format={settled:?} virtual={settled_virtual:?}"
+            );
         }
-        if settled != chosen || settled_rate != wanted_rate {
-            // SAFETY: documented Float64 property.
+        if settled != chosen || settled_virtual != chosen || settled_rate != wanted_rate {
+            // SAFETY: documented device rate and output-stream ASBD properties.
             set_value(self.device, &rate_address, &wanted_rate)
                 .map_err(|_| Self::unsupported(input, "device rejected the nominal sample rate"))?;
-            // SAFETY: documented single-ASBD property on a stream.
             set_value(stream, &physical_address, &chosen)
                 .map_err(|_| Self::unsupported(input, "device rejected the exact physical format"))?;
-            // SAFETY: documented single-ASBD property on a stream.
-            let final_readback: AudioStreamBasicDescription = get_value(stream, &physical_address)
+            set_value(stream, &virtual_address, &chosen)
+                .map_err(|_| Self::unsupported(input, "device rejected the exact IOProc virtual format"))?;
+            // SAFETY: re-read all three properties after the last write.
+            let final_rate: f64 = get_value(self.device, &rate_address)
+                .map_err(|_| Self::unsupported(input, "could not read back the nominal sample rate"))?;
+            let final_physical: AudioStreamBasicDescription = get_value(stream, &physical_address)
                 .map_err(|_| Self::unsupported(input, "could not read back the physical format"))?;
+            let final_virtual: AudioStreamBasicDescription = get_value(stream, &virtual_address)
+                .map_err(|_| Self::unsupported(input, "could not read back the IOProc virtual format"))?;
             if let Some(log) = &mut log {
                 use std::io::Write;
-                let _ = writeln!(log, "  re-applied; final readback: {final_readback:?}");
+                let _ = writeln!(
+                    log,
+                    "  re-applied rate={final_rate} format={final_physical:?} virtual={final_virtual:?}"
+                );
             }
-            if final_readback != chosen {
+            if final_rate != wanted_rate || final_physical != chosen || final_virtual != chosen {
                 return Err(Self::unsupported(
                     input,
-                    "device does not keep the exact physical format",
+                    "device does not keep the exact physical and IOProc virtual formats",
                 ));
             }
         }
