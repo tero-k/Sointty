@@ -26,6 +26,11 @@ pane, selected playlist, and a context-sensitive key guide.
   (TUI `i`) enables integer→F32 conversion on float-only endpoints such as the
   macOS internal speakers (S16/S24 convert exactly; S32 loses its low 8 bits).
   Converted output is labeled `NOT bit-perfect` in the UI.
+- On macOS, hog mode is paired with Core Audio Integer Mode: non-mixable
+  integer stream formats are selected for both the hardware and IOProc sides
+  when the driver offers them, so capable USB DACs receive the exact integer
+  samples with no conversion anywhere. The integer→F32 opt-in is only needed
+  on endpoints whose IOProc interface is float-only.
 - The negotiated format (rate, channels, packing, valid bits) is shown on
   screen as established with the device, not as requested.
 - Tracks with an identical stream specification play gaplessly through one
@@ -136,7 +141,7 @@ adjacent ranges.
 
 | Device | OS | Verified path |
 |---|---|---|
-| iFi ZEN DAC V2 | macOS | 192 kHz S24 FLAC; the DAC's IOProc interface is float-only, so playback uses the integer→F32 opt-in (exact for S16/S24) |
+| iFi ZEN DAC V2 | macOS | 192 kHz S24 FLAC, bit-perfect via Core Audio Integer Mode (non-mixable integer formats, hog mode) |
 | iFi ZEN DAC V2 | Windows | WASAPI exclusive, integer path |
 
 ## Building
