@@ -129,7 +129,7 @@ adjacent ranges.
 | OS | Backend | Status |
 |---|---|---|
 | Linux | ALSA `hw:` direct, native DSD and DoP | implemented, awaiting hardware test |
-| Windows | WASAPI exclusive, push-mode fallback for drivers that force whole-buffer periods | tested on an iFi DAC |
+| Windows | WASAPI exclusive, push-mode fallback for drivers that force whole-buffer periods | tested on an iFi ZEN DAC V2 |
 | macOS | Core Audio HAL hog mode | tested on an iFi ZEN DAC V2 |
 
 ### Tested devices
@@ -137,7 +137,7 @@ adjacent ranges.
 | Device | OS | Verified path |
 |---|---|---|
 | iFi ZEN DAC V2 | macOS | 192 kHz S24 FLAC; the DAC's IOProc interface is float-only, so playback uses the integer→F32 opt-in (exact for S16/S24) |
-| iFi USB DAC | Windows | WASAPI exclusive, integer path |
+| iFi ZEN DAC V2 | Windows | WASAPI exclusive, integer path |
 
 ## Building
 
