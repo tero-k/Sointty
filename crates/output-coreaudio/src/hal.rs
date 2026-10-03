@@ -795,7 +795,32 @@ impl AudioOutput for CoreAudioOutput {
             Ok(spec) => Ok(spec),
             Err(err) => {
                 self.release_hog();
-                Err(err)
+                // A rate/format switch leaves the stream in the previous
+                // non-mixable format, and the driver rejects reconfiguration
+                // until it settles back to its mixable default (observed on
+                // an iFi ZEN DAC V2: 192 kHz -> 48 kHz fails once, then an
+                // immediate retry succeeds). Retry exactly once, after a
+                // short settle delay, only when this device was configured
+                // before; genuinely unsupported formats on a fresh device
+                // still fail on the first attempt.
+                if self.spec.is_none()
+                    || !matches!(err, PlayerError::UnsupportedFormat { .. })
+                {
+                    return Err(err);
+                }
+                if let Some(mut log) = debug_log() {
+                    use std::io::Write;
+                    let _ = writeln!(log, "configure: retrying after settle delay");
+                }
+                std::thread::sleep(std::time::Duration::from_millis(250));
+                self.acquire_hog()?;
+                match self.configure_inner(input, buffers) {
+                    Ok(spec) => Ok(spec),
+                    Err(retry_err) => {
+                        self.release_hog();
+                        Err(retry_err)
+                    }
+                }
             }
         }
     }
