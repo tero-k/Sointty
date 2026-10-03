@@ -175,6 +175,18 @@ pub(crate) fn pick_physical_format(
     }
 }
 
+/// True when `candidate` (a stream's *virtual* format) is the canonical
+/// IOProc-side F32 format for the integer `spec`: interleaved little-endian
+/// F32 at the exact rate and channel count. Some USB DACs expose only
+/// integer *physical* formats but a float-only *virtual* format; the worker
+/// then widens integer samples to F32 under the explicit conversion opt-in.
+pub(crate) fn ioproc_accepts_f32(candidate: CandidateFormat, spec: &StreamSpec) -> bool {
+    classify(
+        candidate,
+        &StreamSpec { encoding: SampleEncoding::F32, ..*spec },
+    ) == Some(DeviceFormat::F32Le)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -258,6 +270,26 @@ mod tests {
         // the property but the IO path keeps running 4-byte frames.
         let offered = vec![lpcm(44100.0, 2, SIGNED_PACKED, 6, 24)];
         assert!(pick_physical_format(&offered, &spec(44100, 2, SampleEncoding::S24)).is_none());
+    }
+
+    #[test]
+    fn ioproc_f32_check_matches_float_virtual_format_only() {
+        let input = spec(192000, 2, SampleEncoding::S24);
+        // The iFi-class DAC's observed IOProc format: float|packed, 32-bit.
+        let float_virtual = lpcm(192000.0, 2, FLAG_IS_FLOAT | FLAG_IS_PACKED, 8, 32);
+        assert!(ioproc_accepts_f32(float_virtual, &input));
+        // An integer virtual format mirrors the physical one: exact path.
+        let int_virtual = lpcm(192000.0, 2, SIGNED_PACKED, 8, 32);
+        assert!(!ioproc_accepts_f32(int_virtual, &input));
+        // Wrong rate or deinterleaved float must not be accepted either.
+        assert!(!ioproc_accepts_f32(
+            lpcm(96000.0, 2, FLAG_IS_FLOAT | FLAG_IS_PACKED, 8, 32),
+            &input
+        ));
+        assert!(!ioproc_accepts_f32(
+            lpcm(192000.0, 2, FLAG_IS_FLOAT | FLAG_IS_NON_INTERLEAVED, 4, 32),
+            &input
+        ));
     }
 
     #[test]

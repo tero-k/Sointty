@@ -2,9 +2,11 @@
 //!
 //! Bit-perfect exclusive access requires hog mode and matching stream formats:
 //! while we hold `kAudioDevicePropertyHogMode` no other client can use the
-//! device. Both the physical (hardware) and virtual (IOProc) formats must
-//! match the exact decoded rate/channels/encoding so the HAL has no format
-//! conversion to perform.
+//! device. The physical (hardware) format is always negotiated exactly. The
+//! virtual (IOProc) format is pinned to the same ASBD when the driver allows
+//! it; on USB DACs whose IOProc interface is float-only, the ring carries F32
+//! instead and the decoder worker widens integer samples under the explicit
+//! int-to-float opt-in (exact for S16/S24).
 //!
 //! # Unsafe FFI containment
 //!
@@ -51,10 +53,11 @@ use objc2_core_audio::{
 };
 use objc2_core_audio_types::{AudioBufferList, AudioStreamBasicDescription, AudioTimeStamp};
 use sointty_core::{
-    AudioOutput, BufferConfig, DeviceId, OutputCounters, OutputSpec, PlayerError, StreamSpec,
+    AudioOutput, BufferConfig, DeviceFormat, DeviceId, OutputCounters, OutputSpec, PlayerError,
+    SampleEncoding, StreamSpec,
 };
 
-use crate::format::{CandidateFormat, pick_physical_format};
+use crate::format::{CandidateFormat, ioproc_accepts_f32, pick_physical_format};
 
 /// The HAL block signature: (now, input_data, input_time, output_data,
 /// output_time); we only write `output_data`.
@@ -555,10 +558,12 @@ impl CoreAudioOutput {
         }
 
         // IOProcs exchange buffers in the stream's *virtual* format, not its
-        // physical (hardware) format. Sending signed PCM to a float virtual
-        // stream is audible garbage even if physical readback and ring
-        // counters are perfect. Require the callback's ASBD to be exactly
-        // the one used by the worker to pack its bytes.
+        // physical (hardware) format. Prefer the exact integer ASBD on both
+        // sides. Some USB DACs keep a float-only virtual format while the
+        // physical side stays integer; then the ring carries F32 and the
+        // worker widens integer samples under the explicit int-to-float
+        // opt-in (exact for S16/S24). Sending integer bytes to a float
+        // virtual stream is clipped garbage, so anything else is an error.
         let virtual_address = prop_addr(
             kAudioStreamPropertyVirtualFormat,
             kAudioObjectPropertyScopeGlobal,
@@ -572,23 +577,41 @@ impl CoreAudioOutput {
             let _ = writeln!(log, "  virtual before: {virtual_before:?}");
         }
         if virtual_before != chosen {
-            // SAFETY: virtual format is the format the HAL presents to IOProcs.
-            set_value(stream, &virtual_address, &chosen)
-                .map_err(|_| Self::unsupported(input, "device rejected the exact IOProc virtual format"))?;
+            // Best effort: some drivers accept the integer client format,
+            // others keep their float one. The readback decides.
+            // SAFETY: documented single-ASBD property on an output stream.
+            let _ = set_value(stream, &virtual_address, &chosen);
         }
         // SAFETY: documented single-ASBD property on an output stream.
-        let virtual_readback: AudioStreamBasicDescription = get_value(stream, &virtual_address)
+        let virtual_format: AudioStreamBasicDescription = get_value(stream, &virtual_address)
             .map_err(|_| Self::unsupported(input, "could not read back the IOProc virtual format"))?;
         if let Some(log) = &mut log {
             use std::io::Write;
-            let _ = writeln!(log, "  virtual readback: {virtual_readback:?}");
+            let _ = writeln!(log, "  virtual readback: {virtual_format:?}");
         }
-        if virtual_readback != chosen {
-            return Err(Self::unsupported(
-                input,
-                "IOProc virtual format does not match the packed PCM format",
-            ));
-        }
+        let float_ioproc = if virtual_format == chosen {
+            false
+        } else {
+            let candidate = CandidateFormat {
+                rate_min: virtual_format.mSampleRate,
+                rate_max: virtual_format.mSampleRate,
+                format_id: virtual_format.mFormatID,
+                format_flags: virtual_format.mFormatFlags,
+                bytes_per_frame: virtual_format.mBytesPerFrame,
+                channels_per_frame: virtual_format.mChannelsPerFrame,
+                bits_per_channel: virtual_format.mBitsPerChannel,
+            };
+            if input.encoding != SampleEncoding::F32 && ioproc_accepts_f32(candidate, input) {
+                true
+            } else {
+                return Err(Self::unsupported(
+                    input,
+                    "IOProc virtual format matches neither the physical format nor canonical F32",
+                ));
+            }
+        };
+        // The ASBD the IOProc callback must be fed with after all settles.
+        let expected_virtual = if float_ioproc { virtual_format } else { chosen };
 
         // (d) Device buffer frame size: best-effort, actual is reported.
         let buffer_address = prop_addr(
@@ -641,13 +664,13 @@ impl CoreAudioOutput {
                 "  settled rate={settled_rate} format={settled:?} virtual={settled_virtual:?}"
             );
         }
-        if settled != chosen || settled_virtual != chosen || settled_rate != wanted_rate {
+        if settled != chosen || settled_virtual != expected_virtual || settled_rate != wanted_rate {
             // SAFETY: documented device rate and output-stream ASBD properties.
             set_value(self.device, &rate_address, &wanted_rate)
                 .map_err(|_| Self::unsupported(input, "device rejected the nominal sample rate"))?;
             set_value(stream, &physical_address, &chosen)
                 .map_err(|_| Self::unsupported(input, "device rejected the exact physical format"))?;
-            set_value(stream, &virtual_address, &chosen)
+            set_value(stream, &virtual_address, &expected_virtual)
                 .map_err(|_| Self::unsupported(input, "device rejected the exact IOProc virtual format"))?;
             // SAFETY: re-read all three properties after the last write.
             let final_rate: f64 = get_value(self.device, &rate_address)
@@ -663,7 +686,7 @@ impl CoreAudioOutput {
                     "  re-applied rate={final_rate} format={final_physical:?} virtual={final_virtual:?}"
                 );
             }
-            if final_rate != wanted_rate || final_physical != chosen || final_virtual != chosen {
+            if final_rate != wanted_rate || final_physical != chosen || final_virtual != expected_virtual {
                 return Err(Self::unsupported(
                     input,
                     "device does not keep the exact physical and IOProc virtual formats",
@@ -684,12 +707,20 @@ impl CoreAudioOutput {
             let _ = writeln!(log, "  actual rate before start: {actual_rate:?}");
         }
 
+        let (format, valid_bits) = if float_ioproc {
+            // The ring carries F32 for the IOProc while the physical integer
+            // format stays exact. `valid_bits` 32 matches the F32 container,
+            // as in the MacBook float-only endpoint path.
+            (DeviceFormat::F32Le, 32)
+        } else {
+            (matched.format, matched.valid_bits)
+        };
         let spec = OutputSpec {
             device: self.device_id.clone(),
             rate_hz: input.rate_hz,
             layout: input.layout,
-            format: matched.format,
-            valid_bits: matched.valid_bits,
+            format,
+            valid_bits,
         };
         self.spec = Some(spec.clone());
         Ok(spec)

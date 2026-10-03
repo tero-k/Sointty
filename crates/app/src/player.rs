@@ -77,6 +77,11 @@ enum Packing {
     /// Explicitly opted-in, non-bit-perfect conversions on the decoder thread.
     FloatToInt,
     IntToFloat,
+    /// F32 stream on an endpoint whose IOProc interface is float-only while
+    /// its hardware format is integer (e.g. USB DACs on macOS): the app
+    /// keeps F32 samples and the HAL/driver quantizes. Still labeled a
+    /// conversion: playback is not bit-perfect against the F32 stream.
+    FloatToIntByHal,
     Dop(DopPacker),
     /// Native DSD groups consecutive time bytes per channel into ALSA slots.
     NativeDsd { channels: u16, slot_bytes: usize },
@@ -85,7 +90,13 @@ enum Packing {
 impl Packing {
     fn for_output(output: &OutputSpec, conversion: Conversion) -> Self {
         match conversion {
-            Conversion::FloatToInt => return Self::FloatToInt,
+            Conversion::FloatToInt => {
+                return if output.format == DeviceFormat::F32Le {
+                    Self::FloatToIntByHal
+                } else {
+                    Self::FloatToInt
+                };
+            }
             Conversion::IntToFloat => return Self::IntToFloat,
             Conversion::None => {}
         }
@@ -103,7 +114,7 @@ impl Packing {
 
     fn conversion(&self) -> Conversion {
         match self {
-            Self::FloatToInt => Conversion::FloatToInt,
+            Self::FloatToInt | Self::FloatToIntByHal => Conversion::FloatToInt,
             Self::IntToFloat => Conversion::IntToFloat,
             _ => Conversion::None,
         }
@@ -149,7 +160,7 @@ fn pack_block(
     block: DecodedBlock<'_>,
 ) -> Result<(), PlayerError> {
     match packing {
-        Packing::Pcm => pack_exact(block, output, scratch),
+        Packing::Pcm | Packing::FloatToIntByHal => pack_exact(block, output, scratch),
         Packing::FloatToInt => pack_float_to_int(block, output, scratch),
         Packing::IntToFloat => pack_int_to_float(block, output, scratch),
         Packing::Dop(packer) => {
@@ -820,7 +831,37 @@ impl<O: AudioOutput> Worker<O> {
         }
         let decoded = decoder.spec();
         let original = match self.output.configure(&decoded, buffers) {
-            Ok(output) => return Ok((output, Conversion::None, buffers)),
+            Ok(output) => {
+                let native = output.format.native_encoding();
+                if native == decoded.encoding {
+                    return Ok((output, Conversion::None, buffers));
+                }
+                // The backend established a converted wire format itself
+                // (e.g. an integer USB DAC whose Core Audio IOProc format is
+                // float-only). Honor the same opt-ins as the retry paths.
+                let conversion = match (decoded.encoding, native) {
+                    (SampleEncoding::F32, _) if self.float_to_int => Conversion::FloatToInt,
+                    (_, SampleEncoding::F32) if self.int_to_float => Conversion::IntToFloat,
+                    (SampleEncoding::F32, _) => {
+                        return Err(PlayerError::UnsupportedFormat {
+                            rate_hz: decoded.rate_hz,
+                            channels: decoded.layout.channels,
+                            encoding: decoded.encoding,
+                            reason: "endpoint accepts only integer IOProc data; enable float-to-integer conversion",
+                        });
+                    }
+                    (_, SampleEncoding::F32) => {
+                        return Err(PlayerError::UnsupportedFormat {
+                            rate_hz: decoded.rate_hz,
+                            channels: decoded.layout.channels,
+                            encoding: decoded.encoding,
+                            reason: "endpoint accepts only float IOProc data; enable integer-to-float conversion",
+                        });
+                    }
+                    _ => return Err(PlayerError::Output),
+                };
+                return Ok((output, conversion, buffers));
+            }
             Err(error) if matches!(error, PlayerError::UnsupportedFormat { .. }) => error,
             Err(error) => return Err(error),
         };
@@ -829,6 +870,11 @@ impl<O: AudioOutput> Worker<O> {
                 let integer = StreamSpec { encoding, ..decoded };
                 match self.output.configure(&integer, buffers) {
                     Ok(output) if output.stream_compatible(&integer) => {
+                        return Ok((output, Conversion::FloatToInt, buffers));
+                    }
+                    Ok(output) if output.format.native_encoding() == SampleEncoding::F32 => {
+                        // Integer hardware behind a float-only IOProc
+                        // interface: the HAL quantizes, samples stay F32.
                         return Ok((output, Conversion::FloatToInt, buffers));
                     }
                     Ok(_) => return Err(PlayerError::Output),
@@ -1784,6 +1830,10 @@ mod tests {
         /// True: the fake endpoint is float-only (like macOS internal
         /// speakers), so integer streams negotiate the int-to-F32 fallback.
         float_only: bool,
+        /// True: integer physical formats behind a float-only IOProc
+        /// interface (iFi-class USB DACs on macOS), so integer streams come
+        /// back with an F32 wire format from the exact configure call.
+        float_ioproc: bool,
         drain: Option<std::thread::JoinHandle<()>>,
         /// Scripted result of `configure_dsd`: DoP or native DSD format.
         dsd_mode: DeviceFormat,
@@ -1808,6 +1858,7 @@ mod tests {
                 drain: None,
                 dsd_mode,
                 float_only,
+                float_ioproc: false,
                 frame_bytes: Arc::new(AtomicU64::new(FRAME_BYTES as u64)),
                 drained,
             }
@@ -1834,10 +1885,15 @@ mod tests {
                 calls.configures += 1;
                 calls.buffers_seen.push(buffers);
             }
-            let (format, valid_bits) = match (input.encoding, self.float_only) {
-                (SampleEncoding::S16, false) => (DeviceFormat::S16Le, 16),
-                (SampleEncoding::S32, false) => (DeviceFormat::S32Le, 32),
-                (SampleEncoding::F32, true) => (DeviceFormat::F32Le, 32),
+            let (format, valid_bits) = match (input.encoding, self.float_only, self.float_ioproc) {
+                (SampleEncoding::S16, false, false) => (DeviceFormat::S16Le, 16),
+                (SampleEncoding::S32, false, false) => (DeviceFormat::S32Le, 32),
+                (SampleEncoding::F32, true, false) => (DeviceFormat::F32Le, 32),
+                // Integer streams succeed with an F32 wire format; F32
+                // streams fail physical negotiation like on the real DAC.
+                (SampleEncoding::S16 | SampleEncoding::S24 | SampleEncoding::S32, false, true) => {
+                    (DeviceFormat::F32Le, 32)
+                }
                 _ => return Err(PlayerError::UnsupportedFormat {
                     rate_hz: input.rate_hz,
                     channels: input.layout.channels,
@@ -1845,15 +1901,18 @@ mod tests {
                     reason: "fake output supports only S16/S32, or only F32 in float-only mode",
                 }),
             };
-            self.frame_bytes
-                .store(input.bytes_per_frame() as u64, Ordering::Relaxed);
-            Ok(OutputSpec {
+            let output = OutputSpec {
                 device: "fake".to_owned(),
                 rate_hz: input.rate_hz,
                 layout: input.layout,
                 format,
                 valid_bits,
-            })
+            };
+            // The wire frame width comes from the established output format,
+            // which differs from the decoded one on converted paths.
+            self.frame_bytes
+                .store(output.bytes_per_frame() as u64, Ordering::Relaxed);
+            Ok(output)
         }
 
         fn configure_dsd(
@@ -1989,6 +2048,7 @@ mod tests {
             stall_timeout,
             dsd_mode,
             false,
+            false,
             Some(test_buffers().period_frames),
             Some(test_buffers().buffer_frames),
         )
@@ -1996,7 +2056,7 @@ mod tests {
 
     /// Engine without timing overrides: per-rate Auto defaults.
     fn spawn_engine_auto(plan: HashMap<PathBuf, FakeTrack>) -> Harness {
-        spawn_engine_timed(plan, Duration::from_secs(5), DeviceFormat::Dop24, false, None, None)
+        spawn_engine_timed(plan, Duration::from_secs(5), DeviceFormat::Dop24, false, false, None, None)
     }
 
     /// Engine whose fake endpoint is float-only (macOS internal speakers).
@@ -2005,6 +2065,21 @@ mod tests {
             plan,
             Duration::from_secs(5),
             DeviceFormat::Dop24,
+            true,
+            false,
+            Some(test_buffers().period_frames),
+            Some(test_buffers().buffer_frames),
+        )
+    }
+
+    /// Engine whose fake endpoint has integer physical formats behind a
+    /// float-only IOProc interface (iFi-class USB DACs on macOS).
+    fn spawn_engine_float_ioproc(plan: HashMap<PathBuf, FakeTrack>) -> Harness {
+        spawn_engine_timed(
+            plan,
+            Duration::from_secs(5),
+            DeviceFormat::Dop24,
+            false,
             true,
             Some(test_buffers().period_frames),
             Some(test_buffers().buffer_frames),
@@ -2016,6 +2091,7 @@ mod tests {
         stall_timeout: Duration,
         dsd_mode: DeviceFormat,
         float_only: bool,
+        float_ioproc: bool,
         period_frames: Option<u32>,
         buffer_frames: Option<u32>,
     ) -> Harness {
@@ -2025,7 +2101,8 @@ mod tests {
         let seeks = Arc::new(Mutex::new(Vec::new()));
         let release = Arc::new(AtomicBool::new(true));
         let drained = Arc::new(Mutex::new(Vec::new()));
-        let output = FakeOutput::new(Arc::clone(&calls), dsd_mode, float_only, Arc::clone(&drained));
+        let mut output = FakeOutput::new(Arc::clone(&calls), dsd_mode, float_only, Arc::clone(&drained));
+        output.float_ioproc = float_ioproc;
         let decoder_factory: DecoderFactory = Box::new({
             let seeks = Arc::clone(&seeks);
             let release = Arc::clone(&release);
@@ -3501,6 +3578,70 @@ mod tests {
     }
 
     #[test]
+    fn float_ioproc_endpoint_converts_integer_stream_with_opt_in() {
+        // Integer physical formats behind a float-only IOProc interface:
+        // the exact configure returns an F32 wire format and the worker
+        // widens the integer samples (exact for S16/S24) under the opt-in.
+        let spec = StreamSpec { encoding: SampleEncoding::S16, ..test_spec(44_100) };
+        let mut plan = HashMap::new();
+        plan.insert(PathBuf::from("int.flac"), FakeTrack::Pcm(spec, 512));
+        let harness = spawn_engine_float_ioproc(plan);
+        harness.commands.send(PlayerCommand::SetIntToFloat(true)).unwrap();
+        enqueue(&harness, "int.flac");
+        harness.commands.send(PlayerCommand::Play).unwrap();
+        let event = recv_until(&harness.events, |event| {
+            matches!(event, PlayerEvent::Playing { .. })
+        });
+        assert!(matches!(event, PlayerEvent::Playing { converted: true, output: OutputSpec { format: DeviceFormat::F32Le, valid_bits: 32, .. }, .. }));
+        recv_until(&harness.events, |event| matches!(event, PlayerEvent::EndOfQueue));
+        let drained = harness.drained.lock();
+        assert!(!drained.is_empty());
+        assert_eq!(drained.len() % 8, 0);
+        drop(drained);
+        harness.commands.send(PlayerCommand::Quit).unwrap();
+        harness.join().unwrap();
+    }
+
+    #[test]
+    fn float_ioproc_endpoint_without_opt_in_stays_strict() {
+        let spec = StreamSpec { encoding: SampleEncoding::S16, ..test_spec(44_100) };
+        let mut plan = HashMap::new();
+        plan.insert(PathBuf::from("int.flac"), FakeTrack::Pcm(spec, 512));
+        let harness = spawn_engine_float_ioproc(plan);
+        enqueue(&harness, "int.flac");
+        harness.commands.send(PlayerCommand::Play).unwrap();
+        let error = recv_until(&harness.events, |event| {
+            matches!(event, PlayerEvent::Error { kind: PlayerError::UnsupportedFormat { .. }, .. })
+        });
+        assert!(matches!(error, PlayerEvent::Error { .. }));
+        harness.commands.send(PlayerCommand::Quit).unwrap();
+        harness.join().unwrap();
+    }
+
+    #[test]
+    fn float_ioproc_endpoint_quantizes_f32_source_in_driver_with_opt_in() {
+        // F32 source, integer physical hardware, float-only IOProc: the app
+        // keeps the F32 samples and the HAL quantizes; still labeled a
+        // conversion because playback is not bit-perfect against the stream.
+        let mut float = test_spec(44_100);
+        float.encoding = SampleEncoding::F32;
+        let mut plan = HashMap::new();
+        plan.insert(PathBuf::from("float.mp3"), FakeTrack::Pcm(float, 512));
+        let harness = spawn_engine_float_ioproc(plan);
+        harness.commands.send(PlayerCommand::SetFloatToInt(true)).unwrap();
+        enqueue(&harness, "float.mp3");
+        harness.commands.send(PlayerCommand::Play).unwrap();
+        let event = recv_until(&harness.events, |event| {
+            matches!(event, PlayerEvent::Playing { .. })
+        });
+        assert!(matches!(event, PlayerEvent::Playing { converted: true, output: OutputSpec { format: DeviceFormat::F32Le, .. }, .. }));
+        recv_until(&harness.events, |event| matches!(event, PlayerEvent::EndOfQueue));
+        assert!(!harness.drained.lock().is_empty());
+        harness.commands.send(PlayerCommand::Quit).unwrap();
+        harness.join().unwrap();
+    }
+
+    #[test]
     fn converted_seek_reconfigures_and_remains_converted() {
         let mut float = test_spec(44_100);
         float.encoding = SampleEncoding::F32;
@@ -3742,6 +3883,7 @@ mod tests {
             plan,
             Duration::from_secs(5),
             DeviceFormat::Dop24,
+            false,
             false,
             Some(1_024),
             Some(4_096),
