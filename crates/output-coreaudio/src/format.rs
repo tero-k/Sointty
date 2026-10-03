@@ -22,6 +22,11 @@ pub(crate) const FLAG_IS_PACKED: u32 = 1 << 3;
 pub(crate) const FLAG_IS_ALIGNED_HIGH: u32 = 1 << 4;
 /// `kAudioFormatFlagIsNonInterleaved`
 pub(crate) const FLAG_IS_NON_INTERLEAVED: u32 = 1 << 5;
+/// `kAudioFormatFlagIsNonMixable`: the format cannot be used through the
+/// shared mixer. macOS Integer Mode = non-mixable integer formats on both
+/// the virtual and physical side; mixable virtual formats are float at the
+/// IOProc boundary even when the hardware is integer.
+pub(crate) const FLAG_IS_NON_MIXABLE: u32 = 1 << 6;
 
 /// Platform-independent mirror of the `AudioStreamRangedDescription` fields
 /// we match on. The macOS HAL layer converts the real struct into this.
@@ -133,42 +138,62 @@ fn classify(candidate: CandidateFormat, spec: &StreamSpec) -> Option<DeviceForma
     }
 }
 
-/// Pick the offered physical format that preserves `spec` exactly.
+/// Pick the offered format that preserves `spec` exactly.
 ///
-/// For 24-bit input the preference order is a high-aligned container
-/// (canonical 24-in-32 or a widened 32-bit slot), then (least preferred,
-/// but still exact) low-aligned 24-in-32.
+/// Among exact matches, non-mixable entries win: pairing a non-mixable
+/// virtual format with a mixable physical one is silently rejected by
+/// drivers, which is what drops macOS playback back to the float IOProc
+/// path. For 24-bit input the preference order is then a high-aligned
+/// container (canonical 24-in-32 or a widened 32-bit slot), then (least
+/// preferred, but still exact) low-aligned 24-in-32.
 pub(crate) fn pick_physical_format(
     candidates: &[CandidateFormat],
     spec: &StreamSpec,
 ) -> Option<MatchedFormat> {
     fn try_pick(candidates: &[CandidateFormat], spec: &StreamSpec) -> Option<MatchedFormat> {
-        candidates.iter().enumerate().find_map(|(index, &c)| {
-            classify(c, spec).map(|format| MatchedFormat {
-                index,
-                format,
-                valid_bits: c.bits_per_channel as u8,
-            })
-        })
+        // Non-mixable first, then mixable; within a tier, list order.
+        for non_mixable in [true, false] {
+            if let Some(m) = candidates.iter().enumerate().find_map(|(index, &c)| {
+                if (c.format_flags & FLAG_IS_NON_MIXABLE != 0) != non_mixable {
+                    return None;
+                }
+                classify(c, spec).map(|format| MatchedFormat {
+                    index,
+                    format,
+                    valid_bits: c.bits_per_channel as u8,
+                })
+            }) {
+                return Some(m);
+            }
+        }
+        None
     }
 
     match spec.encoding {
         SampleEncoding::S24 => {
             let wanted = [DeviceFormat::S24In32High, DeviceFormat::S24In32Low];
             wanted.iter().find_map(|&format| {
-                candidates.iter().enumerate().find_map(|(index, &c)| {
-                    if classify(c, spec) == Some(format) {
-                        Some(MatchedFormat {
-                            index,
-                            format,
-                            // The stream's 24 valid bits, not the container
-                            // width (which may be a widened 32-bit slot).
-                            valid_bits: 24,
-                        })
-                    } else {
+                for non_mixable in [true, false] {
+                    if let Some(m) = candidates.iter().enumerate().find_map(|(index, &c)| {
+                        if (c.format_flags & FLAG_IS_NON_MIXABLE != 0) != non_mixable {
+                            return None;
+                        }
+                        if classify(c, spec) == Some(format) {
+                            return Some(MatchedFormat {
+                                index,
+                                format,
+                                // The stream's 24 valid bits, not the
+                                // container width (which may be a widened
+                                // 32-bit slot).
+                                valid_bits: 24,
+                            });
+                        }
                         None
+                    }) {
+                        return Some(m);
                     }
-                })
+                }
+                None
             })
         }
         _ => try_pick(candidates, spec),
@@ -270,6 +295,23 @@ mod tests {
         // the property but the IO path keeps running 4-byte frames.
         let offered = vec![lpcm(44100.0, 2, SIGNED_PACKED, 6, 24)];
         assert!(pick_physical_format(&offered, &spec(44100, 2, SampleEncoding::S24)).is_none());
+    }
+
+    #[test]
+    fn exact_match_prefers_non_mixable_entry() {
+        // The iFi ZEN DAC V2 pattern: the same integer format listed once
+        // mixable (0xc) and once non-mixable (0x4c). Non-mixable must win:
+        // it is what keeps macOS in Integer Mode instead of silently
+        // falling back to the float IOProc path.
+        let offered = vec![
+            lpcm(192000.0, 2, SIGNED_PACKED, 8, 32),
+            lpcm(192000.0, 2, SIGNED_PACKED | FLAG_IS_NON_MIXABLE, 8, 32),
+        ];
+        let m = pick_physical_format(&offered, &spec(192000, 2, SampleEncoding::S32)).unwrap();
+        assert_eq!(m.index, 1);
+        let m = pick_physical_format(&offered, &spec(192000, 2, SampleEncoding::S24)).unwrap();
+        assert_eq!(m.index, 1);
+        assert_eq!(m.format, DeviceFormat::S24In32High);
     }
 
     #[test]
