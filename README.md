@@ -9,8 +9,8 @@ No resampling, no volume processing, no EQ, no mixer in between.
 [![Platform: Linux | Windows | macOS](https://img.shields.io/badge/platform-Linux%20%7C%20Windows%20%7C%20macOS-lightgrey.svg)](#platforms)
 
 v1 feature complete (see [`docs/PLAN.md`](docs/PLAN.md)). Verified on Windows
-with an iFi USB DAC; Linux and macOS backends are implemented and unit tested,
-hardware testing pending.
+(iFi USB DAC) and macOS (iFi ZEN DAC V2); the Linux backend is implemented
+and unit tested, hardware testing pending.
 
 ![Sointty terminal UI while playing a 192 kHz file](docs/assets/tui-playback.png)
 
@@ -130,7 +130,14 @@ adjacent ranges.
 |---|---|---|
 | Linux | ALSA `hw:` direct, native DSD and DoP | implemented, awaiting hardware test |
 | Windows | WASAPI exclusive, push-mode fallback for drivers that force whole-buffer periods | tested on an iFi DAC |
-| macOS | Core Audio HAL hog mode | implemented, awaiting hardware test |
+| macOS | Core Audio HAL hog mode | tested on an iFi ZEN DAC V2 |
+
+### Tested devices
+
+| Device | OS | Verified path |
+|---|---|---|
+| iFi ZEN DAC V2 | macOS | 192 kHz S24 FLAC; the DAC's IOProc interface is float-only, so playback uses the integer→F32 opt-in (exact for S16/S24) |
+| iFi USB DAC | Windows | WASAPI exclusive, integer path |
 
 ## Building
 
