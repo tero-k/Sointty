@@ -48,8 +48,9 @@ use objc2_core_audio::{
     kAudioHardwarePropertyDevices, kAudioObjectPropertyElementMain,
     kAudioObjectPropertyName, kAudioObjectPropertyScopeGlobal,
     kAudioObjectPropertyScopeOutput, kAudioObjectSystemObject,
-    kAudioStreamPropertyAvailablePhysicalFormats, kAudioStreamPropertyPhysicalFormat,
-    kAudioStreamPropertyVirtualFormat, AudioStreamRangedDescription,
+    kAudioStreamPropertyAvailablePhysicalFormats, kAudioStreamPropertyAvailableVirtualFormats,
+    kAudioStreamPropertyPhysicalFormat, kAudioStreamPropertyVirtualFormat,
+    AudioStreamRangedDescription,
 };
 use objc2_core_audio_types::{AudioBufferList, AudioStreamBasicDescription, AudioTimeStamp};
 use sointty_core::{
@@ -558,17 +559,77 @@ impl CoreAudioOutput {
         }
 
         // IOProcs exchange buffers in the stream's *virtual* format, not its
-        // physical (hardware) format. Prefer the exact integer ASBD on both
-        // sides. Some USB DACs keep a float-only virtual format while the
-        // physical side stays integer; then the ring carries F32 and the
-        // worker widens integer samples under the explicit int-to-float
-        // opt-in (exact for S16/S24). Sending integer bytes to a float
-        // virtual stream is clipped garbage, so anything else is an error.
+        // physical (hardware) format. Preference order:
+        // 1. An exact match from the stream's *available virtual formats*:
+        //    many USB DACs list non-mixable integer virtual formats next to
+        //    the mixable float one, and selecting one keeps the whole path
+        //    integer (no conversion anywhere).
+        // 2. The current virtual format, if it already preserves the stream
+        //    (e.g. it followed the physical ASBD).
+        // 3. Canonical F32: the worker widens integer samples under the
+        //    explicit int-to-float opt-in (exact for S16/S24).
+        // Anything else would reinterpret our bytes (integer data in a
+        // float buffer is clipped garbage), so it is a hard error.
         let virtual_address = prop_addr(
             kAudioStreamPropertyVirtualFormat,
             kAudioObjectPropertyScopeGlobal,
             kAudioObjectPropertyElementMain,
         );
+        let available_virtual_address = prop_addr(
+            kAudioStreamPropertyAvailableVirtualFormats,
+            kAudioObjectPropertyScopeGlobal,
+            kAudioObjectPropertyElementMain,
+        );
+        // SAFETY: documented array-of-AudioStreamRangedDescription property
+        // on a stream; best effort (diagnostics + preference only).
+        let offered_virtual: Vec<AudioStreamRangedDescription> =
+            get_data(stream, &available_virtual_address).unwrap_or_default();
+        if let Some(log) = &mut log {
+            use std::io::Write;
+            for d in &offered_virtual {
+                let a = &d.mFormat;
+                let _ = writeln!(
+                    log,
+                    "  offered virtual: rate={} range=[{}, {}] flags=0x{:x} bpf={} ch={} bits={} id=0x{:x}",
+                    a.mSampleRate,
+                    d.mSampleRateRange.mMinimum,
+                    d.mSampleRateRange.mMaximum,
+                    a.mFormatFlags,
+                    a.mBytesPerFrame,
+                    a.mChannelsPerFrame,
+                    a.mBitsPerChannel,
+                    a.mFormatID,
+                );
+            }
+        }
+        let candidate_from_asbd = |a: &AudioStreamBasicDescription| CandidateFormat {
+            rate_min: a.mSampleRate,
+            rate_max: a.mSampleRate,
+            format_id: a.mFormatID,
+            format_flags: a.mFormatFlags,
+            bytes_per_frame: a.mBytesPerFrame,
+            channels_per_frame: a.mChannelsPerFrame,
+            bits_per_channel: a.mBitsPerChannel,
+        };
+        let virtual_candidates: Vec<CandidateFormat> = offered_virtual
+            .iter()
+            .map(|d| {
+                let a = &d.mFormat;
+                let mut c = candidate_from_asbd(a);
+                // kAudioStreamAnyRate: the supported rates are the range.
+                if a.mSampleRate == 0.0 {
+                    c.rate_min = d.mSampleRateRange.mMinimum;
+                    c.rate_max = d.mSampleRateRange.mMaximum;
+                }
+                c
+            })
+            .collect();
+        let direct_virtual = pick_physical_format(&virtual_candidates, input).map(|m| {
+            let mut asbd = offered_virtual[m.index].mFormat;
+            asbd.mSampleRate = wanted_rate;
+            (asbd, m)
+        });
+
         // SAFETY: documented single-ASBD property on an output stream.
         let virtual_before: AudioStreamBasicDescription = get_value(stream, &virtual_address)
             .map_err(|_| Self::unsupported(input, "could not read the IOProc virtual format"))?;
@@ -576,11 +637,13 @@ impl CoreAudioOutput {
             use std::io::Write;
             let _ = writeln!(log, "  virtual before: {virtual_before:?}");
         }
-        if virtual_before != chosen {
-            // Best effort: some drivers accept the integer client format,
-            // others keep their float one. The readback decides.
+        if let Some((wanted, _)) = &direct_virtual
+            && virtual_before != *wanted
+        {
+            // Best effort: the readback decides. Drivers without an integer
+            // client format silently keep their float one.
             // SAFETY: documented single-ASBD property on an output stream.
-            let _ = set_value(stream, &virtual_address, &chosen);
+            let _ = set_value(stream, &virtual_address, wanted);
         }
         // SAFETY: documented single-ASBD property on an output stream.
         let virtual_format: AudioStreamBasicDescription = get_value(stream, &virtual_address)
@@ -589,29 +652,24 @@ impl CoreAudioOutput {
             use std::io::Write;
             let _ = writeln!(log, "  virtual readback: {virtual_format:?}");
         }
-        let float_ioproc = if virtual_format == chosen {
-            false
-        } else {
-            let candidate = CandidateFormat {
-                rate_min: virtual_format.mSampleRate,
-                rate_max: virtual_format.mSampleRate,
-                format_id: virtual_format.mFormatID,
-                format_flags: virtual_format.mFormatFlags,
-                bytes_per_frame: virtual_format.mBytesPerFrame,
-                channels_per_frame: virtual_format.mChannelsPerFrame,
-                bits_per_channel: virtual_format.mBitsPerChannel,
-            };
-            if input.encoding != SampleEncoding::F32 && ioproc_accepts_f32(candidate, input) {
-                true
-            } else {
-                return Err(Self::unsupported(
-                    input,
-                    "IOProc virtual format matches neither the physical format nor canonical F32",
-                ));
-            }
+
+        let established = direct_virtual
+            .and_then(|(wanted, m)| (virtual_format == wanted).then_some((wanted, m.format, m.valid_bits)))
+            .or_else(|| {
+                (virtual_format == chosen)
+                    .then_some((virtual_format, matched.format, matched.valid_bits))
+            })
+            .or_else(|| {
+                (input.encoding != SampleEncoding::F32
+                    && ioproc_accepts_f32(candidate_from_asbd(&virtual_format), input))
+                .then_some((virtual_format, DeviceFormat::F32Le, 32))
+            });
+        let Some((expected_virtual, wire_format, wire_valid_bits)) = established else {
+            return Err(Self::unsupported(
+                input,
+                "IOProc virtual format preserves neither the exact stream nor canonical F32",
+            ));
         };
-        // The ASBD the IOProc callback must be fed with after all settles.
-        let expected_virtual = if float_ioproc { virtual_format } else { chosen };
 
         // (d) Device buffer frame size: best-effort, actual is reported.
         let buffer_address = prop_addr(
@@ -707,14 +765,10 @@ impl CoreAudioOutput {
             let _ = writeln!(log, "  actual rate before start: {actual_rate:?}");
         }
 
-        let (format, valid_bits) = if float_ioproc {
-            // The ring carries F32 for the IOProc while the physical integer
-            // format stays exact. `valid_bits` 32 matches the F32 container,
-            // as in the MacBook float-only endpoint path.
-            (DeviceFormat::F32Le, 32)
-        } else {
-            (matched.format, matched.valid_bits)
-        };
+        // The ring carries the established IOProc (virtual) wire format:
+        // the exact encoding on a direct integer/native-F32 path, or F32 for
+        // the opt-in float bridge (`valid_bits` 32 matches the container).
+        let (format, valid_bits) = (wire_format, wire_valid_bits);
         let spec = OutputSpec {
             device: self.device_id.clone(),
             rate_hz: input.rate_hz,
