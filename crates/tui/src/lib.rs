@@ -19,6 +19,7 @@ use sointty_core::{
 };
 
 mod browser;
+pub mod display;
 pub mod layout;
 pub mod theme;
 pub mod widgets;
@@ -1874,6 +1875,9 @@ impl App {
                 state.paused = false;
                 state.total_frames = None;
                 state.frame = 0;
+            }
+            PlayerEvent::QueueEditRejected { reason, .. } => {
+                state.status = format!("queue edit rejected: {reason}");
             }
         }
     }

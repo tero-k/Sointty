@@ -278,6 +278,25 @@ pub enum PlayerCommand {
     Pause,
     Stop,
     Next,
+    /// Interrupt current playback and play this entry immediately. The entry
+    /// joins the queue front with a fresh engine ID, ahead of the prepared
+    /// next track, regardless of shuffle.
+    PlayNow(QueueEntry),
+    /// Remove a pending entry by engine ID. Never removes the audible track
+    /// or a track committed past a gapless boundary; refused edits report
+    /// `QueueEditRejected` and leave queue and output untouched.
+    RemoveQueueEntry(TrackId),
+    /// Move pending entry `id` before anchor `before`; `None` appends at the
+    /// end. Audible and gapless-committed tracks refuse; a missing ID or
+    /// anchor rejects without partial edits.
+    MoveQueueEntry {
+        id: TrackId,
+        before: Option<TrackId>,
+    },
+    /// Interrupt current playback and play the pending entry with this ID,
+    /// preserving its ID and CUE range. Jumping to the already-audible track
+    /// is a no-op; a missing ID reports `QueueEditRejected`.
+    JumpToQueueEntry(TrackId),
     SeekFrame(u64),
     SelectDevice(DeviceId),
     /// Opt in to non-bit-perfect F32-to-integer output when exact F32 fails.
@@ -302,6 +321,13 @@ pub enum PlayerEvent {
     QueueChanged {
         audible: Option<QueueItem>,
         pending: Vec<QueueItem>,
+    },
+    /// A pending-queue remove/move/jump was refused (audible or
+    /// gapless-committed track, or a stale/missing ID or anchor). The queue
+    /// order and the output stream are untouched.
+    QueueEditRejected {
+        id: TrackId,
+        reason: &'static str,
     },
     /// Source-frame length of the currently audible track, or unknown.
     Duration {
