@@ -1917,23 +1917,28 @@ fn event_loop(
             terminal.draw(|frame| draw(frame, &app))?;
             dirty = false;
         }
-        if event::poll(Duration::from_millis(100))?
-            && let Event::Key(key) = event::read()?
-        {
-            if key.kind != KeyEventKind::Press {
-                continue;
+        if event::poll(Duration::from_millis(100))? {
+            match event::read()? {
+                Event::Key(key) => {
+                    if key.kind != KeyEventKind::Press {
+                        continue;
+                    }
+                    if app.handle_key_event(key) {
+                        return Ok(());
+                    }
+                    if let Some(action) = app.pending_os.take() {
+                        // The OS credential/mount prompt needs a normal terminal.
+                        // Always restore, even when the action fails.
+                        suspend_terminal(terminal)?;
+                        app.run_os_action(action);
+                        resume_terminal(terminal)?;
+                    }
+                    dirty = true;
+                }
+                // Ratatui resizes the viewport during the next draw.
+                Event::Resize(_, _) => dirty = true,
+                _ => {}
             }
-            if app.handle_key_event(key) {
-                return Ok(());
-            }
-            if let Some(action) = app.pending_os.take() {
-                // The OS credential/mount prompt needs a normal terminal.
-                // Always restore, even when the action fails.
-                suspend_terminal(terminal)?;
-                app.run_os_action(action);
-                resume_terminal(terminal)?;
-            }
-            dirty = true;
         }
     }
 }
@@ -3363,6 +3368,67 @@ mod tests {
         h.app.apply_event(PlayerEvent::EndOfQueue);
         assert_eq!(h.app.state.total_frames, None);
         assert_eq!(h.app.state.frame, 0);
+    }
+
+    #[test]
+    fn redraw_after_resize_keeps_menu_and_reflows_progress_bar() {
+        fn screen(terminal: &Terminal<ratatui::backend::TestBackend>, width: u16, height: u16) -> String {
+            let buffer = terminal.backend().buffer();
+            (0..height).map(|y| {
+                (0..width).map(|x| buffer[(x, y)].symbol()).collect::<String>()
+            }).collect::<Vec<_>>().join("\n")
+        }
+
+        let mut h = harness(Vec::new());
+        h.app.apply_event(PlayerEvent::Playing {
+            track: 7,
+            output: OutputSpec {
+                device: "dev1".to_owned(),
+                rate_hz: 44_100,
+                layout: sointty_core::ChannelLayout::discrete(2),
+                format: sointty_core::DeviceFormat::S16Le,
+                valid_bits: 16,
+            },
+            converted: false,
+        });
+        h.app.apply_event(PlayerEvent::Duration { track: 7, total_frames: Some(441_000) });
+        h.app.apply_event(PlayerEvent::Position { track: 7, frame: 220_500 });
+        h.key(KeyCode::Char('m'));
+        assert!(matches!(h.app.pane, Some(Pane::Menu(_))));
+
+        // The bar fills the playback block, so it sits between the borders.
+        let bordered_bar = |width: u16| {
+            let inner = usize::from(width.saturating_sub(2)).saturating_sub(12);
+            format!("│{}│", progress_bar(220_500, Some(441_000), inner))
+        };
+
+        let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(90, 24)).unwrap();
+        terminal.draw(|frame| draw(frame, &h.app)).unwrap();
+        let grown = screen(&terminal, 90, 24);
+        assert!(grown.contains("sointty"), "{grown}");
+        assert!(grown.contains("Menu"), "{grown}");
+        assert!(grown.contains(&bordered_bar(90)), "{grown}");
+
+        terminal.backend_mut().resize(110, 30);
+        terminal.draw(|frame| draw(frame, &h.app)).unwrap();
+        let wider = screen(&terminal, 110, 30);
+        assert!(wider.contains("sointty"), "{wider}");
+        assert!(wider.contains("Menu"), "{wider}");
+        assert!(wider.contains(&bordered_bar(110)), "{wider}");
+
+        terminal.backend_mut().resize(40, 12);
+        terminal.draw(|frame| draw(frame, &h.app)).unwrap();
+        assert_eq!(terminal.backend().buffer().area, Rect::new(0, 0, 40, 12));
+        let shrunk = screen(&terminal, 40, 12);
+        assert!(shrunk.contains("sointty"), "{shrunk}");
+        assert!(!shrunk.contains(&bordered_bar(90)), "{shrunk}");
+
+        terminal.backend_mut().resize(90, 24);
+        terminal.draw(|frame| draw(frame, &h.app)).unwrap();
+        let restored = screen(&terminal, 90, 24);
+        assert!(restored.contains("Menu"), "{restored}");
+        assert!(restored.contains(&bordered_bar(90)), "{restored}");
+        assert!(matches!(h.app.pane, Some(Pane::Menu(_))));
     }
 
     #[test]
