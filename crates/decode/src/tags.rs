@@ -1,7 +1,7 @@
 //! Read-only metadata tags via lofty. Tags are best-effort: any I/O or
 //! parse failure yields `None` and never blocks playback.
 
-use lofty::file::TaggedFileExt;
+use lofty::file::{AudioFile, TaggedFileExt};
 use lofty::probe::Probe;
 use lofty::tag::ItemKey;
 use sointty_core::TrackTags;
@@ -13,6 +13,53 @@ pub fn read_tags(path: &std::path::Path) -> Option<TrackTags> {
         title: tag.get_string(ItemKey::TrackTitle).map(str::to_owned),
         artist: tag.get_string(ItemKey::TrackArtist).map(str::to_owned),
         album: tag.get_string(ItemKey::AlbumTitle).map(str::to_owned),
+    })
+}
+
+/// Presentation-only metadata for UI display; playback never uses this.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct DisplayMetadata {
+    pub tags: TrackTags,
+    pub track_number: Option<u32>,
+    pub disc_number: Option<u32>,
+    pub duration: Option<std::time::Duration>,
+    pub sample_rate_hz: Option<u32>,
+    pub bit_depth: Option<u8>,
+    pub channels: Option<u16>,
+}
+
+/// Parses the leading integer of tag values like `"3"` or `"3/12"`.
+fn leading_number(value: &str) -> Option<u32> {
+    let digits: String = value.chars().take_while(|c| c.is_ascii_digit()).collect();
+    if digits.is_empty() {
+        None
+    } else {
+        digits.parse().ok()
+    }
+}
+
+/// Reads display metadata; any I/O or parse failure yields `None`. Fields
+/// stay `None` when the file simply lacks them.
+pub fn read_display_metadata(path: &std::path::Path) -> Option<DisplayMetadata> {
+    let tagged_file = Probe::open(path).ok()?.read().ok()?;
+    let tag = tagged_file.primary_tag().or_else(|| tagged_file.first_tag());
+    let properties = tagged_file.properties();
+    Some(DisplayMetadata {
+        tags: tag.map_or_else(TrackTags::default, |tag| TrackTags {
+            title: tag.get_string(ItemKey::TrackTitle).map(str::to_owned),
+            artist: tag.get_string(ItemKey::TrackArtist).map(str::to_owned),
+            album: tag.get_string(ItemKey::AlbumTitle).map(str::to_owned),
+        }),
+        track_number: tag
+            .and_then(|tag| tag.get_string(ItemKey::TrackNumber))
+            .and_then(leading_number),
+        disc_number: tag
+            .and_then(|tag| tag.get_string(ItemKey::DiscNumber))
+            .and_then(leading_number),
+        duration: Some(properties.duration()),
+        sample_rate_hz: properties.sample_rate(),
+        bit_depth: properties.bit_depth(),
+        channels: properties.channels().map(u16::from),
     })
 }
 
@@ -70,5 +117,26 @@ mod tests {
         if let Some(tags) = tags {
             assert_eq!(tags, TrackTags::default());
         }
+    }
+
+    #[test]
+    fn display_metadata_reads_wav_properties() {
+        let path = temp_wav("display");
+        let metadata = read_display_metadata(&path);
+        let _ = std::fs::remove_file(&path);
+        let metadata = metadata.expect("wav should probe");
+        assert_eq!(metadata.tags, TrackTags::default());
+        assert_eq!(metadata.track_number, None);
+        assert_eq!(metadata.disc_number, None);
+        assert_eq!(metadata.sample_rate_hz, Some(44_100));
+        assert_eq!(metadata.bit_depth, Some(16));
+        assert_eq!(metadata.channels, Some(2));
+        assert!(metadata.duration.unwrap().as_secs() < 1);
+    }
+
+    #[test]
+    fn display_metadata_missing_file_returns_none() {
+        let path = std::env::temp_dir().join("sointty-tags-test-definitely-missing.opus");
+        assert_eq!(read_display_metadata(&path), None);
     }
 }

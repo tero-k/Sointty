@@ -7,6 +7,7 @@ license.workspace = true
 
 [dependencies]
 sointty-core.workspace = true
+sointty-decode.workspace = true
 sointty-playlist.workspace = true
 crossbeam-channel.workspace = true
 ratatui.workspace = true

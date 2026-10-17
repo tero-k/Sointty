@@ -1987,6 +1987,7 @@ dependencies = [
  "parking_lot",
  "ratatui",
  "sointty-core",
+ "sointty-decode",
  "sointty-playlist",
 ]
 

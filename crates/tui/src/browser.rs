@@ -73,6 +73,21 @@ fn collect_into(dir: &Path, out: &mut Vec<PathBuf>) -> io::Result<()> {
     Ok(())
 }
 
+/// Scan/add policy: hidden and OS-metadata names never appear in browsing
+/// or recursive collection. This is a scan policy only; explicit CLI paths
+/// and imported playlist entries are never filtered.
+fn is_junk_name(name: &std::ffi::OsStr) -> bool {
+    let text = name.to_string_lossy();
+    // Dot-prefixed files/directories: hidden entries, AppleDouble `._*`,
+    // `.DS_Store` and friends.
+    if text.starts_with('.') {
+        return true;
+    }
+    // Case-insensitive Windows metadata files.
+    let lower = text.to_lowercase();
+    lower == "thumbs.db" || lower == "desktop.ini"
+}
+
 /// Lists `dir`: subdirectories first, then audio and playlist files, each
 /// group sorted case-insensitively by name. Uses only `std::fs`.
 pub fn list_dir(dir: &Path) -> io::Result<Vec<BrowserItem>> {
@@ -80,6 +95,9 @@ pub fn list_dir(dir: &Path) -> io::Result<Vec<BrowserItem>> {
     let mut files = Vec::new();
     for entry in fs::read_dir(dir)? {
         let entry = entry?;
+        if is_junk_name(&entry.file_name()) {
+            continue;
+        }
         let path = entry.path();
         let name = entry.file_name().to_string_lossy().into_owned();
         let file_type = entry.file_type()?;
@@ -257,6 +275,32 @@ mod tests {
         let dir = temp_test_dir("collect-missing");
         // Never created: the whole collection must fail, no partial list.
         assert!(collect_audio_files(&dir).is_err());
+    }
+
+    #[test]
+    fn scans_skip_hidden_and_os_metadata_files() {
+        let dir = temp_test_dir("junk");
+        fs::create_dir_all(dir.join(".hidden-dir")).unwrap();
+        fs::write(dir.join("01-Track.flac"), b"").unwrap();
+        fs::write(dir.join("._01-Track.flac"), b"").unwrap();
+        fs::write(dir.join(".DS_Store"), b"").unwrap();
+        fs::write(dir.join("Thumbs.db"), b"").unwrap();
+        fs::write(dir.join("desktop.ini"), b"").unwrap();
+        fs::write(dir.join(".spotlight.flac"), b"").unwrap();
+        fs::write(dir.join(".hidden-dir").join("inner.flac"), b"").unwrap();
+
+        let items = list_dir(&dir).unwrap();
+        let names: Vec<&str> = items.iter().map(|item| item.name.as_str()).collect();
+        assert_eq!(names, ["01-Track.flac"]);
+
+        let collected = collect_audio_files(&dir).unwrap();
+        let names: Vec<&str> = collected
+            .iter()
+            .map(|path| path.file_name().unwrap().to_str().unwrap())
+            .collect();
+        assert_eq!(names, ["01-Track.flac"]);
+
+        fs::remove_dir_all(&dir).unwrap();
     }
 
 }

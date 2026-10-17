@@ -252,6 +252,18 @@ fn is_audio_path(path: &Path) -> bool {
         .is_some_and(|extension| AUDIO_EXTENSIONS.contains(&extension.to_ascii_lowercase().as_str()))
 }
 
+/// Scan policy: hidden and OS-metadata names are never indexed. Explicit
+/// paths outside scans are unaffected; keep this in sync with the TUI
+/// browser's own private copy (no cross-crate dependency).
+fn is_junk_name(name: &std::ffi::OsStr) -> bool {
+    let text = name.to_string_lossy();
+    if text.starts_with('.') {
+        return true;
+    }
+    let lower = text.to_lowercase();
+    lower == "thumbs.db" || lower == "desktop.ini"
+}
+
 fn collect_audio_files(dir: &Path, out: &mut Vec<PathBuf>) {
     // Unreadable directories (removed mounts, permissions) are skipped so a
     // scan always makes progress and never blocks browsing.
@@ -259,6 +271,9 @@ fn collect_audio_files(dir: &Path, out: &mut Vec<PathBuf>) {
         return;
     };
     for entry in entries.flatten() {
+        if is_junk_name(&entry.file_name()) {
+            continue;
+        }
         let path = entry.path();
         let Ok(file_type) = entry.file_type() else {
             continue;
@@ -463,6 +478,25 @@ mod tests {
         let stats = library.scan(&[dir.clone()]).unwrap();
         assert_eq!(stats.inserted_or_updated, 0);
         assert_eq!(stats.skipped_unchanged, 1);
+    }
+
+    #[test]
+    fn scan_skips_hidden_and_os_metadata_files() {
+        let dir = temp_dir("junk");
+        std::fs::create_dir_all(dir.join(".hidden")).unwrap();
+        write_wav(&dir, "01-Track.wav");
+        write_wav(&dir, "._01-Track.wav");
+        write_wav(&dir.join(".hidden"), "inner.wav");
+        std::fs::write(dir.join(".DS_Store"), b"").unwrap();
+        std::fs::write(dir.join("Thumbs.db"), b"").unwrap();
+        std::fs::write(dir.join("desktop.ini"), b"").unwrap();
+        let db_path = dir.join("index.db");
+        let mut library = Library::open(&db_path).unwrap();
+        let stats = library.scan(&[dir.clone()]).unwrap();
+        assert_eq!(stats.scanned, 1, "only the real track may be indexed");
+        let tracks = library.tracks(10).unwrap();
+        assert_eq!(tracks.len(), 1);
+        assert!(tracks[0].path.ends_with("01-Track.wav"));
     }
 
     #[test]
