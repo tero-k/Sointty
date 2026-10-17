@@ -11,7 +11,7 @@ use crossterm::terminal::{
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
-use ratatui::style::{Color, Modifier, Style};
+use ratatui::style::{Modifier, Style};
 use ratatui::widgets::{Block, Borders, List, ListItem, ListState, Paragraph};
 use sointty_core::{
     BufferConfig, DeviceFormat, DeviceId, OutputSpec, PlayerCommand, PlayerEvent, QueueEntry,
@@ -19,9 +19,13 @@ use sointty_core::{
 };
 
 mod browser;
+pub mod layout;
+pub mod theme;
+pub mod widgets;
 
 pub use browser::collect_audio_files;
 use browser::{Browser, BrowserItemKind};
+use theme::Theme;
 
 /// Lists selectable output devices as `(id, display name)` pairs; invoked
 /// each time the device pane opens so hot-plugged endpoints appear.
@@ -139,6 +143,9 @@ pub struct TuiState {
 }
 
 impl TuiState {
+    // Grouped settings structs would churn every later redesign slice; the
+    // constructor is replaced as the App state migrates to screens.
+    #[allow(clippy::too_many_arguments)]
     fn new(
         device: DeviceId,
         float_to_int: bool,
@@ -411,6 +418,7 @@ enum OsAction {
 
 struct App {
     state: TuiState,
+    theme: Theme,
     pane: Option<Pane>,
     right: RightView,
     playlist_entry_sel: usize,
@@ -427,6 +435,7 @@ struct App {
 
 impl App {
     fn new(options: RunOptions, hooks: Hooks, commands: Sender<PlayerCommand>) -> Self {
+        let (theme, theme_warning) = Theme::detect(None);
         let mut app = Self {
             state: TuiState::new(
                 options.current_device,
@@ -438,6 +447,7 @@ impl App {
                 options.initial_browser_dir,
                 options.home_dir,
             ),
+            theme,
             pane: None,
             right: RightView::SavedList,
             playlist_entry_sel: 0,
@@ -448,6 +458,9 @@ impl App {
             hooks,
             pending_os: None,
         };
+        if let Some(warning) = theme_warning {
+            app.state.status = warning;
+        }
         // Prime the device-name cache so the Playback pane shows a friendly
         // name from the start; a failed enumeration only delays the name
         // until the picker is opened.
@@ -2032,7 +2045,7 @@ fn key_hints(app: &App) -> [&'static str; 3] {
 }
 
 fn draw_key_hints(frame: &mut ratatui::Frame<'_>, app: &App, area: Rect) {
-    let block = Block::default().title("Keys").borders(Borders::ALL);
+    let block = widgets::panel("Keys", None, &app.theme, false);
     let inside = block.inner(area);
     frame.render_widget(block, area);
     for (row, hint) in key_hints(app).into_iter().enumerate() {
@@ -2059,12 +2072,8 @@ fn draw(frame: &mut ratatui::Frame<'_>, app: &App) {
         ])
         .split(frame.area());
     let title = Paragraph::new("sointty — direct/exclusive music player")
-        .style(
-            Style::default()
-                .fg(Color::Cyan)
-                .add_modifier(Modifier::BOLD),
-        )
-        .block(Block::default().borders(Borders::ALL));
+        .style(app.theme.strong().add_modifier(Modifier::BOLD))
+        .block(widgets::panel("", None, &app.theme, false));
     frame.render_widget(title, bottom[0]);
     draw_key_hints(frame, app, bottom[3]);
 
@@ -2138,9 +2147,7 @@ fn draw(frame: &mut ratatui::Frame<'_>, app: &App) {
     .block(Block::default().title("Playback").borders(Borders::ALL));
     frame.render_widget(playback, bottom[1]);
 
-    let highlight = Style::default()
-        .fg(Color::Cyan)
-        .add_modifier(Modifier::BOLD);
+    let highlight = app.theme.selected();
 
     // Right column: selected saved playlist or the live queue.
     let render_right = |frame: &mut ratatui::Frame<'_>, area| match app.right {

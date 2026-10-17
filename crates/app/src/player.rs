@@ -254,7 +254,8 @@ fn pack_int_to_float(
     let frames = block.frames as usize * spec.layout.channels as usize;
     scratch.clear();
     scratch.resize(frames * 4, 0);
-    let mut out_chunks = scratch.chunks_exact_mut(4);
+    let (out_chunks, _) = scratch.as_chunks_mut::<4>();
+    let mut out_chunks = out_chunks.iter_mut();
     match &block.pcm {
         DecodedPcm::I16(samples) => {
             if samples.len() != frames {
@@ -364,7 +365,7 @@ fn playback_total(playback: &Playback) -> Option<u64> {
 /// `true` when the complete decoded block has entered the ring.
 fn push_available(playback: &mut Playback) -> Result<bool, PlayerError> {
     let frame_bytes = playback.output.bytes_per_frame();
-    if playback.scratch.len() % frame_bytes != 0 {
+    if !playback.scratch.len().is_multiple_of(frame_bytes) {
         return Err(PlayerError::InvalidInput("decoded block is not wire-frame aligned"));
     }
     let remaining = playback.scratch.len() - playback.pending_offset;
@@ -1210,10 +1211,10 @@ impl<O: AudioOutput> Worker<O> {
         if self.counters.fault.load(Ordering::Relaxed) {
             return Err(PlayerError::Output);
         }
-        if new_xruns(&self.counters, &mut self.reported_xruns) {
-            if let Some(track) = &self.current {
-                self.emit(PlayerEvent::Underrun { track: track.id });
-            }
+        if new_xruns(&self.counters, &mut self.reported_xruns)
+            && let Some(track) = &self.current
+        {
+            self.emit(PlayerEvent::Underrun { track: track.id });
         }
         self.emit_pending_boundary();
 
@@ -1403,6 +1404,9 @@ pub struct PlayerEngine<O: AudioOutput> {
 }
 
 impl<O: AudioOutput + 'static> PlayerEngine<O> {
+    // The engine is constructed once at startup; a builder would only add
+    // indirection around these independent settings.
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         output: O,
         output_factory: OutputFactory<O>,

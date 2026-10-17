@@ -522,7 +522,7 @@ fn run(cli: Cli, settings: Settings) -> Result<(), PlayerError> {
         on_float_to_int_selected: float_to_int_saver(),
         on_int_to_float_selected: int_to_float_saver(),
         on_browser_dir: browser_dir_saver(),
-        on_catalog: Box::new(|catalog| playlists::save(catalog)),
+        on_catalog: Box::new(playlists::save),
         on_timing: timing_saver(),
         locations: Box::new(locations::list_locations),
         map_drive: locations::map_drive_hook(),

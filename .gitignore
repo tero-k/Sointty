@@ -25,3 +25,6 @@ desktop.ini
 .vscode/
 *.swp
 *.swo
+
+# Local TUI redesign mockup (kept local, never committed)
+/sointty TUI redesign.html
