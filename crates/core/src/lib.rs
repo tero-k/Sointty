@@ -623,7 +623,7 @@ pub fn pack_native_dsd(
         return Err(PlayerError::InvalidInput("invalid native DSD slot layout"));
     }
     let frame_bytes = channels * slot_bytes;
-    if input.len() % frame_bytes != 0 {
+    if !input.len().is_multiple_of(frame_bytes) {
         return Err(PlayerError::InvalidInput(
             "DSD block must contain whole native DSD slots per channel",
         ));
@@ -662,7 +662,7 @@ impl DopPacker {
         if self.channels == 0 {
             return Err(PlayerError::InvalidInput("DoP packer needs channels"));
         }
-        if dsd_interleaved.len() % (self.channels * 2) != 0 {
+        if !dsd_interleaved.len().is_multiple_of(self.channels * 2) {
             return Err(PlayerError::InvalidInput(
                 "DoP packing requires an even per-channel DSD byte count",
             ));

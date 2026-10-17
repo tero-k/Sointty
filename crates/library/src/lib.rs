@@ -37,10 +37,10 @@ impl Library {
     /// reported via the log and recreated. This function never panics and
     /// never blocks browsing: failures arrive as a typed [`LibraryError`].
     pub fn open(db_path: &Path) -> Result<Self, LibraryError> {
-        if let Some(parent) = db_path.parent() {
-            if !parent.as_os_str().is_empty() {
-                std::fs::create_dir_all(parent)?;
-            }
+        if let Some(parent) = db_path.parent()
+            && !parent.as_os_str().is_empty()
+        {
+            std::fs::create_dir_all(parent)?;
         }
         match Self::open_existing(db_path) {
             Ok(library) => Ok(library),

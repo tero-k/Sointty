@@ -15,7 +15,8 @@ use windows::Win32::Foundation::{
 use windows::Win32::Media::Audio::{
     AUDCLNT_E_DEVICE_IN_USE, AUDCLNT_SHAREMODE_EXCLUSIVE, AUDCLNT_STREAMFLAGS_EVENTCALLBACK,
     DEVICE_STATE_ACTIVE, IAudioClient, IAudioRenderClient, IMMDevice, IMMDeviceEnumerator,
-    MMDeviceEnumerator, WAVEFORMATEX, WAVEFORMATEXTENSIBLE, eConsole, eRender,
+    MMDeviceEnumerator, WAVEFORMATEX, WAVEFORMATEXTENSIBLE, WAVEFORMATEXTENSIBLE_0, eConsole,
+    eRender,
 };
 use windows::Win32::System::Com::StructuredStorage::{
     PROPVARIANT, PropVariantClear, PropVariantToBSTR,
@@ -674,7 +675,7 @@ fn init_attempts(buffer_hns: i64, period_hns: i64, aligned_buffer_hns: i64) -> V
 /// multiple of 128 bytes, the alignment required by Intel HD Audio devices.
 fn align_buffer_hns(buffer_hns: i64, rate_hz: u32, frame_bytes: u32) -> i64 {
     let frame_bytes = u64::from(frame_bytes.max(1));
-    let frames = (buffer_hns as u64 * u64::from(rate_hz) + 9_999_999) / 10_000_000;
+    let frames = (buffer_hns as u64 * u64::from(rate_hz)).div_ceil(10_000_000);
     let buffer_bytes = frames * frame_bytes;
     let aligned_bytes = buffer_bytes.div_ceil(128) * 128;
     let aligned_frames = aligned_bytes / frame_bytes;
@@ -683,24 +684,26 @@ fn align_buffer_hns(buffer_hns: i64, rate_hz: u32, frame_bytes: u32) -> i64 {
 
 fn build_extensible(input: &StreamSpec, candidate: &CandidateDesc) -> WAVEFORMATEXTENSIBLE {
     let align = block_align(input.layout.channels, candidate);
-    let mut format = WAVEFORMATEXTENSIBLE::default();
-    format.Format = WAVEFORMATEX {
-        wFormatTag: WAVE_FORMAT_EXTENSIBLE,
-        nChannels: input.layout.channels,
-        nSamplesPerSec: input.rate_hz,
-        nAvgBytesPerSec: input.rate_hz * u32::from(align),
-        nBlockAlign: align,
-        wBitsPerSample: candidate.container_bits,
-        cbSize: WAVEFORMATEXTENSIBLE_EXTRA,
-    };
-    format.Samples.wValidBitsPerSample = candidate.valid_bits;
-    format.dwChannelMask = channel_mask(&input.layout);
-    format.SubFormat = GUID::from_u128(if candidate.subformat_pcm {
-        SUBTYPE_PCM
-    } else {
-        SUBTYPE_IEEE_FLOAT
-    });
-    format
+    WAVEFORMATEXTENSIBLE {
+        Format: WAVEFORMATEX {
+            wFormatTag: WAVE_FORMAT_EXTENSIBLE,
+            nChannels: input.layout.channels,
+            nSamplesPerSec: input.rate_hz,
+            nAvgBytesPerSec: input.rate_hz * u32::from(align),
+            nBlockAlign: align,
+            wBitsPerSample: candidate.container_bits,
+            cbSize: WAVEFORMATEXTENSIBLE_EXTRA,
+        },
+        Samples: WAVEFORMATEXTENSIBLE_0 {
+            wValidBitsPerSample: candidate.valid_bits,
+        },
+        dwChannelMask: channel_mask(&input.layout),
+        SubFormat: GUID::from_u128(if candidate.subformat_pcm {
+            SUBTYPE_PCM
+        } else {
+            SUBTYPE_IEEE_FLOAT
+        }),
+    }
 }
 
 fn build_plain(input: &StreamSpec, candidate: &CandidateDesc) -> WAVEFORMATEX {

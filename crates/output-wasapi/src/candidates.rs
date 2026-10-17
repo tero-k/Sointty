@@ -17,9 +17,9 @@ pub const WAVE_FORMAT_EXTENSIBLE: u16 = 0xFFFE;
 pub const WAVEFORMATEXTENSIBLE_EXTRA: u16 = 22;
 
 /// `KSDATAFORMAT_SUBTYPE_PCM`.
-pub const SUBTYPE_PCM: u128 = 0x00000001_0000_0010_8000_00AA_0038_9B71;
+pub const SUBTYPE_PCM: u128 = 0x0000_0001_0000_0010_8000_00AA_0038_9B71;
 /// `KSDATAFORMAT_SUBTYPE_IEEE_FLOAT`.
-pub const SUBTYPE_IEEE_FLOAT: u128 = 0x00000003_0000_0010_8000_00AA_0038_9B71;
+pub const SUBTYPE_IEEE_FLOAT: u128 = 0x0000_0003_0000_0010_8000_00AA_0038_9B71;
 
 /// `SPEAKER_FRONT_LEFT`.
 pub const SPEAKER_FRONT_LEFT: u32 = 0x1;
@@ -98,12 +98,12 @@ pub fn channel_mask(layout: &sointty_core::ChannelLayout) -> u32 {
 
 /// `WAVEFORMATEX.nBlockAlign` for a candidate.
 pub fn block_align(channels: u16, candidate: &CandidateDesc) -> u16 {
-    channels * (candidate.container_bits / 8) as u16
+    channels * (candidate.container_bits / 8)
 }
 
 /// Convert a frame count to a 100-ns duration, rounded up.
 pub fn frames_to_hns(frames: u32, rate_hz: u32) -> i64 {
-    ((u64::from(frames) * 10_000_000 + u64::from(rate_hz) - 1) / u64::from(rate_hz)) as i64
+    (u64::from(frames) * 10_000_000).div_ceil(u64::from(rate_hz)) as i64
 }
 
 #[cfg(test)]

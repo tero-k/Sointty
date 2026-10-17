@@ -45,11 +45,9 @@ pub(crate) struct CandidateFormat {
 
 impl CandidateFormat {
     fn bytes_per_sample(self) -> u32 {
-        if self.channels_per_frame == 0 {
-            0
-        } else {
-            self.bytes_per_frame / self.channels_per_frame
-        }
+        self.bytes_per_frame
+            .checked_div(self.channels_per_frame)
+            .unwrap_or(0)
     }
 
     /// Common invariants for every bit-perfect candidate: linear PCM, native
