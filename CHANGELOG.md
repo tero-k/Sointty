@@ -3,10 +3,20 @@
 These are retrospectively named development milestones based on dated commits.
 They are not tagged or published releases, and the 0.1.x numbers were not the
 manifest versions at those dates; they exist to summarize how the project
-evolved toward the current build. Only `0.2.0` describes the code as it
-exists today.
+evolved toward the current build. `0.2.0` and the `Unreleased` section
+describe the code as it exists today.
 
-## 0.2.0 (2026-10-18, current build)
+## Unreleased
+
+- Fix search freezing the whole app on broad queries: the search worker
+  indexes whole drives, so short queries matched tens of thousands of
+  entries and the UI spent all its time draining and re-sorting results.
+  The UI now drains worker events in bounded ticks and re-sorts once per
+  pass, results are capped to the best 2048 ranks, keystroke queries are
+  coalesced so only the newest runs, and the index is kept across search
+  opens instead of being rebuilt every time.
+
+## 0.2.0 (2026-10-18)
 
 - Rebuilt the terminal UI as three screens switched with `1`/`2`/`3`: Library
   (file browser, queue, and Now playing panel), Playlists, and Settings.
