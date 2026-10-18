@@ -526,6 +526,10 @@ struct Worker<O: AudioOutput> {
     boundary: Option<(TrackId, u64)>,
     playback: Option<Playback>,
     suspended: Option<Suspended>,
+    /// Set by Pause: parks the current playback for an in-place resume and
+    /// blocks the stall monitor's automatic `Resume` until an explicit
+    /// Play. Cleared by every command that starts or replaces playback.
+    paused: bool,
     /// A message received while the ring was full; handled before pumping.
     pending: Option<WorkerMsg>,
     output: O,
@@ -671,6 +675,7 @@ impl<O: AudioOutput> Worker<O> {
     /// stays alive and keeps accepting commands. A prepared-but-unplayed
     /// next track returns to the queue front; it was never consumed.
     fn report_failure(&mut self, error: &PlayerError) {
+        self.paused = false;
         self.playback = None;
         self.suspended = None;
         self.unprepare();
@@ -685,7 +690,8 @@ impl<O: AudioOutput> Worker<O> {
 
     /// Return a canceled prepared track to the queue front. Called on every
     /// transition that discards the prepared decoder without playing it, so
-    /// Stop/Pause/Seek/SelectDevice never silently lose a queued track.
+    /// Stop/Seek/SelectDevice never silently lose a queued track. Pause keeps
+    /// the prepared decoder: resume continues the same gapless pair.
     fn unprepare(&mut self) {
         if let Some(prepared) = self.prepared.take() {
             self.queue.push_front(prepared.track);
@@ -749,12 +755,22 @@ impl<O: AudioOutput> Worker<O> {
                 true
             }
             WorkerMsg::Play => {
+                self.paused = false;
                 if self.playback.is_none() {
-                    self.start_next()?;
+                    if self.suspended.is_some() {
+                        self.resume_suspended()?;
+                    } else {
+                        self.start_next()?;
+                    }
                 }
                 true
             }
-            WorkerMsg::Pause | WorkerMsg::Stop => {
+            WorkerMsg::Pause => {
+                self.pause()?;
+                true
+            }
+            WorkerMsg::Stop => {
+                self.paused = false;
                 self.playback = None;
                 self.suspended = None;
                 self.unprepare();
@@ -768,6 +784,7 @@ impl<O: AudioOutput> Worker<O> {
                 true
             }
             WorkerMsg::Next => {
+                self.paused = false;
                 self.playback = None;
                 self.suspended = None;
                 self.boundary = None;
@@ -779,6 +796,7 @@ impl<O: AudioOutput> Worker<O> {
                 // Unprepare first so a stale prepared decoder cannot
                 // overtake the chosen track; it returns to the queue front
                 // behind the new entry.
+                self.paused = false;
                 self.unprepare();
                 let tags = sointty_decode::tags::read_tags(&entry.path).unwrap_or_default();
                 self.next_track_id += 1;
@@ -793,6 +811,7 @@ impl<O: AudioOutput> Worker<O> {
                 true
             }
             WorkerMsg::JumpToQueueEntry(id) => {
+                self.paused = false;
                 self.jump_to_entry(id)?;
                 true
             }
@@ -817,6 +836,7 @@ impl<O: AudioOutput> Worker<O> {
                     self.device = device;
                     return Ok(true);
                 }
+                self.paused = false;
                 self.playback = None;
                 self.suspended = None;
                 self.unprepare();
@@ -862,7 +882,11 @@ impl<O: AudioOutput> Worker<O> {
                 true
             }
             WorkerMsg::Resume => {
-                self.resume_after_stall()?;
+                // A track the user paused stays parked: the stall monitor
+                // must not unpause it when data flows again.
+                if !self.paused {
+                    self.resume_suspended()?;
+                }
                 true
             }
             WorkerMsg::Quit => {
@@ -1391,6 +1415,28 @@ impl<O: AudioOutput> Worker<O> {
         Ok(())
     }
 
+    /// Pause: stop the output and park the current playback at the frame
+    /// the output had consumed, keeping the track current and audible so
+    /// Play resumes it in place instead of advancing the queue. A playback
+    /// already parked by a stall stays parked; the `paused` flag blocks the
+    /// stall monitor's automatic resume.
+    fn pause(&mut self) -> Result<(), PlayerError> {
+        self.paused = true;
+        if let Some(playback) = self.playback.take() {
+            // Same position rule as `suspend_for_stall`: the consumed frame,
+            // never the decoded-ahead write head.
+            let resume_frame = consumed_frame(&playback, &self.counters);
+            self.output.stop()?;
+            self.suspended = Some(Suspended {
+                playback,
+                resume_frame,
+            });
+        }
+        self.emit(PlayerEvent::Paused);
+        self.emit_queue_changed();
+        Ok(())
+    }
+
     /// Starvation timeout fired: stop the output and park the playback. The
     /// resume position is the frame count the output had actually consumed,
     /// so resuming re-seeks there (range-aware) and never masks the gap.
@@ -1413,9 +1459,9 @@ impl<O: AudioOutput> Worker<O> {
         Ok(())
     }
 
-    /// Starvation ended: re-seek to the preserved frame on a fresh ring and
-    /// restart the output, keeping the track resumable.
-    fn resume_after_stall(&mut self) -> Result<(), PlayerError> {
+    /// Restart a parked playback (stall or pause): re-seek to the preserved
+    /// frame on a fresh ring and restart the output.
+    fn resume_suspended(&mut self) -> Result<(), PlayerError> {
         let Some(suspended) = self.suspended.take() else {
             return Ok(());
         };
@@ -1577,7 +1623,7 @@ impl<O: AudioOutput> Worker<O> {
             }
             self.restart_current_for_access()
         } else if self.suspended.is_some() {
-            // `resume_after_stall` reconstructs when modes differ.
+            // `resume_suspended` reconstructs when modes differ.
             Ok(())
         } else {
             self.reconstruct_output()
@@ -1676,6 +1722,7 @@ impl<O: AudioOutput> Worker<O> {
     /// its CUE start in the desired mode instead of silently skipping it or
     /// resuming through the old backend.
     fn fail_access_switch(&mut self, error: &PlayerError) {
+        self.paused = false;
         self.playback = None;
         self.suspended = None;
         self.boundary = None;
@@ -2053,6 +2100,7 @@ impl<O: AudioOutput + 'static> PlayerEngine<O> {
             boundary: None,
             playback: None,
             suspended: None,
+            paused: false,
             pending: None,
             output: self.output,
             output_factory: self.output_factory,
@@ -2125,6 +2173,9 @@ impl Coordinator {
             PlayerCommand::Play => WorkerMsg::Play,
             PlayerCommand::Pause => {
                 self.cancel_current();
+                // A stall episode must not outlive the pause: its clearing
+                // would synthesize a Resume and unpause behind the user.
+                self.episode = None;
                 WorkerMsg::Pause
             }
             PlayerCommand::Stop => {
@@ -3015,6 +3066,7 @@ mod tests {
             boundary: None,
             playback: None,
             suspended: None,
+            paused: false,
             pending: None,
             output,
             output_factory: Box::new(|_, _| Err(PlayerError::Output)),
@@ -3826,6 +3878,147 @@ mod tests {
 
         harness.commands.send(PlayerCommand::Quit).unwrap();
         harness.join().unwrap();
+    }
+
+    #[test]
+    fn pause_parks_track_and_play_resumes_in_place() {
+        let mut plan = HashMap::new();
+        plan.insert(
+            PathBuf::from("a.flac"),
+            FakeTrack::Pcm(test_spec(44_100), 1_000_000),
+        );
+        plan.insert(
+            PathBuf::from("b.flac"),
+            FakeTrack::Pcm(test_spec(44_100), 1_000_000),
+        );
+        let (mut worker, events, calls, seeks) = make_test_worker(plan);
+        worker
+            .handle(WorkerMsg::Enqueue(PathBuf::from("a.flac").into()))
+            .unwrap();
+        worker
+            .handle(WorkerMsg::Enqueue(PathBuf::from("b.flac").into()))
+            .unwrap();
+        worker.handle(WorkerMsg::Play).unwrap();
+        recv_until(&events, |event| {
+            matches!(event, PlayerEvent::Playing { track: 1, .. })
+        });
+
+        // The drain thread consumes only the prefilled ring (no pump runs in
+        // this synchronous harness); wait for the counter to settle, then
+        // fix the consumed counter at a known mid-track frame.
+        let mut last = u64::MAX;
+        let mut stable = 0;
+        loop {
+            let played = calls.lock().played_total;
+            if played > 0 && played == last {
+                stable += 1;
+                if stable == 5 {
+                    break;
+                }
+            } else {
+                stable = 0;
+            }
+            last = played;
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        worker.counters.played_frames.store(1_234, Ordering::Relaxed);
+
+        let stops_before = calls.lock().stops;
+        worker.handle(WorkerMsg::Pause).unwrap();
+        recv_until(&events, |event| matches!(event, PlayerEvent::Paused));
+        assert_eq!(
+            calls.lock().stops,
+            stops_before + 1,
+            "pause must stop the output"
+        );
+        assert_eq!(
+            worker.suspended.as_ref().map(|parked| parked.resume_frame),
+            Some(1_234),
+            "pause must park the track at the consumed frame"
+        );
+
+        // The paused track stays audible; the next entry stays queued.
+        let (audible, pending) = recv_queue_changed(&events);
+        assert_eq!(
+            audible.map(|item| item.id),
+            Some(1),
+            "paused track must stay audible"
+        );
+        assert_eq!(
+            pending.iter().map(|item| item.id).collect::<Vec<_>>(),
+            vec![2],
+            "the next entry must stay queued behind the paused track"
+        );
+
+        // Play resumes the same track at the consumed frame, not the next
+        // queue entry.
+        let starts_before = calls.lock().starts;
+        worker.handle(WorkerMsg::Play).unwrap();
+        let playing = recv_until(&events, |event| {
+            matches!(event, PlayerEvent::Playing { .. })
+        });
+        assert!(
+            matches!(playing, PlayerEvent::Playing { track: 1, .. }),
+            "Play must resume the paused track, not advance the queue"
+        );
+        assert_eq!(
+            calls.lock().starts,
+            starts_before + 1,
+            "resume must restart the output"
+        );
+        assert_eq!(
+            *seeks.lock(),
+            vec![1_234],
+            "resume must seek to the frame the output had consumed"
+        );
+    }
+
+    #[test]
+    fn user_pause_blocks_stall_auto_resume() {
+        let mut plan = HashMap::new();
+        plan.insert(
+            PathBuf::from("a.flac"),
+            FakeTrack::Pcm(test_spec(44_100), 1_000_000),
+        );
+        let (mut worker, events, calls, _seeks) = make_test_worker(plan);
+        worker
+            .handle(WorkerMsg::Enqueue(PathBuf::from("a.flac").into()))
+            .unwrap();
+        worker.handle(WorkerMsg::Play).unwrap();
+        recv_until(&events, |event| {
+            matches!(event, PlayerEvent::Playing { track: 1, .. })
+        });
+
+        // The stall timeout parks the track; the user pauses before data
+        // flows again.
+        worker.suspend_for_stall().unwrap();
+        recv_until(&events, |event| {
+            matches!(event, PlayerEvent::Underrun { track: 1 })
+        });
+        worker.handle(WorkerMsg::Pause).unwrap();
+        recv_until(&events, |event| matches!(event, PlayerEvent::Paused));
+
+        // The stall monitor's Resume (data flowing again) must not unpause.
+        let starts = calls.lock().starts;
+        worker.handle(WorkerMsg::Resume).unwrap();
+        let resumed = count_events(
+            &events,
+            |event| matches!(event, PlayerEvent::Playing { .. }),
+            Duration::from_millis(200),
+        );
+        assert_eq!(resumed, 0, "a user-paused track must not auto-resume");
+        assert_eq!(
+            calls.lock().starts,
+            starts,
+            "a blocked resume must not restart the output"
+        );
+
+        // An explicit Play still resumes the parked track.
+        worker.handle(WorkerMsg::Play).unwrap();
+        let playing = recv_until(&events, |event| {
+            matches!(event, PlayerEvent::Playing { .. })
+        });
+        assert!(matches!(playing, PlayerEvent::Playing { track: 1, .. }));
     }
 
     #[test]
@@ -6462,7 +6655,7 @@ mod tests {
         // The old track is still audible when the stall forces a stop.
         worker.suspend_for_stall().unwrap();
         assert_eq!(worker.suspended.as_ref().unwrap().resume_frame, 0);
-        worker.resume_after_stall().unwrap();
+        worker.resume_suspended().unwrap();
         let playing = recv_until(&events, |event| {
             matches!(event, PlayerEvent::Playing { track: 2, .. })
         });

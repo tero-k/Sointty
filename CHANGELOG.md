@@ -17,6 +17,8 @@ exists today.
 - Responsive layouts that adapt to terminal width, plus display titles and
   presentation metadata for tidier track rows.
 - Pending-queue control commands in the player control plane.
+- Fix pause: `space` pauses and resumes the current track in place instead
+  of stopping it and advancing the queue to the next track.
 
 ## 0.1.4 (2026-10-17)
 
