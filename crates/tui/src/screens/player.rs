@@ -17,6 +17,9 @@ use crate::widgets;
 pub enum PlaybackBadge {
     /// No current audible stream.
     Idle,
+    /// The actual stream plays through the OS/system mixer; never
+    /// bit-perfect even if no app-side sample packer converted it.
+    Shared,
     BitPerfect,
     Converted,
 }
@@ -49,6 +52,10 @@ impl PlayerView<'_> {
             PlaybackBadge::BitPerfect => (
                 Span::styled("● ", theme.ok_style()),
                 Span::styled("bit-perfect", theme.ok_style()),
+            ),
+            PlaybackBadge::Shared => (
+                Span::styled("● ", theme.accent_style()),
+                Span::styled("shared", theme.accent_style()),
             ),
             PlaybackBadge::Converted => (
                 Span::styled("● ", theme.accent_style()),

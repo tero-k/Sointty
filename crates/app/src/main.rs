@@ -1,16 +1,16 @@
 // Player engine is platform-agnostic; driven by ALSA wiring on Linux and by
 // unit tests everywhere.
+mod locations;
 #[cfg(any(target_os = "linux", windows, target_os = "macos", test))]
 mod player;
-mod locations;
 mod playlists;
 
 use std::path::PathBuf;
 use std::process::ExitCode;
 
+use sointty_core::{DeviceId, OutputAccess, PlayerError};
 #[cfg(any(target_os = "linux", windows, target_os = "macos"))]
 use sointty_core::{PlayerCommand, QueueEntry};
-use sointty_core::{DeviceId, PlayerError};
 
 #[cfg(any(target_os = "linux", windows, target_os = "macos"))]
 use player::PlayerEngine;
@@ -31,6 +31,8 @@ struct Cli {
     buffer_frames: Option<u32>,
     float_to_int: Option<bool>,
     int_to_float: Option<bool>,
+    /// `--shared` / `--exclusive` override for the persisted access mode.
+    shared_playback: Option<bool>,
     list_devices: bool,
     /// Enable the library index at the default data dir.
     index: bool,
@@ -50,6 +52,7 @@ fn parse_cli_args(args: impl IntoIterator<Item = String>) -> Result<Cli, PlayerE
     let mut buffer_frames = None;
     let mut float_to_int = None;
     let mut int_to_float = None;
+    let mut shared_playback = None;
     let mut list_devices = false;
     let mut index = false;
     let mut reindex = Vec::new();
@@ -75,6 +78,8 @@ fn parse_cli_args(args: impl IntoIterator<Item = String>) -> Result<Cli, PlayerE
             "--no-float-to-int" => float_to_int = Some(false),
             "--allow-int-to-float" => int_to_float = Some(true),
             "--no-int-to-float" => int_to_float = Some(false),
+            "--shared" => shared_playback = Some(true),
+            "--exclusive" => shared_playback = Some(false),
             "--list-devices" => {
                 list_devices = true;
             }
@@ -96,12 +101,16 @@ fn parse_cli_args(args: impl IntoIterator<Item = String>) -> Result<Cli, PlayerE
             "--help" | "-h" => {
                 println!(
                     r#"Usage: sointty [--device DEVICE] [--period-frames N] [--buffer-frames N]
+               [--shared|--exclusive]
                [--allow-float-to-int|--no-float-to-int]
                [--allow-int-to-float|--no-int-to-float] [--list-devices]
                [--index] [--reindex DIR]... [FILE|PLAYLIST]...
 
 --device DEVICE       audio output device (default: "hw:0,0" on Linux, "default" elsewhere;
                       use --list-devices to see endpoint IDs)
+--shared              use the OS/system mixer (may resample, remix or process;
+                      not bit-perfect); Linux follows the configured ALSA "default" PCM
+--exclusive           use the default direct/exclusive path (no mode fallback)
 --allow-float-to-int  opt in to F32-to-integer conversion if exact F32 is unavailable
                       (converted playback is NOT bit-perfect)
 --no-float-to-int     force strict mode for this run
@@ -115,11 +124,12 @@ fn parse_cli_args(args: impl IntoIterator<Item = String>) -> Result<Cli, PlayerE
                       prints scan stats, then plays any files given, else exits
 
 Settings persist in <config dir>/sointty/config.toml; CLI flags override the file.
-In the TUI, press 'd' to pick output, 'c' for F32 compatibility, 'i' for
-integer-to-F32 compatibility.
+In the TUI, press 'd' to pick output, 'g' to toggle shared/exclusive,
+'c' for F32 compatibility, 'i' for integer-to-F32 compatibility.
 
 Keys: space play/pause, s stop, n next, left/right seek 10 s,
-      b browser, d output, c F32-to-integer, i integer-to-F32, q quit.
+      b browser, d output, g shared/exclusive, c F32-to-integer,
+      i integer-to-F32, q quit.
 Playlists (.m3u, .m3u8, .pls, .xspf, .cue) are expanded into tracks.
 With no files, sointty opens the filesystem browser."#
                 );
@@ -137,6 +147,7 @@ With no files, sointty opens the filesystem browser."#
         buffer_frames,
         float_to_int,
         int_to_float,
+        shared_playback,
         list_devices,
         index,
         reindex,
@@ -154,6 +165,8 @@ struct Config {
     buffer_frames: Option<u32>,
     float_to_int: Option<bool>,
     int_to_float: Option<bool>,
+    /// Explicit opt-in to the OS/system mixer. Missing means Direct.
+    shared_playback: Option<bool>,
     /// Optional TUI accent in exact `#RRGGBB` form.
     accent: Option<String>,
     /// Last successfully browsed directory; restored on the next launch.
@@ -222,6 +235,7 @@ struct Settings {
     buffer_frames: Option<u32>,
     float_to_int: bool,
     int_to_float: bool,
+    shared_playback: bool,
 }
 
 /// Linux automatic output: the first available direct `hw:` endpoint.
@@ -239,6 +253,10 @@ fn pick_linux_default(devices: &[(DeviceId, String)]) -> Result<DeviceId, Player
 fn resolve_settings(cli: &Cli, config: &Config) -> Result<Settings, PlayerError> {
     let period_frames = cli.period_frames.or(config.period_frames);
     let buffer_frames = cli.buffer_frames.or(config.buffer_frames);
+    let shared_playback = cli
+        .shared_playback
+        .or(config.shared_playback)
+        .unwrap_or(false);
     if period_frames == Some(0) {
         return Err(PlayerError::InvalidInput("period frames must be positive"));
     }
@@ -249,7 +267,9 @@ fn resolve_settings(cli: &Cli, config: &Config) -> Result<Settings, PlayerError>
         let minimum = period.checked_mul(2).ok_or(PlayerError::InvalidInput(
             "period frames too large for twice-period buffer",
         ))?;
-        if let Some(buffer) = buffer_frames && buffer < minimum {
+        if let Some(buffer) = buffer_frames
+            && buffer < minimum
+        {
             return Err(PlayerError::InvalidInput(
                 "buffer frames must be at least twice the period frames",
             ));
@@ -258,6 +278,14 @@ fn resolve_settings(cli: &Cli, config: &Config) -> Result<Settings, PlayerError>
     #[cfg(target_os = "linux")]
     let device = match cli.device.clone().or_else(|| config.device.clone()) {
         Some(device) => device,
+        // A mixer-backed `default` PCM may work even without `/proc/asound/pcm`
+        // endpoints. Keep it only as an unconfigured Direct selection: a
+        // later Direct switch still fails with the explicit `hw:` validation
+        // error rather than inventing hardware.
+        None if shared_playback => list_devices()
+            .ok()
+            .and_then(|devices| pick_linux_default(&devices).ok())
+            .unwrap_or_else(|| "default".to_owned()),
         None => pick_linux_default(&list_devices()?)?,
     };
     #[cfg(not(target_os = "linux"))]
@@ -272,6 +300,7 @@ fn resolve_settings(cli: &Cli, config: &Config) -> Result<Settings, PlayerError>
         buffer_frames,
         float_to_int: cli.float_to_int.or(config.float_to_int).unwrap_or(false),
         int_to_float: cli.int_to_float.or(config.int_to_float).unwrap_or(false),
+        shared_playback,
     })
 }
 /// Parse `/proc/asound/pcm` into selectable `hw:CARD,DEV` playback endpoints.
@@ -388,6 +417,17 @@ fn int_to_float_saver() -> sointty_tui::FloatCompatibilitySaver {
     })
 }
 
+/// Persists the explicit shared/system-mixer opt-in. A strict-load failure
+/// leaves the malformed config and the active backend untouched.
+#[cfg(any(target_os = "linux", windows, target_os = "macos"))]
+fn shared_playback_saver() -> sointty_tui::FloatCompatibilitySaver {
+    Box::new(|enabled| {
+        let mut config = load_config_strict()?;
+        config.shared_playback = Some(enabled);
+        save_config(&config).map_err(|error| error.to_string())
+    })
+}
+
 #[cfg(feature = "library-index")]
 fn default_index_path() -> PathBuf {
     directories::ProjectDirs::from("dev", "sointty", "sointty")
@@ -453,17 +493,76 @@ fn is_playlist_path(path: &std::path::Path) -> bool {
 }
 
 #[cfg(target_os = "linux")]
-fn open_output(device: &DeviceId) -> Result<AlsaOutput, PlayerError> {
-    AlsaOutput::new(device.clone())
+fn open_output(device: &DeviceId, access: OutputAccess) -> Result<AlsaOutput, PlayerError> {
+    AlsaOutput::new(device.clone(), access)
 }
 
 #[cfg(windows)]
-fn open_output(device: &DeviceId) -> Result<WasapiOutput, PlayerError> {
-    WasapiOutput::new(device)
+fn open_output(device: &DeviceId, access: OutputAccess) -> Result<WasapiOutput, PlayerError> {
+    WasapiOutput::new(device, access)
 }
+
+/// Direct and shared Core Audio are separate backends. The direct HAL hog
+/// path remains unchanged; AUHAL owns only the shared path.
 #[cfg(target_os = "macos")]
-fn open_output(device: &DeviceId) -> Result<sointty_output_coreaudio::CoreAudioOutput, PlayerError> {
-    sointty_output_coreaudio::CoreAudioOutput::new(device)
+enum MacOutput {
+    Direct(sointty_output_coreaudio::CoreAudioOutput),
+    Shared(sointty_output_coreaudio::SharedCoreAudioOutput),
+}
+
+#[cfg(target_os = "macos")]
+impl sointty_core::AudioOutput for MacOutput {
+    fn configure(
+        &mut self,
+        input: &sointty_core::StreamSpec,
+        buffers: sointty_core::BufferConfig,
+    ) -> Result<sointty_core::OutputSpec, PlayerError> {
+        match self {
+            Self::Direct(output) => output.configure(input, buffers),
+            Self::Shared(output) => output.configure(input, buffers),
+        }
+    }
+
+    fn configure_dsd(
+        &mut self,
+        input: &sointty_core::DsdSpec,
+        buffers: sointty_core::BufferConfig,
+    ) -> Result<sointty_core::OutputSpec, PlayerError> {
+        match self {
+            Self::Direct(output) => output.configure_dsd(input, buffers),
+            Self::Shared(output) => output.configure_dsd(input, buffers),
+        }
+    }
+
+    fn start(
+        &mut self,
+        pcm: rtrb::Consumer<u8>,
+        counters: std::sync::Arc<sointty_core::OutputCounters>,
+    ) -> Result<(), PlayerError> {
+        match self {
+            Self::Direct(output) => output.start(pcm, counters),
+            Self::Shared(output) => output.start(pcm, counters),
+        }
+    }
+
+    fn stop(&mut self) -> Result<(), PlayerError> {
+        match self {
+            Self::Direct(output) => output.stop(),
+            Self::Shared(output) => output.stop(),
+        }
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn open_output(device: &DeviceId, access: OutputAccess) -> Result<MacOutput, PlayerError> {
+    match access {
+        OutputAccess::Direct => {
+            sointty_output_coreaudio::CoreAudioOutput::new(device).map(MacOutput::Direct)
+        }
+        OutputAccess::Shared => {
+            sointty_output_coreaudio::SharedCoreAudioOutput::new(device).map(MacOutput::Shared)
+        }
+    }
 }
 
 /// Persists a TUI browser navigation; other config fields are preserved.
@@ -489,11 +588,21 @@ fn timing_saver() -> sointty_tui::TimingSaver {
 }
 
 #[cfg(any(target_os = "linux", windows, target_os = "macos"))]
-fn run(cli: Cli, settings: Settings, config: Config, config_error: Option<String>) -> Result<(), PlayerError> {
+fn run(
+    cli: Cli,
+    settings: Settings,
+    config: Config,
+    config_error: Option<String>,
+) -> Result<(), PlayerError> {
     let (command_tx, command_rx) = crossbeam_channel::unbounded();
     let (event_tx, event_rx) = crossbeam_channel::unbounded();
     let device = settings.device.clone();
-    let output = open_output(&device)?;
+    let access = if settings.shared_playback {
+        OutputAccess::Shared
+    } else {
+        OutputAccess::Direct
+    };
+    let output = open_output(&device, access)?;
     let decoder_factory: player::DecoderFactory = Box::new(|path| {
         let (source, stall) = sointty_source::ReadAheadSource::open(path)?;
         let decoder = sointty_decode::open_decoder(path, Box::new(source))?;
@@ -504,8 +613,9 @@ fn run(cli: Cli, settings: Settings, config: Config, config_error: Option<String
     });
     let engine = PlayerEngine::new(
         output,
-        Box::new(move |device| open_output(&device)),
+        Box::new(move |device, access| open_output(&device, access)),
         device,
+        access,
         settings.period_frames,
         settings.buffer_frames,
         settings.float_to_int,
@@ -548,9 +658,17 @@ fn run(cli: Cli, settings: Settings, config: Config, config_error: Option<String
     }
     let home_dir = directories::BaseDirs::new().map(|dirs| dirs.home_dir().to_path_buf());
     let (search_roots, search_coverage_error) = match locations::list_locations() {
-        Ok(locations) => (locations.into_iter().map(|location| location.path).collect(), None),
+        Ok(locations) => (
+            locations
+                .into_iter()
+                .map(|location| location.path)
+                .collect(),
+            None,
+        ),
         Err(error) => {
-            let fallback = config.last_browser_dir.clone()
+            let fallback = config
+                .last_browser_dir
+                .clone()
                 .or_else(|| home_dir.clone())
                 .or_else(|| std::env::current_dir().ok());
             (fallback.into_iter().collect(), Some(error))
@@ -563,6 +681,7 @@ fn run(cli: Cli, settings: Settings, config: Config, config_error: Option<String
         current_device: settings.device.clone(),
         float_to_int: settings.float_to_int,
         int_to_float: settings.int_to_float,
+        shared_playback: settings.shared_playback,
         timing: (settings.period_frames, settings.buffer_frames),
         catalog: loaded.catalog,
         catalog_error: loaded.read_only_error,
@@ -579,6 +698,7 @@ fn run(cli: Cli, settings: Settings, config: Config, config_error: Option<String
         on_device_reset: device_reset(),
         on_float_to_int_selected: float_to_int_saver(),
         on_int_to_float_selected: int_to_float_saver(),
+        on_shared_playback_selected: shared_playback_saver(),
         on_browser_dir: browser_dir_saver(),
         on_catalog: Box::new(playlists::save),
         on_timing: timing_saver(),
@@ -595,9 +715,23 @@ fn run(cli: Cli, settings: Settings, config: Config, config_error: Option<String
 }
 
 #[cfg(not(any(target_os = "linux", windows, target_os = "macos")))]
-fn run(cli: Cli, settings: Settings, config: Config, config_error: Option<String>) -> Result<(), PlayerError> {
-    let _ = (cli.files, settings.device, settings.period_frames, settings.buffer_frames,
-        settings.float_to_int, settings.int_to_float, config, config_error);
+fn run(
+    cli: Cli,
+    settings: Settings,
+    config: Config,
+    config_error: Option<String>,
+) -> Result<(), PlayerError> {
+    let _ = (
+        cli.files,
+        settings.device,
+        settings.period_frames,
+        settings.buffer_frames,
+        settings.float_to_int,
+        settings.int_to_float,
+        settings.shared_playback,
+        config,
+        config_error,
+    );
     Err(PlayerError::InvalidInput(
         "audio output is not wired for this OS yet; use a Linux, Windows or macOS host",
     ))
@@ -741,7 +875,6 @@ mod tests {
         ));
     }
 
-
     #[test]
     fn config_round_trips_through_toml() {
         let config = Config {
@@ -750,6 +883,7 @@ mod tests {
             buffer_frames: None,
             float_to_int: Some(true),
             int_to_float: Some(false),
+            shared_playback: Some(true),
             accent: Some("#E5A84B".to_owned()),
             last_browser_dir: Some(PathBuf::from("C:\\Music")),
         };
@@ -761,30 +895,120 @@ mod tests {
         assert_eq!(parsed.buffer_frames, None);
         assert_eq!(parsed.last_browser_dir, Some(PathBuf::from("C:\\Music")));
         assert_eq!(parsed.int_to_float, Some(false));
+        assert_eq!(parsed.shared_playback, Some(true));
         assert_eq!(parsed.accent.as_deref(), Some("#E5A84B"));
         // A pre-existing config without the field still parses.
         let legacy: Config = toml::from_str("device = \"hw:0,0\"\n").unwrap();
         assert_eq!(legacy.last_browser_dir, None);
+        assert_eq!(legacy.shared_playback, None);
     }
 
     #[test]
     fn float_compatibility_is_opt_in_with_cli_override() {
-        let config = Config { float_to_int: Some(true), ..Config::default() };
-        assert!(!resolve_settings(&parse(&[]).unwrap(), &Config::default()).unwrap().float_to_int);
-        assert!(resolve_settings(&parse(&[]).unwrap(), &config).unwrap().float_to_int);
-        assert!(!resolve_settings(&parse(&["--no-float-to-int"]).unwrap(), &config).unwrap().float_to_int);
-        let off = Config { float_to_int: Some(false), ..Config::default() };
-        assert!(resolve_settings(&parse(&["--allow-float-to-int"]).unwrap(), &off).unwrap().float_to_int);
+        let config = Config {
+            float_to_int: Some(true),
+            ..Config::default()
+        };
+        assert!(
+            !resolve_settings(&parse(&[]).unwrap(), &Config::default())
+                .unwrap()
+                .float_to_int
+        );
+        assert!(
+            resolve_settings(&parse(&[]).unwrap(), &config)
+                .unwrap()
+                .float_to_int
+        );
+        assert!(
+            !resolve_settings(&parse(&["--no-float-to-int"]).unwrap(), &config)
+                .unwrap()
+                .float_to_int
+        );
+        let off = Config {
+            float_to_int: Some(false),
+            ..Config::default()
+        };
+        assert!(
+            resolve_settings(&parse(&["--allow-float-to-int"]).unwrap(), &off)
+                .unwrap()
+                .float_to_int
+        );
     }
 
     #[test]
     fn int_to_float_compatibility_is_opt_in_with_cli_override() {
-        let config = Config { int_to_float: Some(true), ..Config::default() };
-        assert!(!resolve_settings(&parse(&[]).unwrap(), &Config::default()).unwrap().int_to_float);
-        assert!(resolve_settings(&parse(&[]).unwrap(), &config).unwrap().int_to_float);
-        assert!(!resolve_settings(&parse(&["--no-int-to-float"]).unwrap(), &config).unwrap().int_to_float);
-        let off = Config { int_to_float: Some(false), ..Config::default() };
-        assert!(resolve_settings(&parse(&["--allow-int-to-float"]).unwrap(), &off).unwrap().int_to_float);
+        let config = Config {
+            int_to_float: Some(true),
+            ..Config::default()
+        };
+        assert!(
+            !resolve_settings(&parse(&[]).unwrap(), &Config::default())
+                .unwrap()
+                .int_to_float
+        );
+        assert!(
+            resolve_settings(&parse(&[]).unwrap(), &config)
+                .unwrap()
+                .int_to_float
+        );
+        assert!(
+            !resolve_settings(&parse(&["--no-int-to-float"]).unwrap(), &config)
+                .unwrap()
+                .int_to_float
+        );
+        let off = Config {
+            int_to_float: Some(false),
+            ..Config::default()
+        };
+        assert!(
+            resolve_settings(&parse(&["--allow-int-to-float"]).unwrap(), &off)
+                .unwrap()
+                .int_to_float
+        );
+    }
+
+    #[test]
+    fn shared_playback_defaults_off_and_cli_overrides_persisted_choice() {
+        let no_override = parse(&["--device", "hw:0,0"]).unwrap();
+        assert!(
+            !resolve_settings(&no_override, &Config::default())
+                .unwrap()
+                .shared_playback
+        );
+        let persisted_off = Config {
+            shared_playback: Some(false),
+            ..Config::default()
+        };
+        assert!(
+            !resolve_settings(&no_override, &persisted_off)
+                .unwrap()
+                .shared_playback
+        );
+        let persisted_on: Config = toml::from_str("shared_playback = true\n").unwrap();
+        assert!(
+            resolve_settings(&no_override, &persisted_on)
+                .unwrap()
+                .shared_playback
+        );
+        let exclusive = parse(&["--exclusive", "--device", "hw:0,0"]).unwrap();
+        assert!(
+            !resolve_settings(&exclusive, &persisted_on)
+                .unwrap()
+                .shared_playback
+        );
+        let shared = parse(&["--shared", "--device", "hw:0,0"]).unwrap();
+        assert!(
+            resolve_settings(&shared, &persisted_off)
+                .unwrap()
+                .shared_playback
+        );
+        // Repeated CLI switches use the last explicit choice for this run.
+        let last = parse(&["--shared", "--exclusive", "--device", "hw:0,0"]).unwrap();
+        assert!(
+            !resolve_settings(&last, &persisted_on)
+                .unwrap()
+                .shared_playback
+        );
     }
 
     #[test]

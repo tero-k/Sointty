@@ -121,6 +121,8 @@ pub struct RunOptions {
     pub current_device: DeviceId,
     pub float_to_int: bool,
     pub int_to_float: bool,
+    /// Persisted preference (not an active-playback claim); off by default.
+    pub shared_playback: bool,
     /// DAC timing overrides from CLI/config (None = Auto).
     pub timing: (Option<u32>, Option<u32>),
     pub catalog: PlaylistCatalog,
@@ -148,6 +150,7 @@ pub struct Hooks {
     pub on_device_reset: DeviceReset,
     pub on_float_to_int_selected: FloatCompatibilitySaver,
     pub on_int_to_float_selected: FloatCompatibilitySaver,
+    pub on_shared_playback_selected: FloatCompatibilitySaver,
     pub on_browser_dir: BrowserDirSaver,
     pub on_catalog: PlaylistSaver,
     pub on_timing: TimingSaver,
@@ -174,6 +177,10 @@ pub struct TuiState {
     float_to_int: bool,
     int_to_float: bool,
     converted: bool,
+    /// Persisted access preference. The active stream is reported only by
+    /// `Playing.shared_playback`, never inferred from this value.
+    shared_playback: bool,
+    shared_active: bool,
     output_spec: Option<OutputSpec>,
     source_spec: Option<DecodedSpec>,
     buffers: Option<BufferConfig>,
@@ -208,6 +215,8 @@ impl TuiState {
             float_to_int: options.float_to_int,
             int_to_float: options.int_to_float,
             converted: false,
+            shared_playback: options.shared_playback,
+            shared_active: false,
             output_spec: None,
             source_spec: None,
             buffers: None,
@@ -631,7 +640,9 @@ impl App {
                     && let Some(browser) = &self.browser
                 {
                     let (start, end) = screens::visible_window(
-                        browser.items.len(), browser.selected, visible_height,
+                        browser.items.len(),
+                        browser.selected,
+                        visible_height,
                     );
                     for item in &browser.items[start..end] {
                         if item.kind == BrowserItemKind::Audio {
@@ -673,7 +684,12 @@ impl App {
     /// Rebuild presentation rows only when catalog or metadata changes.
     /// Progress ticks reuse these rows and render only the visible window.
     fn rebuild_playlist_rows(&mut self) {
-        self.playlist_names_cache = self.state.catalog.playlists.iter().enumerate()
+        self.playlist_names_cache = self
+            .state
+            .catalog
+            .playlists
+            .iter()
+            .enumerate()
             .map(|(index, playlist)| {
                 let mut total = Duration::ZERO;
                 let mut known = true;
@@ -682,11 +698,17 @@ impl App {
                         Some(range) => range.end_cd.map(|end| {
                             Duration::from_millis(end.saturating_sub(range.start_cd) * 1_000 / 75)
                         }),
-                        None => self.metadata.get(&entry.path)
-                            .and_then(Option::as_ref).and_then(|meta| meta.duration),
+                        None => self
+                            .metadata
+                            .get(&entry.path)
+                            .and_then(Option::as_ref)
+                            .and_then(|meta| meta.duration),
                     };
-                    if let Some(duration) = duration { total += duration; }
-                    else { known = false; }
+                    if let Some(duration) = duration {
+                        total += duration;
+                    } else {
+                        known = false;
+                    }
                 }
                 screens::playlists::NameRow {
                     name: playlist.name.clone(),
@@ -695,29 +717,45 @@ impl App {
                     catalog_selected: index == self.state.catalog.selected,
                     duration: known.then_some(total),
                 }
-            }).collect();
-        self.playlist_tracks_cache = self.state.catalog.playlists
+            })
+            .collect();
+        self.playlist_tracks_cache = self
+            .state
+            .catalog
+            .playlists
             .get(self.playlist_name_sel)
-            .map(|list| list.entries.iter().map(|entry| {
-                let meta = self.metadata.get(&entry.path).and_then(Option::as_ref);
-                let (title, tag) = display::display_entry_title(
-                    entry, meta.map(|meta| &meta.tags),
-                );
-                let title = if let Some(tag) = tag { format!("{title} ({tag})") } else { title };
-                let duration = match entry.cue_range {
-                    Some(range) => range.end_cd.map(|end| {
-                        Duration::from_millis(end.saturating_sub(range.start_cd) * 1_000 / 75)
-                    }),
-                    None => meta.and_then(|meta| meta.duration),
-                };
-                screens::playlists::TrackRow {
-                    number: meta.and_then(|meta| meta.track_number)
-                        .or_else(|| display::fallback_track_number(&entry.path)),
-                    title,
-                    album: meta.and_then(|meta| meta.tags.album.clone()),
-                    duration,
-                }
-            }).collect()).unwrap_or_default();
+            .map(|list| {
+                list.entries
+                    .iter()
+                    .map(|entry| {
+                        let meta = self.metadata.get(&entry.path).and_then(Option::as_ref);
+                        let (title, tag) =
+                            display::display_entry_title(entry, meta.map(|meta| &meta.tags));
+                        let title = if let Some(tag) = tag {
+                            format!("{title} ({tag})")
+                        } else {
+                            title
+                        };
+                        let duration = match entry.cue_range {
+                            Some(range) => range.end_cd.map(|end| {
+                                Duration::from_millis(
+                                    end.saturating_sub(range.start_cd) * 1_000 / 75,
+                                )
+                            }),
+                            None => meta.and_then(|meta| meta.duration),
+                        };
+                        screens::playlists::TrackRow {
+                            number: meta
+                                .and_then(|meta| meta.track_number)
+                                .or_else(|| display::fallback_track_number(&entry.path)),
+                            title,
+                            album: meta.and_then(|meta| meta.tags.album.clone()),
+                            duration,
+                        }
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
     }
 
     fn poll_worker(&mut self) -> bool {
@@ -1006,7 +1044,11 @@ impl App {
     fn refresh_devices(&mut self) {
         self.device_candidates = (self.hooks.device_provider)();
         if self.device_candidates.is_empty() {
-            self.state.status = "no output devices found".to_owned();
+            self.state.status = if cfg!(target_os = "linux") && self.state.shared_playback {
+                "no direct hardware endpoints; shared uses system default".to_owned()
+            } else {
+                "no output devices found".to_owned()
+            };
             self.device_candidate_sel = 0;
             self.rebuild_settings_rows();
             return;
@@ -1026,7 +1068,11 @@ impl App {
             .get(self.device_candidate_sel)
             .cloned()
         else {
-            self.state.status = "no output devices found".to_owned();
+            self.state.status = if cfg!(target_os = "linux") && self.state.shared_playback {
+                "no direct hardware endpoints; shared uses system default".to_owned()
+            } else {
+                "no output devices found".to_owned()
+            };
             return;
         };
         match (self.hooks.on_device_selected)(&id) {
@@ -1077,6 +1123,28 @@ impl App {
         self.state.int_to_float = enabled;
         let _ = self.commands.send(PlayerCommand::SetIntToFloat(enabled));
         self.state.status = "integer→F32 compatibility applies on next configure".to_owned();
+        self.rebuild_settings_rows();
+    }
+
+    fn toggle_shared_playback(&mut self) {
+        let enabled = !self.state.shared_playback;
+        // Save first: malformed/unreadable config must remain untouched, and
+        // a failed save must not change the preference or issue a backend
+        // switch command.
+        if let Err(error) = (self.hooks.on_shared_playback_selected)(enabled) {
+            self.state.status = format!("shared playback not saved: {error}");
+            return;
+        }
+        self.state.config_error = None;
+        self.state.shared_playback = enabled;
+        let _ = self
+            .commands
+            .send(PlayerCommand::SetSharedPlayback(enabled));
+        self.state.status = if enabled {
+            "shared playback requested (OS mixer may process; not bit-perfect)".to_owned()
+        } else {
+            "direct/exclusive playback requested".to_owned()
+        };
         self.rebuild_settings_rows();
     }
 
@@ -1599,17 +1667,23 @@ impl App {
                 source,
                 buffers,
                 converted,
+                shared_playback,
             } => {
                 let same_track = track == self.state.current_track;
-                self.state.status = if converted {
-                    let direction = if output.format == DeviceFormat::F32Le {
-                        "integer→F32"
-                    } else {
-                        "F32→integer"
-                    };
-                    format!("playing ({direction} converted; not bit-perfect)")
+                let direction = if output.format == DeviceFormat::F32Le {
+                    "integer→F32"
                 } else {
-                    "playing (bit-perfect)".to_owned()
+                    "F32→integer"
+                };
+                self.state.status = match (shared_playback, converted) {
+                    (true, true) => {
+                        format!("playing (shared; {direction} converted; not bit-perfect)")
+                    }
+                    (true, false) => "playing (shared / OS mixer; not bit-perfect)".to_owned(),
+                    (false, true) => {
+                        format!("playing ({direction} converted; not bit-perfect)")
+                    }
+                    (false, false) => "playing (bit-perfect)".to_owned(),
                 };
                 self.state.paused = false;
                 if !same_track {
@@ -1621,7 +1695,10 @@ impl App {
                 self.state.rate_hz =
                     output.rate_hz * output.format.source_frames_per_wire_frame() as u32;
                 self.state.converted = converted;
-                self.state.device = output.device.clone();
+                self.state.shared_active = shared_playback;
+                // `OutputSpec.device` names the active route (Linux shared
+                // uses `default`); it must not overwrite the configured
+                // Direct device picker selection retained in `state.device`.
                 self.state.output_spec = Some(output);
                 self.state.source_spec = Some(source);
                 self.state.buffers = Some(buffers);
@@ -1652,6 +1729,7 @@ impl App {
             PlayerEvent::Paused => {
                 self.state.status = "paused".to_owned();
                 self.state.paused = true;
+                self.state.shared_active = false;
                 true
             }
             PlayerEvent::Reconfiguring => {
@@ -1660,6 +1738,7 @@ impl App {
                 self.state.source_spec = None;
                 self.state.buffers = None;
                 self.state.converted = false;
+                self.state.shared_active = false;
                 self.state.total_frames = None;
                 true
             }
@@ -1678,6 +1757,7 @@ impl App {
                 self.state.output_spec = None;
                 self.state.source_spec = None;
                 self.state.buffers = None;
+                self.state.shared_active = false;
                 true
             }
             PlayerEvent::EndOfQueue => {
@@ -1694,6 +1774,7 @@ impl App {
                 self.state.output_spec = None;
                 self.state.source_spec = None;
                 self.state.buffers = None;
+                self.state.shared_active = false;
                 self.rebuild_queue_rows();
                 true
             }
@@ -2121,10 +2202,21 @@ impl App {
                     .map(|(_, name)| name.as_str())
                     .unwrap_or(self.state.device_display());
                 let (period, buffer) = self.state.timing;
+                let shared = self.state.shared_playback;
+                let device_note = if cfg!(target_os = "linux") {
+                    "←→ preview · Enter apply · r default; hw: for Direct, shared uses ALSA default"
+                } else {
+                    "←→ preview · Enter apply · r platform default"
+                };
+                let access_note = if cfg!(target_os = "linux") {
+                    "Enter/space toggle · r direct; sharing depends on the system-configured default mixer"
+                } else {
+                    "Enter/space toggle · r direct; the OS mixer may process audio"
+                };
                 vec![
-                    Row { label: "Output device".to_owned(), value: device_name.to_owned(), note: Some("←→ preview · Enter apply · r platform default".to_owned()), warning: None },
-                    Row { label: "Access".to_owned(), value: "direct / exclusive".to_owned(), note: Some("fixed: shared mode is not supported".to_owned()), warning: None },
-                    Row { label: "Fidelity".to_owned(), value: "strict first".to_owned(), note: Some("exact native format; conversion only with explicit compatibility opt-in".to_owned()), warning: None },
+                    Row { label: "Output device".to_owned(), value: device_name.to_owned(), note: Some(device_note.to_owned()), warning: None },
+                    Row { label: "Access".to_owned(), value: if shared { "shared / OS mixer" } else { "direct / exclusive" }.to_owned(), note: Some(access_note.to_owned()), warning: shared.then(|| "shared playback may resample, remix or process audio; not bit-perfect".to_owned()) },
+                    Row { label: "Fidelity".to_owned(), value: if shared { "OS-managed" } else { "strict first" }.to_owned(), note: Some(if shared { "client PCM to OS mixer; app/OS conversion possible" } else { "exact native format; conversion only with explicit compatibility opt-in" }.to_owned()), warning: None },
                     Row { label: "Period".to_owned(), value: period.map(|n| format!("{n} frames")).unwrap_or_else(|| "Auto".to_owned()), note: Some("← Auto · → custom period then buffer".to_owned()), warning: None },
                     Row { label: "Buffer".to_owned(), value: buffer.map(|n| format!("{n} frames")).unwrap_or_else(|| "Auto".to_owned()), note: Some("applies on next configure (next track or seek)".to_owned()), warning: None },
                     Row { label: "F32→integer".to_owned(), value: if self.state.float_to_int { "ON" } else { "OFF" }.to_owned(), note: Some("OFF keeps strict bit-perfect; ON permits non-bit-perfect conversion".to_owned()), warning: self.state.float_to_int.then(|| "converted output is not bit-perfect".to_owned()) },
@@ -2221,6 +2313,17 @@ impl App {
                     };
                 }
                 self.rebuild_settings_rows();
+            }
+            (0, 1)
+                if matches!(
+                    key,
+                    KeyCode::Enter | KeyCode::Char(' ') | KeyCode::Char('r')
+                ) =>
+            {
+                if key == KeyCode::Char('r') && !self.state.shared_playback {
+                    return;
+                }
+                self.toggle_shared_playback();
             }
             (0, 3 | 4) if key == KeyCode::Left || key == KeyCode::Char('r') => {
                 self.set_timing(None, None)
@@ -2503,6 +2606,7 @@ impl App {
             }
             Action::ToggleFloatToInt => self.toggle_float_to_int(),
             Action::ToggleIntToFloat => self.toggle_int_to_float(),
+            Action::ToggleSharedPlayback => self.toggle_shared_playback(),
             Action::CloseOverlay
             | Action::DeleteChar
             | Action::OpenFolder
@@ -3000,7 +3104,9 @@ fn event_loop(
         if dirty || (progress_dirty && last_draw.elapsed() >= Duration::from_millis(250)) {
             let size = terminal.size()?;
             let main_height = layout::home(Rect::new(0, 0, size.width, size.height))
-                .library.height.saturating_sub(5) as usize;
+                .library
+                .height
+                .saturating_sub(5) as usize;
             app.prime_metadata(main_height);
             terminal.draw(|frame| draw(frame, &app))?;
             last_draw = Instant::now();
@@ -3106,7 +3212,8 @@ fn draw_header(frame: &mut ratatui::Frame<'_>, app: &App, area: Rect) {
             Paragraph::new(widgets::truncate_cells(
                 "sointty · small terminal · Tab switches pane",
                 area.width as usize,
-            )).style(theme.dimmed()),
+            ))
+            .style(theme.dimmed()),
             area,
         );
         return;
@@ -3131,15 +3238,16 @@ fn draw_header(frame: &mut ratatui::Frame<'_>, app: &App, area: Rect) {
         ));
     }
     let badge = match (&app.state.audible, &app.state.output_spec) {
-        (Some(_), Some(_)) if app.state.converted => "● converted",
-        (Some(_), Some(_)) => "● bit-perfect",
+        (Some(_), Some(_)) if !app.state.paused && app.state.shared_active => "● shared",
+        (Some(_), Some(_)) if !app.state.paused && app.state.converted => "● converted",
+        (Some(_), Some(_)) if !app.state.paused => "● bit-perfect",
         _ => "○ idle",
     };
     spans.push(Span::styled(
         format!("  {badge}  "),
         if badge.contains("bit-perfect") {
             theme.ok_style()
-        } else if badge.contains("converted") {
+        } else if badge.contains("converted") || badge.contains("shared") {
             theme.accent_style()
         } else {
             theme.faint_style()
@@ -3173,8 +3281,14 @@ fn draw_queue(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
         None
     };
     let track_count = app.state.pending.len() + usize::from(app.state.audible.is_some());
-    let time_left = match (app.pending_duration_total, current_remaining, app.state.audible.is_some()) {
-        (Some(pending), Some(current), true) => format!("{} left", screens::clock(pending + current)),
+    let time_left = match (
+        app.pending_duration_total,
+        current_remaining,
+        app.state.audible.is_some(),
+    ) {
+        (Some(pending), Some(current), true) => {
+            format!("{} left", screens::clock(pending + current))
+        }
         (Some(pending), _, false) => format!("{} left", screens::clock(pending)),
         _ => "time unknown".to_owned(),
     };
@@ -3197,7 +3311,11 @@ fn draw_queue(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
 }
 
 fn draw_playlists(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App, narrow: bool) {
-    let list = app.state.catalog.playlists.get(app.playlist_name_sel)
+    let list = app
+        .state
+        .catalog
+        .playlists
+        .get(app.playlist_name_sel)
         .unwrap_or_else(|| app.state.catalog.selected_playlist());
     let lifted: HashSet<usize> = match &app.mode {
         Mode::Move(MoveOverlay::Playlist { indices, .. }) => indices.iter().copied().collect(),
@@ -3290,8 +3408,13 @@ fn draw_settings(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App, narrow: 
 
 fn player_view(app: &App) -> OwnedPlayerView {
     let badge = match (&app.state.audible, &app.state.output_spec) {
-        (Some(_), Some(_)) if app.state.converted => screens::player::PlaybackBadge::Converted,
-        (Some(_), Some(_)) => screens::player::PlaybackBadge::BitPerfect,
+        (Some(_), Some(_)) if !app.state.paused && app.state.shared_active => {
+            screens::player::PlaybackBadge::Shared
+        }
+        (Some(_), Some(_)) if !app.state.paused && app.state.converted => {
+            screens::player::PlaybackBadge::Converted
+        }
+        (Some(_), Some(_)) if !app.state.paused => screens::player::PlaybackBadge::BitPerfect,
         _ => screens::player::PlaybackBadge::Idle,
     };
     let entry = app.state.audible.as_ref().map(|item| &item.entry);
@@ -3735,6 +3858,7 @@ mod tests {
             current_device: "dev1".to_owned(),
             float_to_int: false,
             int_to_float: false,
+            shared_playback: false,
             timing: (None, None),
             catalog: PlaylistCatalog::default(),
             catalog_error: None,
@@ -3757,6 +3881,7 @@ mod tests {
             on_device_reset: Box::new(|| Ok("dev1".to_owned())),
             on_float_to_int_selected: Box::new(|_| Ok(())),
             on_int_to_float_selected: Box::new(|_| Ok(())),
+            on_shared_playback_selected: Box::new(|_| Ok(())),
             on_browser_dir: Box::new(|_| Ok(())),
             on_catalog: Box::new(move |catalog| {
                 saver.lock().push(catalog.clone());
@@ -3795,16 +3920,72 @@ mod tests {
     }
 
     #[test]
+    fn shared_toggle_saves_first_and_updates_settings_access_immediately() {
+        let mut h = harness();
+        h.app.hooks.on_shared_playback_selected = Box::new(|_| Err("invalid TOML".to_owned()));
+        h.key(KeyCode::Char('g'));
+        assert!(
+            !h.app.state.shared_playback,
+            "failed save leaves preference untouched"
+        );
+        assert!(
+            h.sent.try_recv().is_err(),
+            "failed save must not switch backend"
+        );
+        assert!(h.app.state.status.contains("not saved"));
+
+        h.app.hooks.on_shared_playback_selected = Box::new(|_| Ok(()));
+        h.key(KeyCode::Char('g'));
+        assert!(h.app.state.shared_playback);
+        assert!(matches!(
+            h.sent.recv().unwrap(),
+            PlayerCommand::SetSharedPlayback(true)
+        ));
+        assert_eq!(h.app.settings_rows_cache[1].value, "shared / OS mixer");
+        assert!(
+            h.app.settings_rows_cache[1]
+                .warning
+                .as_deref()
+                .unwrap()
+                .contains("not bit-perfect")
+        );
+
+        h.app.screen = Screen::Settings;
+        h.app.focus = Focus::SettingsRows;
+        h.app.settings_section = 0;
+        h.app.settings_row = 1;
+        h.key(KeyCode::Char('r'));
+        assert!(!h.app.state.shared_playback);
+        assert!(matches!(
+            h.sent.recv().unwrap(),
+            PlayerCommand::SetSharedPlayback(false)
+        ));
+        assert_eq!(h.app.settings_rows_cache[1].value, "direct / exclusive");
+        h.key(KeyCode::Enter);
+        assert!(h.app.state.shared_playback);
+        assert!(matches!(
+            h.sent.recv().unwrap(),
+            PlayerCommand::SetSharedPlayback(true)
+        ));
+        h.key(KeyCode::Char(' '));
+        assert!(!h.app.state.shared_playback);
+        assert!(matches!(
+            h.sent.recv().unwrap(),
+            PlayerCommand::SetSharedPlayback(false)
+        ));
+    }
+
+    #[test]
     fn text_input_owns_printable_keys_and_ctrl_q_requests_quit() {
         let mut h = harness();
         h.app.start_prompt("Name:", InputAction::PlaylistCreate);
-        for ch in ['q', 's', 'n', 'r', ' ', '?'] {
+        for ch in ['q', 's', 'n', 'r', 'g', ' ', '?'] {
             assert!(!h.key(KeyCode::Char(ch)));
         }
         let Mode::Prompt(prompt) = &h.app.mode else {
             panic!("prompt should stay open");
         };
-        assert_eq!(prompt.buffer, "qsnr ?");
+        assert_eq!(prompt.buffer, "qsnrg ?");
         assert!(h.sent.try_recv().is_err());
         assert!(
             h.app
@@ -4147,6 +4328,7 @@ mod tests {
             source,
             buffers,
             converted: false,
+            shared_playback: false,
         });
         h.app.apply_event(PlayerEvent::Tags {
             track: 7,
@@ -4182,6 +4364,7 @@ mod tests {
             source,
             buffers,
             converted: true,
+            shared_playback: false,
         });
         assert_eq!(
             h.app.state.tags.title.as_deref(),
@@ -4220,6 +4403,97 @@ mod tests {
     }
 
     #[test]
+    fn shared_playing_badge_is_truthful_and_keeps_selected_direct_device() {
+        use sointty_core::{ChannelLayout, SampleEncoding, StreamSpec};
+        let mut h = harness();
+        h.app.state.device = "hw:2,0".to_owned();
+        h.app.state.shared_playback = true;
+        // The saved preference alone is not an active-stream verdict.
+        assert_eq!(
+            player_view(&h.app).badge,
+            screens::player::PlaybackBadge::Idle
+        );
+        h.app.apply_event(PlayerEvent::QueueChanged {
+            audible: Some(item(7, "/music/song.wav")),
+            pending: Vec::new(),
+        });
+        let source = DecodedSpec::Pcm(StreamSpec {
+            rate_hz: 44_100,
+            layout: ChannelLayout::discrete(2),
+            encoding: SampleEncoding::S16,
+        });
+        let buffers = BufferConfig {
+            period_frames: 1_024,
+            buffer_frames: 4_096,
+            ring_frames: 16_384,
+        };
+        // Linux shared output reports its actual route, `default`, but the
+        // selected `hw:` endpoint must remain in the picker for Direct.
+        let output = OutputSpec {
+            device: "default".to_owned(),
+            rate_hz: 44_100,
+            layout: ChannelLayout::discrete(2),
+            format: DeviceFormat::S16Le,
+            valid_bits: 16,
+        };
+        h.app.apply_event(PlayerEvent::Playing {
+            track: 7,
+            output: output.clone(),
+            source,
+            buffers,
+            converted: false,
+            shared_playback: true,
+        });
+        assert_eq!(h.app.state.device, "hw:2,0");
+        assert_eq!(h.app.state.output_spec.as_ref().unwrap().device, "default");
+        assert_eq!(
+            player_view(&h.app).badge,
+            screens::player::PlaybackBadge::Shared
+        );
+        assert!(h.app.state.status.contains("shared"));
+        assert!(h.app.state.status.contains("not bit-perfect"));
+        let rendered = screen_text(&h.app, 140, 40);
+        assert!(
+            rendered.contains("● shared"),
+            "Now playing and header show shared"
+        );
+        assert!(
+            !rendered.contains("● bit-perfect"),
+            "shared never gets a bit-perfect badge"
+        );
+
+        // Even when an app-side integer→F32 packer also converted, Shared
+        // takes badge precedence and the status keeps the direction.
+        h.app.apply_event(PlayerEvent::Playing {
+            track: 7,
+            output: OutputSpec {
+                format: DeviceFormat::F32Le,
+                valid_bits: 32,
+                ..output
+            },
+            source,
+            buffers,
+            converted: true,
+            shared_playback: true,
+        });
+        assert_eq!(
+            player_view(&h.app).badge,
+            screens::player::PlaybackBadge::Shared
+        );
+        assert!(h.app.state.status.contains("integer→F32 converted"));
+        h.app.apply_event(PlayerEvent::Paused);
+        assert_eq!(
+            player_view(&h.app).badge,
+            screens::player::PlaybackBadge::Idle
+        );
+        h.app.apply_event(PlayerEvent::Reconfiguring);
+        assert_eq!(
+            player_view(&h.app).badge,
+            screens::player::PlaybackBadge::Idle
+        );
+    }
+
+    #[test]
     fn three_screens_render_their_panels_and_tabs() {
         let mut h = harness();
         let library = screen_text(&h.app, 140, 40);
@@ -4232,7 +4506,10 @@ mod tests {
             "Now playing",
             "nothing playing",
         ] {
-            assert!(library.contains(marker), "library screen missing {marker:?}");
+            assert!(
+                library.contains(marker),
+                "library screen missing {marker:?}"
+            );
         }
         h.key(KeyCode::Char('2'));
         let playlists = screen_text(&h.app, 140, 40);
@@ -4243,7 +4520,10 @@ mod tests {
         h.key(KeyCode::Char('3'));
         let settings = screen_text(&h.app, 140, 40);
         for marker in ["Settings", "Output", "/config/config.toml"] {
-            assert!(settings.contains(marker), "settings screen missing {marker:?}");
+            assert!(
+                settings.contains(marker),
+                "settings screen missing {marker:?}"
+            );
         }
     }
 

@@ -38,19 +38,17 @@ use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 
 use block2::RcBlock;
 use objc2_core_audio::{
-    AudioDeviceCreateIOProcIDWithBlock, AudioDeviceDestroyIOProcID, AudioDeviceStart,
-    AudioDeviceStop, AudioObjectGetPropertyData, AudioObjectGetPropertyDataSize,
+    AudioDeviceCreateIOProcIDWithBlock, AudioDeviceDestroyIOProcID, AudioDeviceIOProcID,
+    AudioDeviceStart, AudioDeviceStop, AudioObjectGetPropertyData, AudioObjectGetPropertyDataSize,
     AudioObjectID, AudioObjectPropertyAddress, AudioObjectSetPropertyData,
-    AudioDeviceIOProcID, kAudioDevicePropertyActualSampleRate,
+    AudioStreamRangedDescription, kAudioDevicePropertyActualSampleRate,
     kAudioDevicePropertyBufferFrameSize, kAudioDevicePropertyHogMode,
-    kAudioDevicePropertyNominalSampleRate, kAudioDevicePropertyStreams,
-    kAudioHardwareNoError, kAudioHardwarePropertyDefaultOutputDevice,
-    kAudioHardwarePropertyDevices, kAudioObjectPropertyElementMain,
-    kAudioObjectPropertyName, kAudioObjectPropertyScopeGlobal,
+    kAudioDevicePropertyNominalSampleRate, kAudioDevicePropertyStreams, kAudioHardwareNoError,
+    kAudioHardwarePropertyDefaultOutputDevice, kAudioHardwarePropertyDevices,
+    kAudioObjectPropertyElementMain, kAudioObjectPropertyName, kAudioObjectPropertyScopeGlobal,
     kAudioObjectPropertyScopeOutput, kAudioObjectSystemObject,
     kAudioStreamPropertyAvailablePhysicalFormats, kAudioStreamPropertyAvailableVirtualFormats,
     kAudioStreamPropertyPhysicalFormat, kAudioStreamPropertyVirtualFormat,
-    AudioStreamRangedDescription,
 };
 use objc2_core_audio_types::{AudioBufferList, AudioStreamBasicDescription, AudioTimeStamp};
 use sointty_core::{
@@ -109,11 +107,7 @@ fn debug_log() -> Option<std::fs::File> {
         .ok()
 }
 
-fn prop_addr(
-    selector: u32,
-    scope: u32,
-    element: u32,
-) -> AudioObjectPropertyAddress {
+pub(crate) fn prop_addr(selector: u32, scope: u32, element: u32) -> AudioObjectPropertyAddress {
     AudioObjectPropertyAddress {
         mSelector: selector,
         mScope: scope,
@@ -128,7 +122,10 @@ fn prop_addr(
 /// `T` must be exactly the data type the HAL returns for `address` on
 /// `object` (or an array element of it). `address` must be valid for
 /// `object`.
-fn get_data<T: Copy>(object: AudioObjectID, address: &AudioObjectPropertyAddress) -> Result<Vec<T>, i32> {
+pub(crate) fn get_data<T: Copy>(
+    object: AudioObjectID,
+    address: &AudioObjectPropertyAddress,
+) -> Result<Vec<T>, i32> {
     // SAFETY: `address` and `size` are valid, aligned stack references; the
     // HAL only reads/writes through them for the duration of the call.
     let mut size: u32 = 0;
@@ -180,11 +177,11 @@ fn get_data<T: Copy>(object: AudioObjectID, address: &AudioObjectPropertyAddress
 /// # Safety
 ///
 /// Same contract as [`get_data`].
-fn get_value<T: Copy>(object: AudioObjectID, address: &AudioObjectPropertyAddress) -> Result<T, i32> {
-    get_data(object, address)?
-        .into_iter()
-        .next()
-        .ok_or(-1) // kAudioHardwareNoError-adjacent sentinel: property empty
+pub(crate) fn get_value<T: Copy>(
+    object: AudioObjectID,
+    address: &AudioObjectPropertyAddress,
+) -> Result<T, i32> {
+    get_data(object, address)?.into_iter().next().ok_or(-1) // kAudioHardwareNoError-adjacent sentinel: property empty
 }
 
 /// Write a single-value property.
@@ -193,7 +190,11 @@ fn get_value<T: Copy>(object: AudioObjectID, address: &AudioObjectPropertyAddres
 ///
 /// `T` must be exactly the data type the HAL expects for `address` on
 /// `object`.
-fn set_value<T: Copy>(object: AudioObjectID, address: &AudioObjectPropertyAddress, value: &T) -> Result<(), i32> {
+pub(crate) fn set_value<T: Copy>(
+    object: AudioObjectID,
+    address: &AudioObjectPropertyAddress,
+    value: &T,
+) -> Result<(), i32> {
     // SAFETY: `value` points to one initialized `T`; the HAL reads
     // `size_of::<T>()` bytes during the call.
     let status = unsafe {
@@ -235,9 +236,15 @@ unsafe extern "C" {
 const K_CF_STRING_ENCODING_UTF8: u32 = 0x0800_0100;
 
 fn device_name(object: AudioObjectID) -> Option<String> {
-    let name_ref: *mut c_void =
-        get_value(object, &prop_addr(kAudioObjectPropertyName, kAudioObjectPropertyScopeGlobal, kAudioObjectPropertyElementMain))
-            .ok()?;
+    let name_ref: *mut c_void = get_value(
+        object,
+        &prop_addr(
+            kAudioObjectPropertyName,
+            kAudioObjectPropertyScopeGlobal,
+            kAudioObjectPropertyElementMain,
+        ),
+    )
+    .ok()?;
     if name_ref.is_null() {
         return None;
     }
@@ -291,34 +298,41 @@ pub struct CoreAudioOutput {
 // block; our `RcBlock` handle is only touched from the owning thread.
 unsafe impl Send for CoreAudioOutput {}
 
+/// Resolve a device selection to its `(AudioObjectID, canonical id)`:
+/// `"default"` reads the current default render endpoint, anything else is
+/// the decimal `AudioObjectID` from [`CoreAudioOutput::list_devices`].
+/// Shared by the direct (hog-mode) and shared (AUHAL) constructors; the
+/// selection and error behavior is identical for both.
+pub(crate) fn resolve_device(device: &DeviceId) -> Result<(AudioObjectID, DeviceId), PlayerError> {
+    if device == "default" {
+        // SAFETY: system object + default-output selector is a documented
+        // global-scope read returning one AudioObjectID.
+        let object: AudioObjectID = get_value(
+            kAudioObjectSystemObject as AudioObjectID,
+            &prop_addr(
+                kAudioHardwarePropertyDefaultOutputDevice,
+                kAudioObjectPropertyScopeGlobal,
+                kAudioObjectPropertyElementMain,
+            ),
+        )
+        .map_err(|_| PlayerError::DeviceLost)?;
+        if object == 0 {
+            return Err(PlayerError::DeviceLost);
+        }
+        Ok((object, object.to_string()))
+    } else {
+        let object: AudioObjectID = device.parse().map_err(|_| {
+            PlayerError::InvalidInput("device id must be \"default\" or a decimal AudioObjectID")
+        })?;
+        Ok((object, device.clone()))
+    }
+}
+
 impl CoreAudioOutput {
     /// `device`: `"default"` for the default render endpoint, or the decimal
     /// `AudioObjectID` of a render endpoint (see [`CoreAudioOutput::list_devices`]).
     pub fn new(device: &DeviceId) -> Result<Self, PlayerError> {
-        let (object, device_id) = if device == "default" {
-            // SAFETY: system object + default-output selector is a documented
-            // global-scope read returning one AudioObjectID.
-            let object: AudioObjectID = get_value(
-                kAudioObjectSystemObject as AudioObjectID,
-                &prop_addr(
-                    kAudioHardwarePropertyDefaultOutputDevice,
-                    kAudioObjectPropertyScopeGlobal,
-                    kAudioObjectPropertyElementMain,
-                ),
-            )
-            .map_err(|_| PlayerError::DeviceLost)?;
-            if object == 0 {
-                return Err(PlayerError::DeviceLost);
-            }
-            (object, object.to_string())
-        } else {
-            let object: AudioObjectID = device.parse().map_err(|_| {
-                PlayerError::InvalidInput(
-                    "device id must be \"default\" or a decimal AudioObjectID",
-                )
-            })?;
-            (object, device.clone())
-        };
+        let (object, device_id) = resolve_device(device)?;
         Ok(Self {
             device: object,
             device_id,
@@ -647,17 +661,24 @@ impl CoreAudioOutput {
         }
         // SAFETY: documented single-ASBD property on an output stream.
         let virtual_format: AudioStreamBasicDescription = get_value(stream, &virtual_address)
-            .map_err(|_| Self::unsupported(input, "could not read back the IOProc virtual format"))?;
+            .map_err(|_| {
+                Self::unsupported(input, "could not read back the IOProc virtual format")
+            })?;
         if let Some(log) = &mut log {
             use std::io::Write;
             let _ = writeln!(log, "  virtual readback: {virtual_format:?}");
         }
 
         let established = direct_virtual
-            .and_then(|(wanted, m)| (virtual_format == wanted).then_some((wanted, m.format, m.valid_bits)))
+            .and_then(|(wanted, m)| {
+                (virtual_format == wanted).then_some((wanted, m.format, m.valid_bits))
+            })
             .or_else(|| {
-                (virtual_format == chosen)
-                    .then_some((virtual_format, matched.format, matched.valid_bits))
+                (virtual_format == chosen).then_some((
+                    virtual_format,
+                    matched.format,
+                    matched.valid_bits,
+                ))
             })
             .or_else(|| {
                 (input.encoding != SampleEncoding::F32
@@ -726,17 +747,22 @@ impl CoreAudioOutput {
             // SAFETY: documented device rate and output-stream ASBD properties.
             set_value(self.device, &rate_address, &wanted_rate)
                 .map_err(|_| Self::unsupported(input, "device rejected the nominal sample rate"))?;
-            set_value(stream, &physical_address, &chosen)
-                .map_err(|_| Self::unsupported(input, "device rejected the exact physical format"))?;
-            set_value(stream, &virtual_address, &expected_virtual)
-                .map_err(|_| Self::unsupported(input, "device rejected the exact IOProc virtual format"))?;
+            set_value(stream, &physical_address, &chosen).map_err(|_| {
+                Self::unsupported(input, "device rejected the exact physical format")
+            })?;
+            set_value(stream, &virtual_address, &expected_virtual).map_err(|_| {
+                Self::unsupported(input, "device rejected the exact IOProc virtual format")
+            })?;
             // SAFETY: re-read all three properties after the last write.
-            let final_rate: f64 = get_value(self.device, &rate_address)
-                .map_err(|_| Self::unsupported(input, "could not read back the nominal sample rate"))?;
+            let final_rate: f64 = get_value(self.device, &rate_address).map_err(|_| {
+                Self::unsupported(input, "could not read back the nominal sample rate")
+            })?;
             let final_physical: AudioStreamBasicDescription = get_value(stream, &physical_address)
                 .map_err(|_| Self::unsupported(input, "could not read back the physical format"))?;
             let final_virtual: AudioStreamBasicDescription = get_value(stream, &virtual_address)
-                .map_err(|_| Self::unsupported(input, "could not read back the IOProc virtual format"))?;
+                .map_err(|_| {
+                    Self::unsupported(input, "could not read back the IOProc virtual format")
+                })?;
             if let Some(log) = &mut log {
                 use std::io::Write;
                 let _ = writeln!(
@@ -744,7 +770,10 @@ impl CoreAudioOutput {
                     "  re-applied rate={final_rate} format={final_physical:?} virtual={final_virtual:?}"
                 );
             }
-            if final_rate != wanted_rate || final_physical != chosen || final_virtual != expected_virtual {
+            if final_rate != wanted_rate
+                || final_physical != chosen
+                || final_virtual != expected_virtual
+            {
                 return Err(Self::unsupported(
                     input,
                     "device does not keep the exact physical and IOProc virtual formats",
@@ -803,9 +832,7 @@ impl AudioOutput for CoreAudioOutput {
                 // short settle delay, only when this device was configured
                 // before; genuinely unsupported formats on a fresh device
                 // still fail on the first attempt.
-                if self.spec.is_none()
-                    || !matches!(err, PlayerError::UnsupportedFormat { .. })
-                {
+                if self.spec.is_none() || !matches!(err, PlayerError::UnsupportedFormat { .. }) {
                     return Err(err);
                 }
                 if let Some(mut log) = debug_log() {
@@ -834,12 +861,9 @@ impl AudioOutput for CoreAudioOutput {
             // Already streaming; start is idempotent.
             return Ok(());
         }
-        let spec = self
-            .spec
-            .as_ref()
-            .ok_or(PlayerError::InvalidInput(
-                "configure must succeed before start",
-            ))?;
+        let spec = self.spec.as_ref().ok_or(PlayerError::InvalidInput(
+            "configure must succeed before start",
+        ))?;
         let frame_bytes = spec.bytes_per_frame() as u32;
         let rate_hz = spec.rate_hz;
 

@@ -8,10 +8,10 @@ use std::time::{Duration, Instant};
 use crossbeam_channel::{Receiver, Sender};
 use rand::{Rng, seq::SliceRandom};
 use sointty_core::{
-    AudioOutput, BufferConfig, Decoder, DecodedBlock, DecodedPcm, DecodedSpec, DeviceFormat,
-    DeviceId, DopPacker, OutputCounters, OutputSpec, PlayerCommand, PlayerError, PlayerEvent,
-    QueueEntry, SampleEncoding, StreamSpec, TrackId, TrackTags, cd_frames_to_samples, pack_exact,
-    pack_native_dsd,
+    AudioOutput, BufferConfig, DecodedBlock, DecodedPcm, DecodedSpec, Decoder, DeviceFormat,
+    DeviceId, DopPacker, OutputAccess, OutputCounters, OutputSpec, PlayerCommand, PlayerError,
+    PlayerEvent, QueueEntry, SampleEncoding, StreamSpec, TrackId, TrackTags, cd_frames_to_samples,
+    pack_exact, pack_native_dsd,
 };
 use sointty_source::StallState;
 
@@ -91,7 +91,10 @@ enum Packing {
     FloatToIntByHal,
     Dop(DopPacker),
     /// Native DSD groups consecutive time bytes per channel into ALSA slots.
-    NativeDsd { channels: u16, slot_bytes: usize },
+    NativeDsd {
+        channels: u16,
+        slot_bytes: usize,
+    },
 }
 
 impl Packing {
@@ -150,6 +153,18 @@ struct Playback {
     /// Frames written since the current range started; resets on seek and on
     /// a seamless track swap, while `written_frames` keeps counting.
     span_written: u64,
+    /// Range-relative source frame at which the current ring/output run
+    /// began: 0 at a range start, the seek target after a seek, the
+    /// consumed frame after a stall resume or an access-mode restart.
+    /// Position events report `position_base_frames + ring progress`, so a
+    /// seek/restart offset survives all later Position events.
+    position_base_frames: u64,
+    /// `written_frames` value at which the audible track's frames started
+    /// entering the ring (the committed gapless boundary, 0 for a fresh
+    /// stream). Resume accounting subtracts it from the output's cumulative
+    /// `played_frames` so a mid-track restart lands inside the audible
+    /// track, not at a decoded-ahead offset.
+    ring_track_start_frames: u64,
     /// One packed decoder block may exceed ring capacity. Keep its unwritten
     /// suffix until the consumer makes room; never drop a decoded block.
     scratch: Vec<u8>,
@@ -178,7 +193,10 @@ fn pack_block(
             };
             packer.pack(bytes, scratch)
         }
-        Packing::NativeDsd { channels, slot_bytes } => {
+        Packing::NativeDsd {
+            channels,
+            slot_bytes,
+        } => {
             let DecodedPcm::Dsd(bytes) = &block.pcm else {
                 return Err(PlayerError::Decode);
             };
@@ -331,6 +349,7 @@ enum WorkerMsg {
     SelectDevice(DeviceId),
     SetFloatToInt(bool),
     SetIntToFloat(bool),
+    SetSharedPlayback(bool),
     SetTiming {
         period_frames: Option<u32>,
         buffer_frames: Option<u32>,
@@ -356,7 +375,7 @@ struct StallEpisode {
     stopped: bool,
 }
 
-type OutputFactory<O> = Box<dyn FnMut(DeviceId) -> Result<O, PlayerError> + Send>;
+type OutputFactory<O> = Box<dyn FnMut(DeviceId, OutputAccess) -> Result<O, PlayerError> + Send>;
 
 /// The decoder's own spec as a `DecodedSpec`, for the `Playing` event's
 /// read-only signal-path fields.
@@ -374,10 +393,34 @@ fn span_remaining(playback: &Playback) -> Option<u64> {
         .end_frames
         .map(|end| end.saturating_sub(playback.span_written))
 }
+
+/// Range-relative position of the ring's write head: the run's base offset
+/// plus the frames written since the audible track entered the ring.
+fn playback_position(playback: &Playback) -> u64 {
+    playback.position_base_frames
+        + playback
+            .written_frames
+            .saturating_sub(playback.ring_track_start_frames)
+}
+
+/// Range-relative frame the output has actually consumed: the run base plus
+/// the played count past the committed gapless boundary. Restarting the
+/// stream (stall resume, access-mode switch) re-seeks to exactly this
+/// frame, never to the decoded-ahead write head.
+fn consumed_frame(playback: &Playback, counters: &OutputCounters) -> u64 {
+    playback.position_base_frames
+        + counters
+            .played_frames
+            .load(Ordering::Relaxed)
+            .saturating_sub(playback.ring_track_start_frames)
+}
+
 /// Bound an advertised file length to the active CUE span. Without a file
 /// length, an explicit CUE end still supplies an exact progress endpoint.
 fn playback_total(playback: &Playback) -> Option<u64> {
-    let file_remaining = playback.decoder.total_frames()
+    let file_remaining = playback
+        .decoder
+        .total_frames()
         .map(|total| total.saturating_sub(playback.start_sample));
     match playback.end_frames {
         Some(end) => Some(file_remaining.map_or(end, |remaining| remaining.min(end))),
@@ -385,13 +428,14 @@ fn playback_total(playback: &Playback) -> Option<u64> {
     }
 }
 
-
 /// Push as many whole wire frames as the ring currently accepts. Returns
 /// `true` when the complete decoded block has entered the ring.
 fn push_available(playback: &mut Playback) -> Result<bool, PlayerError> {
     let frame_bytes = playback.output.bytes_per_frame();
     if !playback.scratch.len().is_multiple_of(frame_bytes) {
-        return Err(PlayerError::InvalidInput("decoded block is not wire-frame aligned"));
+        return Err(PlayerError::InvalidInput(
+            "decoded block is not wire-frame aligned",
+        ));
     }
     let remaining = playback.scratch.len() - playback.pending_offset;
     let bytes = playback.producer.slots().min(remaining) / frame_bytes * frame_bytes;
@@ -488,6 +532,14 @@ struct Worker<O: AudioOutput> {
     output_factory: OutputFactory<O>,
     decoder_factory: DecoderFactory,
     device: DeviceId,
+    /// Desired output access mode (set at startup and by
+    /// `SetSharedPlayback`). Retained across failures: a failed switch never
+    /// reverts the preference, and the next configure retries it.
+    access: OutputAccess,
+    /// The mode `output` was actually constructed with. Playback paths
+    /// reconstruct the backend before configuring when the two differ, so a
+    /// failed switch never resumes through the old mode.
+    output_access: OutputAccess,
     /// DAC timing overrides; `None` means the rate-relative default.
     period_frames: Option<u32>,
     buffer_frames: Option<u32>,
@@ -655,7 +707,11 @@ impl<O: AudioOutput> Worker<O> {
         let audible_id = self.audible.as_ref().map(|track| track.id);
         let mut pending = Vec::new();
         let mut push_unique = |track: &QueuedTrack| {
-            if Some(track.id) != audible_id && !pending.iter().any(|item: &sointty_core::QueueItem| item.id == track.id) {
+            if Some(track.id) != audible_id
+                && !pending
+                    .iter()
+                    .any(|item: &sointty_core::QueueItem| item.id == track.id)
+            {
                 pending.push(to_item(track));
             }
         };
@@ -684,7 +740,9 @@ impl<O: AudioOutput> Worker<O> {
             }
             WorkerMsg::SetShuffle(enabled) => {
                 if enabled && !self.shuffle {
-                    self.queue.make_contiguous().shuffle(&mut rand::thread_rng());
+                    self.queue
+                        .make_contiguous()
+                        .shuffle(&mut rand::thread_rng());
                 }
                 self.shuffle = enabled;
                 self.emit_queue_changed();
@@ -751,6 +809,14 @@ impl<O: AudioOutput> Worker<O> {
                 true
             }
             WorkerMsg::SelectDevice(device) => {
+                // Linux shared playback always renders through the
+                // system-configured `default` PCM, independent of the `hw:`
+                // selection: retain the new selection for the next Direct
+                // configure and leave the active shared route untouched.
+                if cfg!(target_os = "linux") && self.access == OutputAccess::Shared {
+                    self.device = device;
+                    return Ok(true);
+                }
                 self.playback = None;
                 self.suspended = None;
                 self.unprepare();
@@ -759,11 +825,16 @@ impl<O: AudioOutput> Worker<O> {
                 self.clear_shared_stall();
                 // Build the replacement before committing: on factory failure
                 // the previous device/output pair stays consistent.
-                let output = (self.output_factory)(device.clone())?;
+                let output = (self.output_factory)(device.clone(), self.access)?;
                 self.device = device;
                 self.output = output;
+                self.output_access = self.access;
                 self.emit(PlayerEvent::Reconfiguring);
                 self.start_next()?;
+                true
+            }
+            WorkerMsg::SetSharedPlayback(enabled) => {
+                self.set_shared_playback(enabled)?;
                 true
             }
             WorkerMsg::SetFloatToInt(enabled) => {
@@ -936,10 +1007,13 @@ impl<O: AudioOutput> Worker<O> {
             // Source equals anchor: nothing to reorder.
             return;
         }
-        let pending_contains = |target: TrackId, queue: &VecDeque<QueuedTrack>, prepared: &Option<PreparedNext>| {
-            queue.iter().any(|track| track.id == target)
-                || prepared.as_ref().is_some_and(|next| next.track.id == target)
-        };
+        let pending_contains =
+            |target: TrackId, queue: &VecDeque<QueuedTrack>, prepared: &Option<PreparedNext>| {
+                queue.iter().any(|track| track.id == target)
+                    || prepared
+                        .as_ref()
+                        .is_some_and(|next| next.track.id == target)
+            };
         if !pending_contains(id, &self.queue, &self.prepared) {
             self.emit_reject(id, REJECT_MISSING_ID);
             return;
@@ -967,7 +1041,11 @@ impl<O: AudioOutput> Worker<O> {
                     .expect("anchor validated above");
                 // After removing `pos`, the anchor sits one slot earlier
                 // when the removed entry preceded it.
-                let insert_at = if pos < anchor_pos { anchor_pos - 1 } else { anchor_pos };
+                let insert_at = if pos < anchor_pos {
+                    anchor_pos - 1
+                } else {
+                    anchor_pos
+                };
                 self.queue.insert(insert_at, track);
             }
             None => self.queue.push_back(track),
@@ -996,7 +1074,9 @@ impl<O: AudioOutput> Worker<O> {
         } else {
             let rate = decoder.spec().rate_hz;
             if rate == 0 || rate.div_ceil(10).checked_mul(3).is_none() {
-                return Err(PlayerError::InvalidInput("decoded rate is invalid for DAC timing"));
+                return Err(PlayerError::InvalidInput(
+                    "decoded rate is invalid for DAC timing",
+                ));
             }
             let default = BufferConfig::default_for_rate(rate);
             let period = self.period_frames.unwrap_or(default.period_frames);
@@ -1012,10 +1092,16 @@ impl<O: AudioOutput> Worker<O> {
                 ring_frames: ring,
             }
         };
-        let minimum = buffers.period_frames.checked_mul(2).ok_or(PlayerError::InvalidInput(
-            "period frames too large for twice-period buffer",
-        ))?;
-        if buffers.period_frames == 0 || buffers.buffer_frames == 0 || buffers.buffer_frames < minimum {
+        let minimum = buffers
+            .period_frames
+            .checked_mul(2)
+            .ok_or(PlayerError::InvalidInput(
+                "period frames too large for twice-period buffer",
+            ))?;
+        if buffers.period_frames == 0
+            || buffers.buffer_frames == 0
+            || buffers.buffer_frames < minimum
+        {
             return Err(PlayerError::InvalidInput(
                 "buffer frames must be at least twice the positive period frames",
             ));
@@ -1041,6 +1127,11 @@ impl<O: AudioOutput> Worker<O> {
                 .map(|output| (output, Conversion::None, buffers));
         }
         let decoded = decoder.spec();
+        // The shared-playback opt-in authorizes the application-side packers
+        // too: the OS mixer owns the route anyway, and shared backends that
+        // accept only F32 clients (macOS AUHAL) need the integer→F32 packer.
+        // Direct mode still requires its distinct per-direction opt-ins.
+        let shared = self.access == OutputAccess::Shared;
         let original = match self.output.configure(&decoded, buffers) {
             Ok(output) => {
                 let native = output.format.native_encoding();
@@ -1051,8 +1142,12 @@ impl<O: AudioOutput> Worker<O> {
                 // (e.g. an integer USB DAC whose Core Audio IOProc format is
                 // float-only). Honor the same opt-ins as the retry paths.
                 let conversion = match (decoded.encoding, native) {
-                    (SampleEncoding::F32, _) if self.float_to_int => Conversion::FloatToInt,
-                    (_, SampleEncoding::F32) if self.int_to_float => Conversion::IntToFloat,
+                    (SampleEncoding::F32, _) if self.float_to_int || shared => {
+                        Conversion::FloatToInt
+                    }
+                    (_, SampleEncoding::F32) if self.int_to_float || shared => {
+                        Conversion::IntToFloat
+                    }
                     (SampleEncoding::F32, _) => {
                         return Err(PlayerError::UnsupportedFormat {
                             rate_hz: decoded.rate_hz,
@@ -1076,9 +1171,16 @@ impl<O: AudioOutput> Worker<O> {
             Err(error) if matches!(error, PlayerError::UnsupportedFormat { .. }) => error,
             Err(error) => return Err(error),
         };
-        if decoded.encoding == SampleEncoding::F32 && self.float_to_int {
-            for encoding in [SampleEncoding::S32, SampleEncoding::S24, SampleEncoding::S16] {
-                let integer = StreamSpec { encoding, ..decoded };
+        if decoded.encoding == SampleEncoding::F32 && (self.float_to_int || shared) {
+            for encoding in [
+                SampleEncoding::S32,
+                SampleEncoding::S24,
+                SampleEncoding::S16,
+            ] {
+                let integer = StreamSpec {
+                    encoding,
+                    ..decoded
+                };
                 match self.output.configure(&integer, buffers) {
                     Ok(output) if output.stream_compatible(&integer) => {
                         return Ok((output, Conversion::FloatToInt, buffers));
@@ -1093,8 +1195,11 @@ impl<O: AudioOutput> Worker<O> {
                     Err(error) => return Err(error),
                 }
             }
-        } else if decoded.encoding != SampleEncoding::F32 && self.int_to_float {
-            let float = StreamSpec { encoding: SampleEncoding::F32, ..decoded };
+        } else if decoded.encoding != SampleEncoding::F32 && (self.int_to_float || shared) {
+            let float = StreamSpec {
+                encoding: SampleEncoding::F32,
+                ..decoded
+            };
             match self.output.configure(&float, buffers) {
                 Ok(output) if output.stream_compatible(&float) => {
                     return Ok((output, Conversion::IntToFloat, buffers));
@@ -1108,6 +1213,9 @@ impl<O: AudioOutput> Worker<O> {
     }
 
     fn start_next(&mut self) -> Result<(), PlayerError> {
+        // A desired access mode not yet built (e.g. a failed idle switch)
+        // must be constructed before anything configures the old backend.
+        self.reconstruct_output()?;
         self.playback = None;
         self.suspended = None;
         self.boundary = None;
@@ -1169,6 +1277,8 @@ impl<O: AudioOutput> Worker<O> {
             start_sample,
             end_frames,
             span_written: 0,
+            position_base_frames: 0,
+            ring_track_start_frames: 0,
             scratch: Vec::new(),
             pending_offset: 0,
             pending_frames: 0,
@@ -1184,6 +1294,7 @@ impl<O: AudioOutput> Worker<O> {
             source,
             buffers,
             converted: conversion.converted(),
+            shared_playback: self.active_shared(),
         });
         self.emit(PlayerEvent::Tags {
             track: track.id,
@@ -1216,6 +1327,13 @@ impl<O: AudioOutput> Worker<O> {
             target = target.min(playback.start_sample + end_frames);
         }
         decoder.seek_to_frame(target)?;
+        // Range-relative offset the stream resumes at; Position events keep
+        // it as their base so the display never jumps back to the range
+        // start after a seek.
+        let resume_frame = target - playback.start_sample;
+        // Reconstruct the backend first when the desired access mode is not
+        // the built one: a seek never resumes through a stale mode.
+        self.reconstruct_output()?;
         self.output.stop()?;
         self.emit(PlayerEvent::Reconfiguring);
         // `seek_to_frame` counts per-channel DSD bytes for DSD decoders, so
@@ -1234,7 +1352,9 @@ impl<O: AudioOutput> Worker<O> {
             written_frames: 0,
             start_sample: playback.start_sample,
             end_frames: playback.end_frames,
-            span_written: 0,
+            span_written: resume_frame,
+            position_base_frames: resume_frame,
+            ring_track_start_frames: 0,
             scratch: Vec::new(),
             pending_offset: 0,
             pending_frames: 0,
@@ -1254,6 +1374,7 @@ impl<O: AudioOutput> Worker<O> {
                 source,
                 buffers,
                 converted: playback.packing.converted(),
+                shared_playback: self.active_shared(),
             });
             self.emit(PlayerEvent::Duration {
                 track: track.id,
@@ -1264,7 +1385,7 @@ impl<O: AudioOutput> Worker<O> {
         if let Some(track) = &self.current {
             self.emit(PlayerEvent::Position {
                 track: track.id,
-                frame,
+                frame: resume_frame,
             });
         }
         Ok(())
@@ -1277,7 +1398,10 @@ impl<O: AudioOutput> Worker<O> {
         let Some(playback) = self.playback.take() else {
             return Ok(());
         };
-        let resume_frame = self.counters.played_frames.load(Ordering::Relaxed);
+        // The frame the output actually consumed of the audible track (base
+        // plus played frames past the committed gapless boundary), never the
+        // decoded-ahead write head.
+        let resume_frame = consumed_frame(&playback, &self.counters);
         self.output.stop()?;
         if let Some(track) = &self.current {
             self.emit(PlayerEvent::Underrun { track: track.id });
@@ -1295,6 +1419,11 @@ impl<O: AudioOutput> Worker<O> {
         let Some(suspended) = self.suspended.take() else {
             return Ok(());
         };
+        // A suspended ring cannot preserve an unannounced gapless boundary.
+        // If the next track was committed but not audible when the stall
+        // stopped output, the fresh ring resumes that current track at its
+        // consumed (possibly zero) frame and announces it as audible now.
+        let boundary_pending = self.boundary.take().is_some();
         self.reset_shared_cancel();
         let Suspended {
             playback: old,
@@ -1306,6 +1435,9 @@ impl<O: AudioOutput> Worker<O> {
             target = target.min(old.start_sample + end_frames);
         }
         decoder.seek_to_frame(target)?;
+        // A mode change requested while suspended applies here: rebuild the
+        // backend before configuring so resume never uses the old mode.
+        self.reconstruct_output()?;
         self.emit(PlayerEvent::Reconfiguring);
         let (output_spec, conversion, buffers) = self.configure_for_decoder(decoder.as_ref())?;
         let source = decoded_spec(decoder.as_ref());
@@ -1317,10 +1449,12 @@ impl<O: AudioOutput> Worker<O> {
             output: output_spec.clone(),
             source,
             buffers,
-            written_frames: resume_frame,
+            written_frames: 0,
             start_sample: old.start_sample,
             end_frames: old.end_frames,
             span_written: resume_frame,
+            position_base_frames: resume_frame,
+            ring_track_start_frames: 0,
             scratch: Vec::new(),
             pending_offset: 0,
             pending_frames: 0,
@@ -1338,13 +1472,228 @@ impl<O: AudioOutput> Worker<O> {
                 source,
                 buffers,
                 converted: conversion.converted(),
+                shared_playback: self.active_shared(),
             });
             self.emit(PlayerEvent::Duration {
                 track: track.id,
                 total_frames: self.playback.as_ref().and_then(playback_total),
             });
+            if boundary_pending {
+                self.emit(PlayerEvent::Tags {
+                    track: track.id,
+                    tags: track.tags.clone(),
+                });
+            }
+            self.emit(PlayerEvent::Position {
+                track: track.id,
+                frame: resume_frame,
+            });
+        }
+        if boundary_pending {
+            self.audible = self.current.clone();
+            self.emit_queue_changed();
         }
         Ok(())
+    }
+
+    /// True when the constructed backend is the shared system-mixer path.
+    /// Only the actually built backend counts: a saved preference alone
+    /// never claims the shared (or direct) path in a `Playing` event.
+    fn active_shared(&self) -> bool {
+        self.output_access == OutputAccess::Shared
+    }
+
+    /// Stop the current backend and build the replacement for the same
+    /// device selection in the desired access mode, when the two differ.
+    /// On macOS the OS gets a bounded settling interval after the old
+    /// backend released the device (hog-mode teardown) before the new
+    /// backend is constructed. On factory failure the old (stopped) backend
+    /// stays in place and `output_access` still describes it, so the next
+    /// configure retries the desired mode instead of silently reverting.
+    fn reconstruct_output(&mut self) -> Result<(), PlayerError> {
+        if self.output_access == self.access {
+            return Ok(());
+        }
+        self.output.stop()?;
+        // macOS: hog release and format changes settle asynchronously; the
+        // direct backend's own once-only retry covers same-backend rate
+        // changes, but a fresh backend of the other mode needs the device
+        // back in a mixable state first. Never sleep in a render callback;
+        // this is the non-RT decoder worker.
+        #[cfg(target_os = "macos")]
+        std::thread::sleep(Duration::from_millis(250));
+        let output = (self.output_factory)(self.device.clone(), self.access)?;
+        self.output = output;
+        self.output_access = self.access;
+        Ok(())
+    }
+
+    /// Configure for the decoder right after an access-mode change. macOS
+    /// only: a first `UnsupportedFormat` from the fresh backend can mean the
+    /// device has not settled out of the previous mode yet, so dispose the
+    /// backend, wait one more bounded interval, rebuild for the same
+    /// device/mode, and retry exactly once. The second failure propagates
+    /// without any automatic mode fallback. `DeviceBusy` is never retried:
+    /// another application may legitimately occupy the endpoint.
+    fn configure_after_access_change(
+        &mut self,
+        decoder: &dyn Decoder,
+    ) -> Result<(OutputSpec, Conversion, BufferConfig), PlayerError> {
+        let first = self.configure_for_decoder(decoder);
+        #[cfg(target_os = "macos")]
+        if let Err(error) = &first
+            && matches!(error, PlayerError::UnsupportedFormat { .. })
+        {
+            let _ = self.output.stop();
+            std::thread::sleep(Duration::from_millis(250));
+            self.output = (self.output_factory)(self.device.clone(), self.access)?;
+            self.output_access = self.access;
+            return self.configure_for_decoder(decoder);
+        }
+        first
+    }
+
+    /// Set the desired access mode; redundant same-mode requests are
+    /// skipped. Idle/paused swaps the stopped backend immediately without
+    /// auto-playing. Playing restarts the audible stream near its consumed
+    /// frame. A next track committed to the ring but not yet audible defers
+    /// the switch to `emit_pending_boundary`; a suspended (stalled) stream
+    /// applies the mode on resume.
+    fn set_shared_playback(&mut self, enabled: bool) -> Result<(), PlayerError> {
+        let desired = if enabled {
+            OutputAccess::Shared
+        } else {
+            OutputAccess::Direct
+        };
+        if desired == self.access {
+            return Ok(());
+        }
+        self.access = desired;
+        if self.playback.is_some() {
+            if self.boundary.is_some() {
+                // The committed next track is not audible yet; the switch
+                // happens once its boundary `Playing` announces it.
+                return Ok(());
+            }
+            self.restart_current_for_access()
+        } else if self.suspended.is_some() {
+            // `resume_after_stall` reconstructs when modes differ.
+            Ok(())
+        } else {
+            self.reconstruct_output()
+        }
+    }
+
+    /// Restart the audible stream through a backend built for the (already
+    /// updated) desired access mode, resuming at the frame the output
+    /// actually consumed. Track ID, CUE range, queue order and the prepared
+    /// next entry are untouched; there is no seamless or bit-perfect claim
+    /// across the restart. Backend construction/configure failure stops the
+    /// output, reports the error, and returns the current entry (original
+    /// ID/CUE range) to the queue front ahead of the prepared next entry;
+    /// other playback failures keep the usual `report_failure` behavior.
+    fn restart_current_for_access(&mut self) -> Result<(), PlayerError> {
+        let Some(playback) = self.playback.take() else {
+            return Ok(());
+        };
+        self.reset_shared_cancel();
+        let resume_frame = consumed_frame(&playback, &self.counters);
+        let start_sample = playback.start_sample;
+        let end_frames = playback.end_frames;
+        let mut decoder = playback.decoder;
+        let mut target = start_sample + resume_frame;
+        if let Some(end_frames) = end_frames {
+            target = target.min(start_sample + end_frames);
+        }
+        decoder.seek_to_frame(target)?;
+        if let Err(error) = self.reconstruct_output() {
+            self.fail_access_switch(&error);
+            return Ok(());
+        }
+        self.emit(PlayerEvent::Reconfiguring);
+        let (output_spec, conversion, buffers) =
+            match self.configure_after_access_change(decoder.as_ref()) {
+                Ok(configured) => configured,
+                Err(error) => {
+                    let _ = self.output.stop();
+                    self.fail_access_switch(&error);
+                    return Ok(());
+                }
+            };
+        let source = decoded_spec(decoder.as_ref());
+        let (producer, consumer) =
+            rtrb::RingBuffer::new(Self::ring_bytes(buffers, output_spec.bytes_per_frame()));
+        let mut playback = Playback {
+            decoder,
+            producer,
+            output: output_spec.clone(),
+            source,
+            buffers,
+            written_frames: 0,
+            start_sample,
+            end_frames,
+            span_written: resume_frame,
+            position_base_frames: resume_frame,
+            ring_track_start_frames: 0,
+            scratch: Vec::new(),
+            pending_offset: 0,
+            pending_frames: 0,
+            packing: Packing::for_output(&output_spec, conversion),
+        };
+        self.counters = Arc::new(OutputCounters::default());
+        self.reported_xruns = 0;
+        self.prefill(&mut playback)?;
+        self.output.start(consumer, Arc::clone(&self.counters))?;
+        if let Some(track) = &self.current {
+            self.emit(PlayerEvent::Playing {
+                track: track.id,
+                output: output_spec,
+                source,
+                buffers,
+                converted: conversion.converted(),
+                shared_playback: self.active_shared(),
+            });
+            self.emit(PlayerEvent::Duration {
+                track: track.id,
+                total_frames: playback_total(&playback),
+            });
+            self.emit(PlayerEvent::Position {
+                track: track.id,
+                frame: resume_frame,
+            });
+        }
+        self.playback = Some(playback);
+        // Queue identity is unchanged; refresh the snapshot so observers
+        // see the same IDs/order survive the mode switch.
+        self.emit_queue_changed();
+        Ok(())
+    }
+
+    /// Backend-side failure of an access-mode switch: stop, report, and park
+    /// the current entry (original ID and CUE range) at the queue front,
+    /// ahead of the prepared next entry. The audible track is cleared and
+    /// the desired mode retained, so the next Play reopens the entry from
+    /// its CUE start in the desired mode instead of silently skipping it or
+    /// resuming through the old backend.
+    fn fail_access_switch(&mut self, error: &PlayerError) {
+        self.playback = None;
+        self.suspended = None;
+        self.boundary = None;
+        let _ = self.output.stop();
+        self.clear_shared_stall();
+        let track = self.current.take();
+        self.emit(PlayerEvent::Error {
+            track: track.as_ref().map(|track| track.id),
+            kind: error.clone(),
+        });
+        if let Some(prepared) = self.prepared.take() {
+            self.queue.push_front(prepared.track);
+        }
+        if let Some(track) = track {
+            self.queue.push_front(track);
+        }
+        self.audible = None;
+        self.emit_queue_changed();
     }
 
     fn preopen_next(&mut self) {
@@ -1433,6 +1782,7 @@ impl<O: AudioOutput> Worker<O> {
                 source: playback.source,
                 buffers: playback.buffers,
                 converted: playback.packing.converted(),
+                shared_playback: self.active_shared(),
             });
             self.emit(PlayerEvent::Duration {
                 track,
@@ -1443,8 +1793,15 @@ impl<O: AudioOutput> Worker<O> {
         // audible; refresh the queue snapshot only now.
         self.audible = self.current.clone();
         self.emit_queue_changed();
+        // An access-mode switch requested while this track was committed but
+        // not yet audible applies now, resuming the now-audible track.
+        if self.output_access != self.access
+            && self.playback.is_some()
+            && let Err(error) = self.restart_current_for_access()
+        {
+            self.report_failure(&error);
+        }
     }
-
 
     fn pump(&mut self) -> Result<Pump, PlayerError> {
         if self.counters.fault.load(Ordering::Relaxed) {
@@ -1467,7 +1824,7 @@ impl<O: AudioOutput> Worker<O> {
                 if !flush_pending(playback, &self.msgs, &mut self.pending, &self.counters)? {
                     return Ok(Pump::Waiting);
                 }
-                position = Some(playback.written_frames);
+                position = Some(playback_position(playback));
                 Pump::Active
             } else {
                 let remaining = span_remaining(playback);
@@ -1491,10 +1848,11 @@ impl<O: AudioOutput> Worker<O> {
                             &mut playback.scratch,
                             block,
                         )?;
-                        if !flush_pending(playback, &self.msgs, &mut self.pending, &self.counters)? {
+                        if !flush_pending(playback, &self.msgs, &mut self.pending, &self.counters)?
+                        {
                             return Ok(Pump::Waiting);
                         }
-                        position = Some(playback.written_frames);
+                        position = Some(playback_position(playback));
                         Pump::Active
                     }
                     None => self.end_of_track()?,
@@ -1522,10 +1880,7 @@ impl<O: AudioOutput> Worker<O> {
             // Seamless only when the full decoded spec matches: PCM specs as
             // before; DSD on both bit rate and layout. A DSD<->PCM boundary
             // or a DSD rate change takes the reconfigure path below.
-            let same_spec = match (
-                playback.decoder.dsd_spec(),
-                prepared.decoder.dsd_spec(),
-            ) {
+            let same_spec = match (playback.decoder.dsd_spec(), prepared.decoder.dsd_spec()) {
                 (Some(active), Some(next)) => active == next,
                 (None, None) => playback.decoder.spec() == prepared.decoder.spec(),
                 _ => false,
@@ -1553,6 +1908,11 @@ impl<O: AudioOutput> Worker<O> {
                 playback.start_sample = start_sample;
                 playback.end_frames = end_frames;
                 playback.span_written = 0;
+                // The new track's position base resets at the committed
+                // boundary; resume accounting subtracts it from the output's
+                // cumulative played count.
+                playback.position_base_frames = 0;
+                playback.ring_track_start_frames = boundary;
                 self.current = Some(prepared.track.clone());
                 self.publish_track(prepared.track.id, prepared.stall);
                 self.boundary = Some((prepared.track.id, boundary));
@@ -1634,6 +1994,8 @@ pub struct PlayerEngine<O: AudioOutput> {
     output_factory: OutputFactory<O>,
     decoder_factory: DecoderFactory,
     device: DeviceId,
+    /// Initial output access mode; the initial `output` was built with it.
+    access: OutputAccess,
     /// DAC timing overrides; `None` derives rate-relative defaults per track.
     period_frames: Option<u32>,
     buffer_frames: Option<u32>,
@@ -1651,6 +2013,7 @@ impl<O: AudioOutput + 'static> PlayerEngine<O> {
         output: O,
         output_factory: OutputFactory<O>,
         device: DeviceId,
+        access: OutputAccess,
         period_frames: Option<u32>,
         buffer_frames: Option<u32>,
         float_to_int: bool,
@@ -1664,6 +2027,7 @@ impl<O: AudioOutput + 'static> PlayerEngine<O> {
             output_factory,
             decoder_factory,
             device,
+            access,
             period_frames,
             buffer_frames,
             float_to_int,
@@ -1694,6 +2058,8 @@ impl<O: AudioOutput + 'static> PlayerEngine<O> {
             output_factory: self.output_factory,
             decoder_factory: self.decoder_factory,
             device: self.device,
+            access: self.access,
+            output_access: self.access,
             period_frames: self.period_frames,
             buffer_frames: self.buffer_frames,
             float_to_int: self.float_to_int,
@@ -1778,7 +2144,9 @@ impl Coordinator {
                 WorkerMsg::JumpToQueueEntry(id)
             }
             PlayerCommand::RemoveQueueEntry(id) => WorkerMsg::RemoveQueueEntry(id),
-            PlayerCommand::MoveQueueEntry { id, before } => WorkerMsg::MoveQueueEntry { id, before },
+            PlayerCommand::MoveQueueEntry { id, before } => {
+                WorkerMsg::MoveQueueEntry { id, before }
+            }
             PlayerCommand::SeekFrame(frame) => {
                 self.cancel_current();
                 WorkerMsg::SeekFrame(frame)
@@ -1789,6 +2157,12 @@ impl Coordinator {
             }
             PlayerCommand::SetFloatToInt(enabled) => WorkerMsg::SetFloatToInt(enabled),
             PlayerCommand::SetIntToFloat(enabled) => WorkerMsg::SetIntToFloat(enabled),
+            PlayerCommand::SetSharedPlayback(enabled) => {
+                // A blocked source read must unwind before the worker
+                // re-seeks the current decoder for the mode switch.
+                self.cancel_current();
+                WorkerMsg::SetSharedPlayback(enabled)
+            }
             PlayerCommand::SetTiming {
                 period_frames,
                 buffer_frames,
@@ -1868,15 +2242,15 @@ impl Coordinator {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use parking_lot::Mutex;
+    use sointty_core::{
+        ChannelLayout, DecodedBlock, DecodedPcm, DecodedSpec, DeviceFormat, DopPacker, DsdSpec,
+        SampleEncoding, StreamSpec,
+    };
     use std::collections::HashMap;
     use std::io;
     use std::io::Read as _;
-    use parking_lot::Mutex;
     use std::sync::atomic::{AtomicBool, AtomicU64};
-    use sointty_core::{
-        ChannelLayout, DecodedBlock, DecodedSpec, DecodedPcm, DeviceFormat, DopPacker, DsdSpec,
-        SampleEncoding, StreamSpec,
-    };
 
     const FRAME_BYTES: usize = 4; // S16 stereo
 
@@ -1936,9 +2310,9 @@ mod tests {
         let mut next = 0u64;
         while next < total_per_channel {
             let frames = (total_per_channel - next).min(512) as usize;
-            out.extend((0..frames * channels).map(|i| {
-                (i as u8).wrapping_mul(31).wrapping_add(seed)
-            }));
+            out.extend(
+                (0..frames * channels).map(|i| (i as u8).wrapping_mul(31).wrapping_add(seed)),
+            );
             next += frames as u64;
         }
         out
@@ -2023,7 +2397,6 @@ mod tests {
             Some(self.total_frames)
         }
 
-
         fn dsd_spec(&self) -> Option<DsdSpec> {
             self.dsd
         }
@@ -2066,6 +2439,18 @@ mod tests {
         }
     }
 
+    /// Fake backend lifecycle, tagged with the access mode the backend was
+    /// constructed for. Switching tests assert ordering (old stop before
+    /// new configure) and absence of old-mode fallback after a failure.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum BackendEvent {
+        Construct(OutputAccess),
+        Configure(OutputAccess),
+        Start(OutputAccess),
+        Stop(OutputAccess),
+        Drop(OutputAccess),
+    }
+
     #[derive(Default)]
     struct FakeCalls {
         configures: usize,
@@ -2076,10 +2461,13 @@ mod tests {
         played_total: u64,
         /// Buffer timing of every configure call, in order.
         buffers_seen: Vec<BufferConfig>,
+        backend_events: Vec<BackendEvent>,
     }
 
     struct FakeOutput {
         calls: Arc<Mutex<FakeCalls>>,
+        access: OutputAccess,
+        reject_configure: Option<Arc<AtomicBool>>,
         stop_flag: Arc<AtomicBool>,
         /// True: the fake endpoint is float-only (like macOS internal
         /// speakers), so integer streams negotiate the int-to-F32 fallback.
@@ -2105,9 +2493,16 @@ mod tests {
             dsd_mode: DeviceFormat,
             float_only: bool,
             drained: Arc<Mutex<Vec<u8>>>,
+            access: OutputAccess,
         ) -> Self {
+            calls
+                .lock()
+                .backend_events
+                .push(BackendEvent::Construct(access));
             Self {
                 calls,
+                access,
+                reject_configure: None,
                 stop_flag: Arc::new(AtomicBool::new(false)),
                 drain: None,
                 dsd_mode,
@@ -2125,6 +2520,10 @@ mod tests {
             if let Some(drain) = self.drain.take() {
                 let _ = drain.join();
             }
+            self.calls
+                .lock()
+                .backend_events
+                .push(BackendEvent::Drop(self.access));
         }
     }
 
@@ -2138,6 +2537,21 @@ mod tests {
                 let mut calls = self.calls.lock();
                 calls.configures += 1;
                 calls.buffers_seen.push(buffers);
+                calls
+                    .backend_events
+                    .push(BackendEvent::Configure(self.access));
+            }
+            if self
+                .reject_configure
+                .as_ref()
+                .is_some_and(|flag| flag.load(Ordering::SeqCst))
+            {
+                return Err(PlayerError::UnsupportedFormat {
+                    rate_hz: input.rate_hz,
+                    channels: input.layout.channels,
+                    encoding: input.encoding,
+                    reason: "fake backend rejected this access mode",
+                });
             }
             let (format, valid_bits) = match (input.encoding, self.float_only, self.float_ioproc) {
                 (SampleEncoding::S16, false, false) => (DeviceFormat::S16Le, 16),
@@ -2148,12 +2562,14 @@ mod tests {
                 (SampleEncoding::S16 | SampleEncoding::S24 | SampleEncoding::S32, false, true) => {
                     (DeviceFormat::F32Le, 32)
                 }
-                _ => return Err(PlayerError::UnsupportedFormat {
-                    rate_hz: input.rate_hz,
-                    channels: input.layout.channels,
-                    encoding: input.encoding,
-                    reason: "fake output supports only S16/S32, or only F32 in float-only mode",
-                }),
+                _ => {
+                    return Err(PlayerError::UnsupportedFormat {
+                        rate_hz: input.rate_hz,
+                        channels: input.layout.channels,
+                        encoding: input.encoding,
+                        reason: "fake output supports only S16/S32, or only F32 in float-only mode",
+                    });
+                }
             };
             let output = OutputSpec {
                 device: "fake".to_owned(),
@@ -2212,6 +2628,7 @@ mod tests {
                 let mut calls = self.calls.lock();
                 calls.occupied_at_start.push(consumer.slots());
                 calls.starts += 1;
+                calls.backend_events.push(BackendEvent::Start(self.access));
             }
             self.stop_flag.store(false, Ordering::Relaxed);
             let stop_flag = Arc::clone(&self.stop_flag);
@@ -2241,7 +2658,10 @@ mod tests {
         }
 
         fn stop(&mut self) -> Result<(), PlayerError> {
-            self.calls.lock().stops += 1;
+            let mut calls = self.calls.lock();
+            calls.stops += 1;
+            calls.backend_events.push(BackendEvent::Stop(self.access));
+            drop(calls);
             self.stop_flag.store(true, Ordering::Relaxed);
             if let Some(drain) = self.drain.take() {
                 let _ = drain.join();
@@ -2310,7 +2730,15 @@ mod tests {
 
     /// Engine without timing overrides: per-rate Auto defaults.
     fn spawn_engine_auto(plan: HashMap<PathBuf, FakeTrack>) -> Harness {
-        spawn_engine_timed(plan, Duration::from_secs(5), DeviceFormat::Dop24, false, false, None, None)
+        spawn_engine_timed(
+            plan,
+            Duration::from_secs(5),
+            DeviceFormat::Dop24,
+            false,
+            false,
+            None,
+            None,
+        )
     }
 
     /// Engine whose fake endpoint is float-only (macOS internal speakers).
@@ -2355,13 +2783,20 @@ mod tests {
         let seeks = Arc::new(Mutex::new(Vec::new()));
         let release = Arc::new(AtomicBool::new(true));
         let drained = Arc::new(Mutex::new(Vec::new()));
-        let mut output = FakeOutput::new(Arc::clone(&calls), dsd_mode, float_only, Arc::clone(&drained));
+        let mut output = FakeOutput::new(
+            Arc::clone(&calls),
+            dsd_mode,
+            float_only,
+            Arc::clone(&drained),
+            OutputAccess::Direct,
+        );
         output.float_ioproc = float_ioproc;
         let decoder_factory = fake_decoder_factory(plan, Arc::clone(&seeks), Arc::clone(&release));
         let engine = PlayerEngine::new(
             output,
-            Box::new(|_| Err(PlayerError::Output)),
+            Box::new(|_, _| Err(PlayerError::Output)),
             "fake".to_owned(),
+            OutputAccess::Direct,
             period_frames,
             buffer_frames,
             false,
@@ -2380,6 +2815,84 @@ mod tests {
             drained,
             player: Some(player),
         }
+    }
+
+    /// Access-aware fake factory for end-to-end engine switch tests. The
+    /// returned flags can fail construction/configure once and then be
+    /// cleared to verify that the next Play retries the same entry in the
+    /// desired mode instead of falling back to the old backend.
+    fn spawn_engine_access(
+        plan: HashMap<PathBuf, FakeTrack>,
+        initial_access: OutputAccess,
+        reject_shared_construct: bool,
+        reject_shared_configure: bool,
+    ) -> (Harness, Arc<AtomicBool>, Arc<AtomicBool>) {
+        let (command_tx, command_rx) = crossbeam_channel::unbounded();
+        let (event_tx, event_rx) = crossbeam_channel::unbounded();
+        let calls = Arc::new(Mutex::new(FakeCalls::default()));
+        let seeks = Arc::new(Mutex::new(Vec::new()));
+        let release = Arc::new(AtomicBool::new(true));
+        let drained = Arc::new(Mutex::new(Vec::new()));
+        let reject_construct = Arc::new(AtomicBool::new(reject_shared_construct));
+        let reject_configure = Arc::new(AtomicBool::new(reject_shared_configure));
+        let mut output = FakeOutput::new(
+            Arc::clone(&calls),
+            DeviceFormat::Dop24,
+            false,
+            Arc::clone(&drained),
+            initial_access,
+        );
+        if initial_access == OutputAccess::Shared {
+            output.reject_configure = Some(Arc::clone(&reject_configure));
+        }
+        let factory_calls = Arc::clone(&calls);
+        let factory_drained = Arc::clone(&drained);
+        let factory_reject_construct = Arc::clone(&reject_construct);
+        let factory_reject_configure = Arc::clone(&reject_configure);
+        let factory: OutputFactory<FakeOutput> = Box::new(move |_, access| {
+            if access == OutputAccess::Shared && factory_reject_construct.load(Ordering::SeqCst) {
+                return Err(PlayerError::DeviceBusy);
+            }
+            let mut output = FakeOutput::new(
+                Arc::clone(&factory_calls),
+                DeviceFormat::Dop24,
+                false,
+                Arc::clone(&factory_drained),
+                access,
+            );
+            if access == OutputAccess::Shared {
+                output.reject_configure = Some(Arc::clone(&factory_reject_configure));
+            }
+            Ok(output)
+        });
+        let decoder_factory = fake_decoder_factory(plan, Arc::clone(&seeks), Arc::clone(&release));
+        let engine = PlayerEngine::new(
+            output,
+            factory,
+            "fake".to_owned(),
+            initial_access,
+            Some(test_buffers().period_frames),
+            Some(test_buffers().buffer_frames),
+            false,
+            false,
+            decoder_factory,
+            event_tx,
+            Duration::from_secs(5),
+        );
+        let player = std::thread::spawn(move || engine.run(command_rx));
+        (
+            Harness {
+                commands: command_tx,
+                events: event_rx,
+                calls,
+                seeks,
+                release,
+                drained,
+                player: Some(player),
+            },
+            reject_construct,
+            reject_configure,
+        )
     }
 
     /// Build the fake decoder factory shared by the engine harness and the
@@ -2430,12 +2943,11 @@ mod tests {
                     )
                 }
             };
-            let (source, stall) =
-                sointty_source::ReadAheadSource::with_reader(
-                    GatedReader::new(Arc::clone(&release)),
-                    None,
-                    1 << 20,
-                );
+            let (source, stall) = sointty_source::ReadAheadSource::with_reader(
+                GatedReader::new(Arc::clone(&release)),
+                None,
+                1 << 20,
+            );
             Ok(OpenedDecoder {
                 decoder: Box::new(FakeDecoder {
                     spec,
@@ -2474,7 +2986,12 @@ mod tests {
     /// engine thread.
     fn make_test_worker(
         plan: HashMap<PathBuf, FakeTrack>,
-    ) -> (Worker<FakeOutput>, Receiver<PlayerEvent>, Arc<Mutex<FakeCalls>>) {
+    ) -> (
+        Worker<FakeOutput>,
+        Receiver<PlayerEvent>,
+        Arc<Mutex<FakeCalls>>,
+        Arc<Mutex<Vec<u64>>>,
+    ) {
         let (event_tx, event_rx) = crossbeam_channel::unbounded();
         let (_msg_tx, msg_rx) = crossbeam_channel::unbounded();
         let calls = Arc::new(Mutex::new(FakeCalls::default()));
@@ -2486,6 +3003,7 @@ mod tests {
             DeviceFormat::Dop24,
             false,
             Arc::clone(&drained),
+            OutputAccess::Direct,
         );
         let worker = Worker {
             queue: VecDeque::new(),
@@ -2499,9 +3017,11 @@ mod tests {
             suspended: None,
             pending: None,
             output,
-            output_factory: Box::new(|_| Err(PlayerError::Output)),
-            decoder_factory: fake_decoder_factory(plan, seeks, release),
+            output_factory: Box::new(|_, _| Err(PlayerError::Output)),
+            decoder_factory: fake_decoder_factory(plan, Arc::clone(&seeks), release),
             device: "fake".to_owned(),
+            access: OutputAccess::Direct,
+            output_access: OutputAccess::Direct,
             period_frames: Some(test_buffers().period_frames),
             buffer_frames: Some(test_buffers().buffer_frames),
             float_to_int: false,
@@ -2512,7 +3032,88 @@ mod tests {
             msgs: msg_rx,
             shared: Arc::new(std::sync::Mutex::new(TrackState::default())),
         };
-        (worker, event_rx, calls)
+        (worker, event_rx, calls, seeks)
+    }
+
+    /// A deterministic worker state at a committed gapless boundary: track
+    /// 2 is already in the ring, track 1 is still audible, track 3 is
+    /// prepared, and only 500 of the old track's 512 frames have been
+    /// consumed. The next track's CUE span starts at CD frame 2. The old
+    /// backend need not run: tests set the consumed counter explicitly,
+    /// then exercise the same worker transition code as the threaded engine.
+    fn make_committed_boundary_worker() -> (
+        Worker<FakeOutput>,
+        Receiver<PlayerEvent>,
+        Arc<Mutex<FakeCalls>>,
+        Arc<Mutex<Vec<u64>>>,
+        sointty_core::CueRange,
+    ) {
+        let mut plan = HashMap::new();
+        plan.insert(
+            PathBuf::from("b.flac"),
+            FakeTrack::Pcm(test_spec(44_100), 500_000),
+        );
+        plan.insert(
+            PathBuf::from("c.flac"),
+            FakeTrack::Pcm(test_spec(44_100), 512),
+        );
+        let (mut worker, events, calls, seeks) = make_test_worker(plan);
+        let factory_calls = Arc::clone(&calls);
+        let factory_drained = Arc::clone(&worker.output.drained);
+        worker.output_factory = Box::new(move |_, access| {
+            Ok(FakeOutput::new(
+                Arc::clone(&factory_calls),
+                DeviceFormat::Dop24,
+                false,
+                Arc::clone(&factory_drained),
+                access,
+            ))
+        });
+        let range = sointty_core::CueRange {
+            start_cd: 2,
+            end_cd: Some(600),
+        };
+        let start_sample = cd_frames_to_samples(range.start_cd, 44_100);
+        let end_frames = cd_frames_to_samples(600, 44_100) - start_sample;
+        let b = (worker.decoder_factory)(Path::new("b.flac")).unwrap();
+        let c = (worker.decoder_factory)(Path::new("c.flac")).unwrap();
+        worker.current = Some(queued(2, "b.flac", Some(range)));
+        worker.audible = Some(queued(1, "a.flac", None));
+        worker.prepared = Some(PreparedNext {
+            track: queued(3, "c.flac", None),
+            decoder: c.decoder,
+            stall: c.stall,
+        });
+        worker.boundary = Some((2, 512));
+        worker.next_track_id = 3;
+        let buffers = test_buffers();
+        let output = worker
+            .output
+            .configure(&test_spec(44_100), buffers)
+            .unwrap();
+        let (producer, _old_consumer) = rtrb::RingBuffer::<u8>::new(
+            Worker::<FakeOutput>::ring_bytes(buffers, output.bytes_per_frame()),
+        );
+        let source = decoded_spec(b.decoder.as_ref());
+        worker.playback = Some(Playback {
+            decoder: b.decoder,
+            producer,
+            output,
+            source,
+            buffers,
+            written_frames: 600,
+            start_sample,
+            end_frames: Some(end_frames),
+            span_written: 88,
+            position_base_frames: 0,
+            ring_track_start_frames: 512,
+            scratch: Vec::new(),
+            pending_offset: 0,
+            pending_frames: 0,
+            packing: Packing::Pcm,
+        });
+        worker.counters.played_frames.store(500, Ordering::Relaxed);
+        (worker, events, calls, seeks, range)
     }
 
     /// Receive the next non-snapshot event. `QueueChanged` snapshots are
@@ -2530,7 +3131,12 @@ mod tests {
     }
 
     /// Receive the next `QueueChanged` snapshot, skipping anything else.
-    fn recv_queue_changed(events: &Receiver<PlayerEvent>) -> (Option<sointty_core::QueueItem>, Vec<sointty_core::QueueItem>) {
+    fn recv_queue_changed(
+        events: &Receiver<PlayerEvent>,
+    ) -> (
+        Option<sointty_core::QueueItem>,
+        Vec<sointty_core::QueueItem>,
+    ) {
         loop {
             let event = events
                 .recv_timeout(Duration::from_secs(5))
@@ -2541,13 +3147,14 @@ mod tests {
         }
     }
 
-
-
     /// Receive `QueueChanged` snapshots until `predicate` matches.
     fn recv_queue_until(
         events: &Receiver<PlayerEvent>,
         predicate: impl Fn(&Option<sointty_core::QueueItem>, &[sointty_core::QueueItem]) -> bool,
-    ) -> (Option<sointty_core::QueueItem>, Vec<sointty_core::QueueItem>) {
+    ) -> (
+        Option<sointty_core::QueueItem>,
+        Vec<sointty_core::QueueItem>,
+    ) {
         loop {
             let (audible, pending) = recv_queue_changed(events);
             if predicate(&audible, &pending) {
@@ -2609,8 +3216,14 @@ mod tests {
     #[test]
     fn same_spec_tracks_swap_without_reconfigure() {
         let mut plan = HashMap::new();
-        plan.insert(PathBuf::from("a.flac"), FakeTrack::Pcm(test_spec(44_100), 1024));
-        plan.insert(PathBuf::from("b.flac"), FakeTrack::Pcm(test_spec(44_100), 512));
+        plan.insert(
+            PathBuf::from("a.flac"),
+            FakeTrack::Pcm(test_spec(44_100), 1024),
+        );
+        plan.insert(
+            PathBuf::from("b.flac"),
+            FakeTrack::Pcm(test_spec(44_100), 512),
+        );
         let harness = spawn_engine(plan);
         enqueue(&harness, "a.flac");
         enqueue(&harness, "b.flac");
@@ -2622,7 +3235,10 @@ mod tests {
             PlayerEvent::Reconfiguring
         ));
         let first = recv_event(&harness.events);
-        let PlayerEvent::Playing { track: first_id, .. } = first else {
+        let PlayerEvent::Playing {
+            track: first_id, ..
+        } = first
+        else {
             panic!("expected Playing, got {first:?}");
         };
         let tags = recv_event(&harness.events);
@@ -2684,8 +3300,14 @@ mod tests {
     #[test]
     fn different_rate_track_reconfigures_output() {
         let mut plan = HashMap::new();
-        plan.insert(PathBuf::from("a.flac"), FakeTrack::Pcm(test_spec(44_100), 512));
-        plan.insert(PathBuf::from("b.flac"), FakeTrack::Pcm(test_spec(48_000), 512));
+        plan.insert(
+            PathBuf::from("a.flac"),
+            FakeTrack::Pcm(test_spec(44_100), 512),
+        );
+        plan.insert(
+            PathBuf::from("b.flac"),
+            FakeTrack::Pcm(test_spec(48_000), 512),
+        );
         let harness = spawn_engine(plan);
         enqueue(&harness, "a.flac");
         enqueue(&harness, "b.flac");
@@ -2694,7 +3316,12 @@ mod tests {
         let first = recv_event(&harness.events);
         assert!(matches!(first, PlayerEvent::Reconfiguring));
         let first = recv_event(&harness.events);
-        let PlayerEvent::Playing { track: first_id, output, .. } = first else {
+        let PlayerEvent::Playing {
+            track: first_id,
+            output,
+            ..
+        } = first
+        else {
             panic!("expected Playing, got {first:?}");
         };
         assert_eq!(output.rate_hz, 44_100);
@@ -2730,17 +3357,17 @@ mod tests {
     #[test]
     fn seek_replaces_ring_and_reports_position() {
         let mut plan = HashMap::new();
-        plan.insert(PathBuf::from("a.flac"), FakeTrack::Pcm(test_spec(44_100), 4096));
+        plan.insert(
+            PathBuf::from("a.flac"),
+            FakeTrack::Pcm(test_spec(44_100), 4096),
+        );
         let harness = spawn_engine(plan);
         enqueue(&harness, "a.flac");
         harness.commands.send(PlayerCommand::Play).unwrap();
 
         let mut started = false;
         for _ in 0..16 {
-            if matches!(
-                recv_event(&harness.events),
-                PlayerEvent::Playing { .. }
-            ) {
+            if matches!(recv_event(&harness.events), PlayerEvent::Playing { .. }) {
                 started = true;
                 break;
             }
@@ -2748,7 +3375,10 @@ mod tests {
         assert!(started, "expected first Playing");
         recv_event(&harness.events); // Tags
 
-        harness.commands.send(PlayerCommand::SeekFrame(1000)).unwrap();
+        harness
+            .commands
+            .send(PlayerCommand::SeekFrame(1000))
+            .unwrap();
         let mut position = None;
         for _ in 0..64 {
             match recv_event(&harness.events) {
@@ -2775,7 +3405,10 @@ mod tests {
     #[test]
     fn start_prefills_ring_before_output_start() {
         let mut plan = HashMap::new();
-        plan.insert(PathBuf::from("a.flac"), FakeTrack::Pcm(test_spec(44_100), 8192));
+        plan.insert(
+            PathBuf::from("a.flac"),
+            FakeTrack::Pcm(test_spec(44_100), 8192),
+        );
         let harness = spawn_engine(plan);
         enqueue(&harness, "a.flac");
         harness.commands.send(PlayerCommand::Play).unwrap();
@@ -2792,8 +3425,8 @@ mod tests {
         {
             let calls = harness.calls.lock();
             let occupied = calls.occupied_at_start[0];
-            let prefill_frames = (2 * test_buffers().period_frames as u64)
-                .min(test_buffers().ring_frames as u64);
+            let prefill_frames =
+                (2 * test_buffers().period_frames as u64).min(test_buffers().ring_frames as u64);
             assert!(
                 occupied as u64 >= prefill_frames * FRAME_BYTES as u64,
                 "ring held {occupied} bytes at start, expected at least {}",
@@ -2807,7 +3440,10 @@ mod tests {
     #[test]
     fn prefilled_short_track_reports_final_position() {
         let mut plan = HashMap::new();
-        plan.insert(PathBuf::from("short.flac"), FakeTrack::Pcm(test_spec(44_100), 512));
+        plan.insert(
+            PathBuf::from("short.flac"),
+            FakeTrack::Pcm(test_spec(44_100), 512),
+        );
         let harness = spawn_engine(plan);
         enqueue(&harness, "short.flac");
         harness.commands.send(PlayerCommand::Play).unwrap();
@@ -2836,9 +3472,14 @@ mod tests {
         let harness = spawn_engine(plan);
         enqueue(&harness, "large.flac");
         harness.commands.send(PlayerCommand::Play).unwrap();
-        recv_until(&harness.events, |event| matches!(event, PlayerEvent::EndOfQueue));
+        recv_until(&harness.events, |event| {
+            matches!(event, PlayerEvent::EndOfQueue)
+        });
         let calls = harness.calls.lock();
-        assert_eq!(calls.played_total, 16_384, "entire block reached the output");
+        assert_eq!(
+            calls.played_total, 16_384,
+            "entire block reached the output"
+        );
         assert!(calls.occupied_at_start[0] >= test_buffers().ring_frames as usize * FRAME_BYTES);
         drop(calls);
         assert_eq!(harness.drained.lock().len(), 16_384 * FRAME_BYTES);
@@ -2849,7 +3490,10 @@ mod tests {
     #[test]
     fn ranged_track_plays_exact_span() {
         let mut plan = HashMap::new();
-        plan.insert(PathBuf::from("a.flac"), FakeTrack::Pcm(test_spec(44_100), 588 * 10));
+        plan.insert(
+            PathBuf::from("a.flac"),
+            FakeTrack::Pcm(test_spec(44_100), 588 * 10),
+        );
         let harness = spawn_engine(plan);
         // cd 2..4 at 44.1 kHz = samples 1176..2352, span 1176 = 2x512 + 152,
         // so the last 512-frame block must be truncated.
@@ -2889,7 +3533,10 @@ mod tests {
     #[test]
     fn adjacent_cue_ranges_are_gapless() {
         let mut plan = HashMap::new();
-        plan.insert(PathBuf::from("a.flac"), FakeTrack::Pcm(test_spec(44_100), 588 * 10));
+        plan.insert(
+            PathBuf::from("a.flac"),
+            FakeTrack::Pcm(test_spec(44_100), 588 * 10),
+        );
         let harness = spawn_engine(plan);
         enqueue_ranged(
             &harness,
@@ -2912,14 +3559,20 @@ mod tests {
         let first = recv_event(&harness.events);
         assert!(matches!(first, PlayerEvent::Reconfiguring));
         let first = recv_event(&harness.events);
-        let PlayerEvent::Playing { track: first_id, .. } = first else {
+        let PlayerEvent::Playing {
+            track: first_id, ..
+        } = first
+        else {
             panic!("expected Playing, got {first:?}");
         };
         assert_eq!(first_id, 1);
         recv_event(&harness.events); // Tags for track 1
         assert!(matches!(
             recv_event(&harness.events),
-            PlayerEvent::Duration { track: 1, total_frames: Some(1176) }
+            PlayerEvent::Duration {
+                track: 1,
+                total_frames: Some(1176)
+            }
         ));
 
         // Track 2 is announced only after track 1's full span (1176 frames)
@@ -2940,21 +3593,18 @@ mod tests {
                             calls.played_total >= 1176,
                             "track 2 announced before track 1's span was consumed"
                         );
-                        assert_eq!(
-                            calls.configures, 1,
-                            "same-spec swap must not reconfigure"
-                        );
-                        assert_eq!(
-                            calls.starts, 1,
-                            "same-spec swap must not restart output"
-                        );
+                        assert_eq!(calls.configures, 1, "same-spec swap must not reconfigure");
+                        assert_eq!(calls.starts, 1, "same-spec swap must not restart output");
                     }
                 }
                 PlayerEvent::EndOfQueue => {
                     ended = true;
                     break;
                 }
-                PlayerEvent::Duration { track: 2, total_frames } => {
+                PlayerEvent::Duration {
+                    track: 2,
+                    total_frames,
+                } => {
                     second_duration = total_frames;
                 }
                 _ => {}
@@ -2978,7 +3628,10 @@ mod tests {
     #[test]
     fn seek_within_range_offsets_by_start() {
         let mut plan = HashMap::new();
-        plan.insert(PathBuf::from("a.flac"), FakeTrack::Pcm(test_spec(44_100), 588 * 10));
+        plan.insert(
+            PathBuf::from("a.flac"),
+            FakeTrack::Pcm(test_spec(44_100), 588 * 10),
+        );
         let harness = spawn_engine(plan);
         enqueue_ranged(
             &harness,
@@ -3004,7 +3657,10 @@ mod tests {
             "range start seek before playback"
         );
 
-        harness.commands.send(PlayerCommand::SeekFrame(100)).unwrap();
+        harness
+            .commands
+            .send(PlayerCommand::SeekFrame(100))
+            .unwrap();
         let mut sought = false;
         for _ in 0..64 {
             match recv_event(&harness.events) {
@@ -3027,9 +3683,18 @@ mod tests {
     #[test]
     fn fifo_order() {
         let mut plan = HashMap::new();
-        plan.insert(PathBuf::from("a.flac"), FakeTrack::Pcm(test_spec(44_100), 512));
-        plan.insert(PathBuf::from("b.flac"), FakeTrack::Pcm(test_spec(48_000), 512));
-        plan.insert(PathBuf::from("c.flac"), FakeTrack::Pcm(test_spec(44_100), 512));
+        plan.insert(
+            PathBuf::from("a.flac"),
+            FakeTrack::Pcm(test_spec(44_100), 512),
+        );
+        plan.insert(
+            PathBuf::from("b.flac"),
+            FakeTrack::Pcm(test_spec(48_000), 512),
+        );
+        plan.insert(
+            PathBuf::from("c.flac"),
+            FakeTrack::Pcm(test_spec(44_100), 512),
+        );
         let harness = spawn_engine(plan);
         enqueue(&harness, "a.flac");
         enqueue(&harness, "b.flac");
@@ -3044,11 +3709,7 @@ mod tests {
                     break;
                 }
             }
-            assert_eq!(
-                seen,
-                Some(expected),
-                "FIFO order: tracks must play 1, 2, 3"
-            );
+            assert_eq!(seen, Some(expected), "FIFO order: tracks must play 1, 2, 3");
         }
         harness.commands.send(PlayerCommand::Quit).unwrap();
         harness.join().unwrap();
@@ -3057,14 +3718,19 @@ mod tests {
     #[test]
     fn coordinator_responsive_during_blocked_decode() {
         let mut plan = HashMap::new();
-        plan.insert(PathBuf::from("a.flac"), FakeTrack::Pcm(test_spec(44_100), 1_000_000));
+        plan.insert(
+            PathBuf::from("a.flac"),
+            FakeTrack::Pcm(test_spec(44_100), 1_000_000),
+        );
         let harness = spawn_engine(plan);
         enqueue(&harness, "a.flac");
         harness.commands.send(PlayerCommand::Play).unwrap();
         recv_until(&harness.events, |event| {
             matches!(event, PlayerEvent::Playing { track: 1, .. })
         });
-        recv_until(&harness.events, |event| matches!(event, PlayerEvent::Tags { .. }));
+        recv_until(&harness.events, |event| {
+            matches!(event, PlayerEvent::Tags { .. })
+        });
 
         // Close the gate: the decoder's next read blocks in the source.
         harness.release.store(false, Ordering::Relaxed);
@@ -3103,14 +3769,19 @@ mod tests {
     #[test]
     fn stall_timeout_stops_and_resumes() {
         let mut plan = HashMap::new();
-        plan.insert(PathBuf::from("a.flac"), FakeTrack::Pcm(test_spec(44_100), 1_000_000));
+        plan.insert(
+            PathBuf::from("a.flac"),
+            FakeTrack::Pcm(test_spec(44_100), 1_000_000),
+        );
         let harness = spawn_engine_with_timeout(plan, Duration::from_millis(200));
         enqueue(&harness, "a.flac");
         harness.commands.send(PlayerCommand::Play).unwrap();
         recv_until(&harness.events, |event| {
             matches!(event, PlayerEvent::Playing { track: 1, .. })
         });
-        recv_until(&harness.events, |event| matches!(event, PlayerEvent::Tags { .. }));
+        recv_until(&harness.events, |event| {
+            matches!(event, PlayerEvent::Tags { .. })
+        });
 
         harness.release.store(false, Ordering::Relaxed);
         let stalled = recv_until(&harness.events, |event| {
@@ -3160,14 +3831,19 @@ mod tests {
     #[test]
     fn brief_stall_does_not_stop() {
         let mut plan = HashMap::new();
-        plan.insert(PathBuf::from("a.flac"), FakeTrack::Pcm(test_spec(44_100), 1_000_000));
+        plan.insert(
+            PathBuf::from("a.flac"),
+            FakeTrack::Pcm(test_spec(44_100), 1_000_000),
+        );
         let harness = spawn_engine_with_timeout(plan, Duration::from_millis(400));
         enqueue(&harness, "a.flac");
         harness.commands.send(PlayerCommand::Play).unwrap();
         recv_until(&harness.events, |event| {
             matches!(event, PlayerEvent::Playing { track: 1, .. })
         });
-        recv_until(&harness.events, |event| matches!(event, PlayerEvent::Tags { .. }));
+        recv_until(&harness.events, |event| {
+            matches!(event, PlayerEvent::Tags { .. })
+        });
 
         harness.release.store(false, Ordering::Relaxed);
         recv_until(&harness.events, |event| {
@@ -3200,8 +3876,14 @@ mod tests {
     #[test]
     fn next_during_stall_skips() {
         let mut plan = HashMap::new();
-        plan.insert(PathBuf::from("a.flac"), FakeTrack::Pcm(test_spec(44_100), 1_000_000));
-        plan.insert(PathBuf::from("b.flac"), FakeTrack::Pcm(test_spec(44_100), 512));
+        plan.insert(
+            PathBuf::from("a.flac"),
+            FakeTrack::Pcm(test_spec(44_100), 1_000_000),
+        );
+        plan.insert(
+            PathBuf::from("b.flac"),
+            FakeTrack::Pcm(test_spec(44_100), 512),
+        );
         let harness = spawn_engine_with_timeout(plan, Duration::from_millis(400));
         enqueue(&harness, "a.flac");
         enqueue(&harness, "b.flac");
@@ -3209,7 +3891,9 @@ mod tests {
         recv_until(&harness.events, |event| {
             matches!(event, PlayerEvent::Playing { track: 1, .. })
         });
-        recv_until(&harness.events, |event| matches!(event, PlayerEvent::Tags { .. }));
+        recv_until(&harness.events, |event| {
+            matches!(event, PlayerEvent::Tags { .. })
+        });
 
         harness.release.store(false, Ordering::Relaxed);
         recv_until(&harness.events, |event| {
@@ -3222,7 +3906,10 @@ mod tests {
         // prefill can read.
         let deadline = Instant::now() + Duration::from_secs(5);
         while harness.calls.lock().stops < 2 {
-            assert!(Instant::now() < deadline, "second output stop never happened");
+            assert!(
+                Instant::now() < deadline,
+                "second output stop never happened"
+            );
             std::thread::sleep(Duration::from_millis(5));
         }
         harness.release.store(true, Ordering::Relaxed);
@@ -3313,7 +4000,10 @@ mod tests {
             unreachable!()
         };
         assert_eq!(output.format, DeviceFormat::DsdU32Le);
-        assert_eq!(output.rate_hz, 88_200, "ALSA-style DSD_U32_LE rate for DSD64");
+        assert_eq!(
+            output.rate_hz, 88_200,
+            "ALSA-style DSD_U32_LE rate for DSD64"
+        );
         recv_until(&harness.events, |event| {
             matches!(event, PlayerEvent::Tags { track: 1, .. })
         });
@@ -3329,7 +4019,10 @@ mod tests {
         let mut expected = Vec::new();
         pack_native_dsd(&dsd_raw_stream("a.dsf", 1024, 2), 2, 4, &mut expected).unwrap();
         let drained = harness.drained.lock();
-        assert_eq!(*drained, expected, "native DSD slots must preserve every bit and channel");
+        assert_eq!(
+            *drained, expected,
+            "native DSD slots must preserve every bit and channel"
+        );
         drop(drained);
 
         harness.commands.send(PlayerCommand::Quit).unwrap();
@@ -3339,11 +4032,11 @@ mod tests {
     #[test]
     fn dsd_to_pcm_reconfigures() {
         let mut plan = HashMap::new();
+        plan.insert(PathBuf::from("a.dsf"), FakeTrack::Dsd(test_dsd_spec(), 512));
         plan.insert(
-            PathBuf::from("a.dsf"),
-            FakeTrack::Dsd(test_dsd_spec(), 512),
+            PathBuf::from("b.flac"),
+            FakeTrack::Pcm(test_spec(44_100), 512),
         );
-        plan.insert(PathBuf::from("b.flac"), FakeTrack::Pcm(test_spec(44_100), 512));
         let harness = spawn_engine_dsd(plan, DeviceFormat::Dop24);
         enqueue(&harness, "a.dsf");
         enqueue(&harness, "b.flac");
@@ -3420,7 +4113,10 @@ mod tests {
         });
         {
             let calls = harness.calls.lock();
-            assert_eq!(calls.dsd_configures, 2, "DSD bit-rate change must reconfigure");
+            assert_eq!(
+                calls.dsd_configures, 2,
+                "DSD bit-rate change must reconfigure"
+            );
             assert_eq!(calls.starts, 2, "DSD bit-rate change must restart output");
         }
 
@@ -3433,7 +4129,10 @@ mod tests {
         let mut plan = HashMap::new();
         // 1002 DSD bytes/channel = 501 DoP frames: odd phase at the
         // boundary, so restarting the marker at 0x05 would be detectable.
-        plan.insert(PathBuf::from("a.dsf"), FakeTrack::Dsd(test_dsd_spec(), 1002));
+        plan.insert(
+            PathBuf::from("a.dsf"),
+            FakeTrack::Dsd(test_dsd_spec(), 1002),
+        );
         plan.insert(PathBuf::from("b.dsf"), FakeTrack::Dsd(test_dsd_spec(), 520));
         let harness = spawn_engine_dsd(plan, DeviceFormat::Dop24);
         enqueue(&harness, "a.dsf");
@@ -3455,7 +4154,10 @@ mod tests {
                 calls.dsd_configures, 1,
                 "identical DSD specs must swap seamlessly"
             );
-            assert_eq!(calls.starts, 1, "identical DSD specs must not restart output");
+            assert_eq!(
+                calls.starts, 1,
+                "identical DSD specs must not restart output"
+            );
         }
         recv_until(&harness.events, |event| {
             matches!(event, PlayerEvent::EndOfQueue)
@@ -3479,7 +4181,10 @@ mod tests {
     #[test]
     fn dsd_cue_range_errors_and_skips() {
         let mut plan = HashMap::new();
-        plan.insert(PathBuf::from("a.dsf"), FakeTrack::Dsd(test_dsd_spec(), 1000));
+        plan.insert(
+            PathBuf::from("a.dsf"),
+            FakeTrack::Dsd(test_dsd_spec(), 1000),
+        );
         plan.insert(PathBuf::from("b.dsf"), FakeTrack::Dsd(test_dsd_spec(), 512));
         let harness = spawn_engine_dsd(plan, DeviceFormat::Dop24);
         enqueue_ranged(
@@ -3560,8 +4265,14 @@ mod tests {
         });
         {
             let calls = harness.calls.lock();
-            assert_eq!(calls.dsd_configures, 2, "prepared CUE track must not configure");
-            assert_eq!(calls.starts, 2, "third track starts after the rejected CUE track");
+            assert_eq!(
+                calls.dsd_configures, 2,
+                "prepared CUE track must not configure"
+            );
+            assert_eq!(
+                calls.starts, 2,
+                "third track starts after the rejected CUE track"
+            );
         }
 
         harness.commands.send(PlayerCommand::Quit).unwrap();
@@ -3586,13 +4297,19 @@ mod tests {
             matches!(event, PlayerEvent::Tags { track: 1, .. })
         });
 
-        harness.commands.send(PlayerCommand::SeekFrame(512)).unwrap();
+        harness
+            .commands
+            .send(PlayerCommand::SeekFrame(512))
+            .unwrap();
         recv_until(&harness.events, |event| {
             matches!(event, PlayerEvent::Position { frame: 512, .. })
         });
         {
             let calls = harness.calls.lock();
-            assert_eq!(calls.dsd_configures, 2, "seek must reconfigure via configure_dsd");
+            assert_eq!(
+                calls.dsd_configures, 2,
+                "seek must reconfigure via configure_dsd"
+            );
             assert_eq!(calls.configures, 0);
             assert_eq!(calls.starts, 2, "seek must restart the output");
         }
@@ -3604,7 +4321,9 @@ mod tests {
         // the bytes from the seek target: the marker phase restarts.
         let raw = dsd_raw_stream("a.dsf", 1024, 2);
         let mut expected = Vec::new();
-        DopPacker::new(2).pack(&raw[512 * 2..], &mut expected).unwrap();
+        DopPacker::new(2)
+            .pack(&raw[512 * 2..], &mut expected)
+            .unwrap();
         let drained = harness.drained.lock();
         assert!(
             drained.ends_with(&expected),
@@ -3621,12 +4340,21 @@ mod tests {
         // Regression: a track that failed to open killed the worker silently
         // — no Error event, every later command ignored, UI frozen until quit.
         let mut plan = HashMap::new();
-        plan.insert(PathBuf::from("good.flac"), FakeTrack::Pcm(test_spec(44_100), 512));
+        plan.insert(
+            PathBuf::from("good.flac"),
+            FakeTrack::Pcm(test_spec(44_100), 512),
+        );
         let harness = spawn_engine(plan);
         enqueue(&harness, "missing.mp3");
         harness.commands.send(PlayerCommand::Play).unwrap();
         let error = recv_until(&harness.events, |event| {
-            matches!(event, PlayerEvent::Error { kind: PlayerError::Decode, .. })
+            matches!(
+                event,
+                PlayerEvent::Error {
+                    kind: PlayerError::Decode,
+                    ..
+                }
+            )
         });
         assert!(
             matches!(error, PlayerEvent::Error { track: Some(1), .. }),
@@ -3650,13 +4378,22 @@ mod tests {
         let mut float = test_spec(44_100);
         float.encoding = SampleEncoding::F32;
         plan.insert(PathBuf::from("float.mp3"), FakeTrack::Pcm(float, 512));
-        plan.insert(PathBuf::from("good.wav"), FakeTrack::Pcm(test_spec(44_100), 512));
+        plan.insert(
+            PathBuf::from("good.wav"),
+            FakeTrack::Pcm(test_spec(44_100), 512),
+        );
         let harness = spawn_engine(plan);
         enqueue(&harness, "float.mp3");
         enqueue(&harness, "good.wav");
         harness.commands.send(PlayerCommand::Play).unwrap();
         let error = recv_until(&harness.events, |event| {
-            matches!(event, PlayerEvent::Error { kind: PlayerError::UnsupportedFormat { .. }, .. })
+            matches!(
+                event,
+                PlayerEvent::Error {
+                    kind: PlayerError::UnsupportedFormat { .. },
+                    ..
+                }
+            )
         });
         assert!(matches!(error, PlayerEvent::Error { track: Some(1), .. }));
         harness.commands.send(PlayerCommand::Next).unwrap();
@@ -3672,14 +4409,26 @@ mod tests {
         // Same regression through the automatic queue advance: the good first
         // track ends, advancing into the broken one must report, not die.
         let mut plan = HashMap::new();
-        plan.insert(PathBuf::from("a.flac"), FakeTrack::Pcm(test_spec(44_100), 512));
-        plan.insert(PathBuf::from("b.flac"), FakeTrack::Pcm(test_spec(44_100), 512));
+        plan.insert(
+            PathBuf::from("a.flac"),
+            FakeTrack::Pcm(test_spec(44_100), 512),
+        );
+        plan.insert(
+            PathBuf::from("b.flac"),
+            FakeTrack::Pcm(test_spec(44_100), 512),
+        );
         let harness = spawn_engine(plan);
         enqueue(&harness, "a.flac");
         enqueue(&harness, "missing.mp3");
         harness.commands.send(PlayerCommand::Play).unwrap();
         recv_until(&harness.events, |event| {
-            matches!(event, PlayerEvent::Error { kind: PlayerError::Decode, .. })
+            matches!(
+                event,
+                PlayerEvent::Error {
+                    kind: PlayerError::Decode,
+                    ..
+                }
+            )
         });
         // a.flac may finish before these arrive; the queue can empty and
         // restart track ids, so accept the next Playing whatever its id.
@@ -3694,7 +4443,10 @@ mod tests {
 
     #[test]
     fn float_compatibility_quantizes_and_preserves_channel_order() {
-        let spec = StreamSpec { encoding: SampleEncoding::F32, ..test_spec(44_100) };
+        let spec = StreamSpec {
+            encoding: SampleEncoding::F32,
+            ..test_spec(44_100)
+        };
         let output = OutputSpec {
             device: "fake".to_owned(),
             rate_hz: spec.rate_hz,
@@ -3710,17 +4462,29 @@ mod tests {
             .chunks_exact(4)
             .map(|chunk| i32::from_le_bytes(chunk.try_into().unwrap()))
             .collect();
-        assert_eq!(actual, [
-            i32::MIN, i32::MAX, 1_073_741_824, -1_073_741_824,
-            536_870_912, -536_870_912, i32::MAX, i32::MIN,
-        ]);
+        assert_eq!(
+            actual,
+            [
+                i32::MIN,
+                i32::MAX,
+                1_073_741_824,
+                -1_073_741_824,
+                536_870_912,
+                -536_870_912,
+                i32::MAX,
+                i32::MIN,
+            ]
+        );
         assert_eq!(quantize_float(1.0 / 65_536.0, 16).unwrap(), 0);
         assert_eq!(quantize_float(3.0 / 65_536.0, 16).unwrap(), 2);
     }
 
     #[test]
     fn float_compatibility_packs_valid_bits_and_rejects_nonfinite() {
-        let spec = StreamSpec { encoding: SampleEncoding::F32, ..test_spec(44_100) };
+        let spec = StreamSpec {
+            encoding: SampleEncoding::F32,
+            ..test_spec(44_100)
+        };
         let mut output = OutputSpec {
             device: "fake".to_owned(),
             rate_hz: spec.rate_hz,
@@ -3753,7 +4517,10 @@ mod tests {
             &mut bytes,
         )
         .unwrap();
-        assert_eq!(bytes, [(-8_388_608_i32).to_le_bytes(), 4_194_304_i32.to_le_bytes()].concat());
+        assert_eq!(
+            bytes,
+            [(-8_388_608_i32).to_le_bytes(), 4_194_304_i32.to_le_bytes()].concat()
+        );
         output.format = DeviceFormat::S16Le;
         output.valid_bits = 16;
         pack_float_to_int(
@@ -3762,7 +4529,10 @@ mod tests {
             &mut bytes,
         )
         .unwrap();
-        assert_eq!(bytes, [(-32_768_i16).to_le_bytes(), 16_384_i16.to_le_bytes()].concat());
+        assert_eq!(
+            bytes,
+            [(-32_768_i16).to_le_bytes(), 16_384_i16.to_le_bytes()].concat()
+        );
         assert!(matches!(
             pack_float_to_int(
                 DecodedBlock::pcm_block(spec, 1, DecodedPcm::F32(&[f32::NAN, 0.0])),
@@ -3780,16 +4550,34 @@ mod tests {
         let mut plan = HashMap::new();
         plan.insert(PathBuf::from("float.mp3"), FakeTrack::Pcm(float, 512));
         let harness = spawn_engine(plan);
-        harness.commands.send(PlayerCommand::SetFloatToInt(true)).unwrap();
+        harness
+            .commands
+            .send(PlayerCommand::SetFloatToInt(true))
+            .unwrap();
         enqueue(&harness, "float.mp3");
         harness.commands.send(PlayerCommand::Play).unwrap();
         let event = recv_until(&harness.events, |event| {
             matches!(event, PlayerEvent::Playing { .. })
         });
-        assert!(matches!(event, PlayerEvent::Playing { converted: true, output: OutputSpec { format: DeviceFormat::S32Le, .. }, .. }));
-        recv_until(&harness.events, |event| matches!(event, PlayerEvent::EndOfQueue));
+        assert!(matches!(
+            event,
+            PlayerEvent::Playing {
+                converted: true,
+                output: OutputSpec {
+                    format: DeviceFormat::S32Le,
+                    ..
+                },
+                ..
+            }
+        ));
+        recv_until(&harness.events, |event| {
+            matches!(event, PlayerEvent::EndOfQueue)
+        });
         let drained = harness.drained.lock();
-        assert_eq!(drained.as_slice(), [536_870_912_i32.to_le_bytes(); 1024].concat());
+        assert_eq!(
+            drained.as_slice(),
+            [536_870_912_i32.to_le_bytes(); 1024].concat()
+        );
         drop(drained);
         harness.commands.send(PlayerCommand::Quit).unwrap();
         harness.join().unwrap();
@@ -3797,7 +4585,10 @@ mod tests {
 
     #[test]
     fn int_to_float_packing_is_exact_for_16_and_24_bit() {
-        let spec = StreamSpec { encoding: SampleEncoding::S16, ..test_spec(44_100) };
+        let spec = StreamSpec {
+            encoding: SampleEncoding::S16,
+            ..test_spec(44_100)
+        };
         let output = OutputSpec {
             device: "fake".to_owned(),
             rate_hz: spec.rate_hz,
@@ -3850,27 +4641,45 @@ mod tests {
             .collect();
         assert_eq!(actual[0], -1.0);
         assert_eq!(actual[1], 1.0 - 1.0 / 2_147_483_648.0_f32);
-        assert_eq!(
-            actual[2],
-            (f64::from(0x0100_00ff) / 2_147_483_648.0) as f32
+        assert_eq!(actual[2], (f64::from(0x0100_00ff) / 2_147_483_648.0) as f32);
+        assert_ne!(
+            f64::from(actual[2]) * 2_147_483_648.0,
+            f64::from(0x0100_00ff)
         );
-        assert_ne!(f64::from(actual[2]) * 2_147_483_648.0, f64::from(0x0100_00ff));
     }
 
     #[test]
     fn opt_in_int_to_float_fallback_plays_float_bytes_and_marks_event() {
-        let spec = StreamSpec { encoding: SampleEncoding::S16, ..test_spec(44_100) };
+        let spec = StreamSpec {
+            encoding: SampleEncoding::S16,
+            ..test_spec(44_100)
+        };
         let mut plan = HashMap::new();
         plan.insert(PathBuf::from("int.flac"), FakeTrack::Pcm(spec, 512));
         let harness = spawn_engine_float_only(plan);
-        harness.commands.send(PlayerCommand::SetIntToFloat(true)).unwrap();
+        harness
+            .commands
+            .send(PlayerCommand::SetIntToFloat(true))
+            .unwrap();
         enqueue(&harness, "int.flac");
         harness.commands.send(PlayerCommand::Play).unwrap();
         let event = recv_until(&harness.events, |event| {
             matches!(event, PlayerEvent::Playing { .. })
         });
-        assert!(matches!(event, PlayerEvent::Playing { converted: true, output: OutputSpec { format: DeviceFormat::F32Le, .. }, .. }));
-        recv_until(&harness.events, |event| matches!(event, PlayerEvent::EndOfQueue));
+        assert!(matches!(
+            event,
+            PlayerEvent::Playing {
+                converted: true,
+                output: OutputSpec {
+                    format: DeviceFormat::F32Le,
+                    ..
+                },
+                ..
+            }
+        ));
+        recv_until(&harness.events, |event| {
+            matches!(event, PlayerEvent::EndOfQueue)
+        });
         let drained = harness.drained.lock();
         assert!(!drained.is_empty());
         assert_eq!(drained.len() % 4, 0);
@@ -3881,14 +4690,23 @@ mod tests {
 
     #[test]
     fn float_only_endpoint_without_opt_in_stays_strict() {
-        let spec = StreamSpec { encoding: SampleEncoding::S16, ..test_spec(44_100) };
+        let spec = StreamSpec {
+            encoding: SampleEncoding::S16,
+            ..test_spec(44_100)
+        };
         let mut plan = HashMap::new();
         plan.insert(PathBuf::from("int.flac"), FakeTrack::Pcm(spec, 512));
         let harness = spawn_engine_float_only(plan);
         enqueue(&harness, "int.flac");
         harness.commands.send(PlayerCommand::Play).unwrap();
         let error = recv_until(&harness.events, |event| {
-            matches!(event, PlayerEvent::Error { kind: PlayerError::UnsupportedFormat { .. }, .. })
+            matches!(
+                event,
+                PlayerEvent::Error {
+                    kind: PlayerError::UnsupportedFormat { .. },
+                    ..
+                }
+            )
         });
         assert!(matches!(error, PlayerEvent::Error { .. }));
         harness.commands.send(PlayerCommand::Quit).unwrap();
@@ -3900,18 +4718,37 @@ mod tests {
         // Integer physical formats behind a float-only IOProc interface:
         // the exact configure returns an F32 wire format and the worker
         // widens the integer samples (exact for S16/S24) under the opt-in.
-        let spec = StreamSpec { encoding: SampleEncoding::S16, ..test_spec(44_100) };
+        let spec = StreamSpec {
+            encoding: SampleEncoding::S16,
+            ..test_spec(44_100)
+        };
         let mut plan = HashMap::new();
         plan.insert(PathBuf::from("int.flac"), FakeTrack::Pcm(spec, 512));
         let harness = spawn_engine_float_ioproc(plan);
-        harness.commands.send(PlayerCommand::SetIntToFloat(true)).unwrap();
+        harness
+            .commands
+            .send(PlayerCommand::SetIntToFloat(true))
+            .unwrap();
         enqueue(&harness, "int.flac");
         harness.commands.send(PlayerCommand::Play).unwrap();
         let event = recv_until(&harness.events, |event| {
             matches!(event, PlayerEvent::Playing { .. })
         });
-        assert!(matches!(event, PlayerEvent::Playing { converted: true, output: OutputSpec { format: DeviceFormat::F32Le, valid_bits: 32, .. }, .. }));
-        recv_until(&harness.events, |event| matches!(event, PlayerEvent::EndOfQueue));
+        assert!(matches!(
+            event,
+            PlayerEvent::Playing {
+                converted: true,
+                output: OutputSpec {
+                    format: DeviceFormat::F32Le,
+                    valid_bits: 32,
+                    ..
+                },
+                ..
+            }
+        ));
+        recv_until(&harness.events, |event| {
+            matches!(event, PlayerEvent::EndOfQueue)
+        });
         let drained = harness.drained.lock();
         assert!(!drained.is_empty());
         assert_eq!(drained.len() % 8, 0);
@@ -3922,14 +4759,23 @@ mod tests {
 
     #[test]
     fn float_ioproc_endpoint_without_opt_in_stays_strict() {
-        let spec = StreamSpec { encoding: SampleEncoding::S16, ..test_spec(44_100) };
+        let spec = StreamSpec {
+            encoding: SampleEncoding::S16,
+            ..test_spec(44_100)
+        };
         let mut plan = HashMap::new();
         plan.insert(PathBuf::from("int.flac"), FakeTrack::Pcm(spec, 512));
         let harness = spawn_engine_float_ioproc(plan);
         enqueue(&harness, "int.flac");
         harness.commands.send(PlayerCommand::Play).unwrap();
         let error = recv_until(&harness.events, |event| {
-            matches!(event, PlayerEvent::Error { kind: PlayerError::UnsupportedFormat { .. }, .. })
+            matches!(
+                event,
+                PlayerEvent::Error {
+                    kind: PlayerError::UnsupportedFormat { .. },
+                    ..
+                }
+            )
         });
         assert!(matches!(error, PlayerEvent::Error { .. }));
         harness.commands.send(PlayerCommand::Quit).unwrap();
@@ -3946,14 +4792,29 @@ mod tests {
         let mut plan = HashMap::new();
         plan.insert(PathBuf::from("float.mp3"), FakeTrack::Pcm(float, 512));
         let harness = spawn_engine_float_ioproc(plan);
-        harness.commands.send(PlayerCommand::SetFloatToInt(true)).unwrap();
+        harness
+            .commands
+            .send(PlayerCommand::SetFloatToInt(true))
+            .unwrap();
         enqueue(&harness, "float.mp3");
         harness.commands.send(PlayerCommand::Play).unwrap();
         let event = recv_until(&harness.events, |event| {
             matches!(event, PlayerEvent::Playing { .. })
         });
-        assert!(matches!(event, PlayerEvent::Playing { converted: true, output: OutputSpec { format: DeviceFormat::F32Le, .. }, .. }));
-        recv_until(&harness.events, |event| matches!(event, PlayerEvent::EndOfQueue));
+        assert!(matches!(
+            event,
+            PlayerEvent::Playing {
+                converted: true,
+                output: OutputSpec {
+                    format: DeviceFormat::F32Le,
+                    ..
+                },
+                ..
+            }
+        ));
+        recv_until(&harness.events, |event| {
+            matches!(event, PlayerEvent::EndOfQueue)
+        });
         assert!(!harness.drained.lock().is_empty());
         harness.commands.send(PlayerCommand::Quit).unwrap();
         harness.join().unwrap();
@@ -3966,13 +4827,25 @@ mod tests {
         let mut plan = HashMap::new();
         plan.insert(PathBuf::from("float.mp3"), FakeTrack::Pcm(float, 8192));
         let harness = spawn_engine(plan);
-        harness.commands.send(PlayerCommand::SetFloatToInt(true)).unwrap();
+        harness
+            .commands
+            .send(PlayerCommand::SetFloatToInt(true))
+            .unwrap();
         enqueue(&harness, "float.mp3");
         harness.commands.send(PlayerCommand::Play).unwrap();
         recv_until(&harness.events, |event| {
-            matches!(event, PlayerEvent::Playing { converted: true, .. })
+            matches!(
+                event,
+                PlayerEvent::Playing {
+                    converted: true,
+                    ..
+                }
+            )
         });
-        harness.commands.send(PlayerCommand::SeekFrame(1025)).unwrap();
+        harness
+            .commands
+            .send(PlayerCommand::SeekFrame(1025))
+            .unwrap();
         recv_until(&harness.events, |event| {
             matches!(event, PlayerEvent::Position { frame: 1025, .. })
         });
@@ -3989,16 +4862,35 @@ mod tests {
         plan.insert(PathBuf::from("first.mp3"), FakeTrack::Pcm(float, 100_000));
         plan.insert(PathBuf::from("second.mp3"), FakeTrack::Pcm(float, 512));
         let harness = spawn_engine(plan);
-        harness.commands.send(PlayerCommand::SetFloatToInt(true)).unwrap();
+        harness
+            .commands
+            .send(PlayerCommand::SetFloatToInt(true))
+            .unwrap();
         enqueue(&harness, "first.mp3");
         enqueue(&harness, "second.mp3");
         harness.commands.send(PlayerCommand::Play).unwrap();
         recv_until(&harness.events, |event| {
-            matches!(event, PlayerEvent::Playing { track: 1, converted: true, .. })
+            matches!(
+                event,
+                PlayerEvent::Playing {
+                    track: 1,
+                    converted: true,
+                    ..
+                }
+            )
         });
-        harness.commands.send(PlayerCommand::SetFloatToInt(false)).unwrap();
+        harness
+            .commands
+            .send(PlayerCommand::SetFloatToInt(false))
+            .unwrap();
         let error = recv_until(&harness.events, |event| {
-            matches!(event, PlayerEvent::Error { track: Some(2), kind: PlayerError::UnsupportedFormat { .. } })
+            matches!(
+                event,
+                PlayerEvent::Error {
+                    track: Some(2),
+                    kind: PlayerError::UnsupportedFormat { .. }
+                }
+            )
         });
         assert!(matches!(error, PlayerEvent::Error { track: Some(2), .. }));
         harness.commands.send(PlayerCommand::Quit).unwrap();
@@ -4013,26 +4905,55 @@ mod tests {
         plan.insert(PathBuf::from("first.mp3"), FakeTrack::Pcm(float, 512));
         plan.insert(PathBuf::from("second.mp3"), FakeTrack::Pcm(float, 512));
         let harness = spawn_engine(plan);
-        harness.commands.send(PlayerCommand::SetFloatToInt(true)).unwrap();
+        harness
+            .commands
+            .send(PlayerCommand::SetFloatToInt(true))
+            .unwrap();
         enqueue(&harness, "first.mp3");
         enqueue(&harness, "second.mp3");
         harness.commands.send(PlayerCommand::Play).unwrap();
         recv_until(&harness.events, |event| {
-            matches!(event, PlayerEvent::Playing { track: 1, converted: true, .. })
+            matches!(
+                event,
+                PlayerEvent::Playing {
+                    track: 1,
+                    converted: true,
+                    ..
+                }
+            )
         });
         recv_until(&harness.events, |event| {
-            matches!(event, PlayerEvent::Playing { track: 2, converted: true, .. })
+            matches!(
+                event,
+                PlayerEvent::Playing {
+                    track: 2,
+                    converted: true,
+                    ..
+                }
+            )
         });
-        recv_until(&harness.events, |event| matches!(event, PlayerEvent::EndOfQueue));
-        assert_eq!(harness.calls.lock().starts, 1, "same spec should keep one output stream");
-        assert_eq!(harness.drained.lock().as_slice(), [536_870_912_i32.to_le_bytes(); 2048].concat());
+        recv_until(&harness.events, |event| {
+            matches!(event, PlayerEvent::EndOfQueue)
+        });
+        assert_eq!(
+            harness.calls.lock().starts,
+            1,
+            "same spec should keep one output stream"
+        );
+        assert_eq!(
+            harness.drained.lock().as_slice(),
+            [536_870_912_i32.to_le_bytes(); 2048].concat()
+        );
         harness.commands.send(PlayerCommand::Quit).unwrap();
         harness.join().unwrap();
     }
     #[test]
     fn duplicate_paths_get_distinct_monotonic_ids() {
         let mut plan = HashMap::new();
-        plan.insert(PathBuf::from("a.flac"), FakeTrack::Pcm(test_spec(44_100), 512));
+        plan.insert(
+            PathBuf::from("a.flac"),
+            FakeTrack::Pcm(test_spec(44_100), 512),
+        );
         let harness = spawn_engine(plan);
         enqueue(&harness, "a.flac");
         enqueue(&harness, "a.flac");
@@ -4042,7 +4963,10 @@ mod tests {
         assert_eq!(pending2.len(), 2);
         assert_eq!(pending2[0].entry.path, PathBuf::from("a.flac"));
         assert_eq!(pending2[1].entry.path, PathBuf::from("a.flac"));
-        assert!(pending2[0].id < pending2[1].id, "IDs must be distinct and increasing");
+        assert!(
+            pending2[0].id < pending2[1].id,
+            "IDs must be distinct and increasing"
+        );
         harness.commands.send(PlayerCommand::Quit).unwrap();
         harness.join().unwrap();
     }
@@ -4055,14 +4979,26 @@ mod tests {
         }
         let (_, original) = recv_queue_until(&harness.events, |_, pending| pending.len() == 12);
         let ids: Vec<_> = original.iter().map(|item| item.id).collect();
-        harness.commands.send(PlayerCommand::SetShuffle(true)).unwrap();
+        harness
+            .commands
+            .send(PlayerCommand::SetShuffle(true))
+            .unwrap();
         let (_, shuffled) = recv_queue_changed(&harness.events);
         let mut shuffled_ids: Vec<_> = shuffled.iter().map(|item| item.id).collect();
         shuffled_ids.sort_unstable();
-        assert_eq!(shuffled_ids, ids, "shuffle retains every track exactly once");
-        harness.commands.send(PlayerCommand::SetShuffle(false)).unwrap();
+        assert_eq!(
+            shuffled_ids, ids,
+            "shuffle retains every track exactly once"
+        );
+        harness
+            .commands
+            .send(PlayerCommand::SetShuffle(false))
+            .unwrap();
         let (_, unshuffled) = recv_queue_changed(&harness.events);
-        assert_eq!(unshuffled, shuffled, "turning random play off must not reshuffle pending");
+        assert_eq!(
+            unshuffled, shuffled,
+            "turning random play off must not reshuffle pending"
+        );
         enqueue(&harness, "new.flac");
         let (_, appended) = recv_queue_changed(&harness.events);
         assert_eq!(&appended[..12], &shuffled[..]);
@@ -4075,20 +5011,31 @@ mod tests {
     fn shuffle_during_play_keeps_audible_and_prepared_next() {
         let mut plan = HashMap::new();
         for name in ["a.flac", "b.flac", "c.flac", "d.flac"] {
-            plan.insert(PathBuf::from(name), FakeTrack::Pcm(test_spec(44_100), 100_000));
+            plan.insert(
+                PathBuf::from(name),
+                FakeTrack::Pcm(test_spec(44_100), 100_000),
+            );
         }
         let harness = spawn_engine(plan);
         for name in ["a.flac", "b.flac", "c.flac", "d.flac"] {
             enqueue(&harness, name);
         }
         harness.commands.send(PlayerCommand::Play).unwrap();
-        recv_until(&harness.events, |event| matches!(event, PlayerEvent::Playing { track: 1, .. }));
+        recv_until(&harness.events, |event| {
+            matches!(event, PlayerEvent::Playing { track: 1, .. })
+        });
         let (audible, pending) = recv_queue_until(&harness.events, |audible, pending| {
             audible.as_ref().is_some_and(|track| track.id == 1) && pending.len() == 3
         });
         assert_eq!(audible.unwrap().id, 1);
-        assert_eq!(pending.iter().map(|item| item.id).collect::<Vec<_>>(), [2, 3, 4]);
-        harness.commands.send(PlayerCommand::SetShuffle(true)).unwrap();
+        assert_eq!(
+            pending.iter().map(|item| item.id).collect::<Vec<_>>(),
+            [2, 3, 4]
+        );
+        harness
+            .commands
+            .send(PlayerCommand::SetShuffle(true))
+            .unwrap();
         let (audible, pending) = recv_queue_changed(&harness.events);
         assert_eq!(audible.unwrap().id, 1);
         assert_eq!(pending[0].id, 2, "preopened next must not be displaced");
@@ -4096,7 +5043,9 @@ mod tests {
         rest.sort_unstable();
         assert_eq!(rest, [3, 4]);
         harness.commands.send(PlayerCommand::Next).unwrap();
-        recv_until(&harness.events, |event| matches!(event, PlayerEvent::Playing { track: 2, .. }));
+        recv_until(&harness.events, |event| {
+            matches!(event, PlayerEvent::Playing { track: 2, .. })
+        });
         harness.commands.send(PlayerCommand::Quit).unwrap();
         harness.join().unwrap();
     }
@@ -4107,13 +5056,21 @@ mod tests {
         // plays. Before the boundary, the snapshot must show the OLD track
         // as audible and the new one pending.
         let mut plan = HashMap::new();
-        plan.insert(PathBuf::from("a.flac"), FakeTrack::Pcm(test_spec(44_100), 4096));
-        plan.insert(PathBuf::from("b.flac"), FakeTrack::Pcm(test_spec(44_100), 4096));
+        plan.insert(
+            PathBuf::from("a.flac"),
+            FakeTrack::Pcm(test_spec(44_100), 4096),
+        );
+        plan.insert(
+            PathBuf::from("b.flac"),
+            FakeTrack::Pcm(test_spec(44_100), 4096),
+        );
         let harness = spawn_engine(plan);
         enqueue(&harness, "a.flac");
         enqueue(&harness, "b.flac");
         harness.commands.send(PlayerCommand::Play).unwrap();
-        recv_until(&harness.events, |event| matches!(event, PlayerEvent::Playing { track: 1, .. }));
+        recv_until(&harness.events, |event| {
+            matches!(event, PlayerEvent::Playing { track: 1, .. })
+        });
         // Snapshots after start: audible 1; b (id 2) appears pending once
         // preopened.
         let (audible, pending) = recv_queue_until(&harness.events, |_, pending| {
@@ -4122,7 +5079,9 @@ mod tests {
         assert_eq!(audible.map(|item| item.id), Some(1));
         assert_eq!(pending.iter().map(|item| item.id).collect::<Vec<_>>(), [2]);
         // After the gapless boundary the new track becomes audible.
-        recv_until(&harness.events, |event| matches!(event, PlayerEvent::Playing { track: 2, .. }));
+        recv_until(&harness.events, |event| {
+            matches!(event, PlayerEvent::Playing { track: 2, .. })
+        });
         harness.commands.send(PlayerCommand::Quit).unwrap();
         harness.join().unwrap();
     }
@@ -4130,13 +5089,21 @@ mod tests {
     #[test]
     fn stop_returns_prepared_track_to_pending() {
         let mut plan = HashMap::new();
-        plan.insert(PathBuf::from("a.flac"), FakeTrack::Pcm(test_spec(44_100), 100_000));
-        plan.insert(PathBuf::from("b.flac"), FakeTrack::Pcm(test_spec(44_100), 512));
+        plan.insert(
+            PathBuf::from("a.flac"),
+            FakeTrack::Pcm(test_spec(44_100), 100_000),
+        );
+        plan.insert(
+            PathBuf::from("b.flac"),
+            FakeTrack::Pcm(test_spec(44_100), 512),
+        );
         let harness = spawn_engine(plan);
         enqueue(&harness, "a.flac");
         enqueue(&harness, "b.flac");
         harness.commands.send(PlayerCommand::Play).unwrap();
-        recv_until(&harness.events, |event| matches!(event, PlayerEvent::Playing { track: 1, .. }));
+        recv_until(&harness.events, |event| {
+            matches!(event, PlayerEvent::Playing { track: 1, .. })
+        });
         // Wait until b is prepared (popped from the queue)...
         let (audible, pending) = recv_queue_until(&harness.events, |_, pending| {
             pending.iter().any(|item| item.id == 2)
@@ -4155,11 +5122,16 @@ mod tests {
     #[test]
     fn queue_snapshot_clears_on_end_of_queue() {
         let mut plan = HashMap::new();
-        plan.insert(PathBuf::from("a.flac"), FakeTrack::Pcm(test_spec(44_100), 512));
+        plan.insert(
+            PathBuf::from("a.flac"),
+            FakeTrack::Pcm(test_spec(44_100), 512),
+        );
         let harness = spawn_engine(plan);
         enqueue(&harness, "a.flac");
         harness.commands.send(PlayerCommand::Play).unwrap();
-        recv_until(&harness.events, |event| matches!(event, PlayerEvent::EndOfQueue));
+        recv_until(&harness.events, |event| {
+            matches!(event, PlayerEvent::EndOfQueue)
+        });
         let (audible, pending) = recv_queue_changed(&harness.events);
         assert_eq!(audible, None);
         assert!(pending.is_empty());
@@ -4170,22 +5142,38 @@ mod tests {
     #[test]
     fn auto_timing_follows_each_tracks_rate() {
         let mut plan = HashMap::new();
-        plan.insert(PathBuf::from("low.flac"), FakeTrack::Pcm(test_spec(44_100), 512));
-        plan.insert(PathBuf::from("high.flac"), FakeTrack::Pcm(test_spec(96_000), 512));
+        plan.insert(
+            PathBuf::from("low.flac"),
+            FakeTrack::Pcm(test_spec(44_100), 512),
+        );
+        plan.insert(
+            PathBuf::from("high.flac"),
+            FakeTrack::Pcm(test_spec(96_000), 512),
+        );
         let harness = spawn_engine_auto(plan);
         enqueue(&harness, "low.flac");
         enqueue(&harness, "high.flac");
         harness.commands.send(PlayerCommand::Play).unwrap();
-        recv_until(&harness.events, |event| matches!(event, PlayerEvent::EndOfQueue));
+        recv_until(&harness.events, |event| {
+            matches!(event, PlayerEvent::EndOfQueue)
+        });
         let calls = harness.calls.lock();
         assert_eq!(
             calls.buffers_seen[0],
-            BufferConfig { period_frames: 2_205, buffer_frames: 6_615, ring_frames: 11_025 },
+            BufferConfig {
+                period_frames: 2_205,
+                buffer_frames: 6_615,
+                ring_frames: 11_025
+            },
             "44.1 kHz auto timing"
         );
         assert_eq!(
             calls.buffers_seen[1],
-            BufferConfig { period_frames: 4_800, buffer_frames: 14_400, ring_frames: 24_000 },
+            BufferConfig {
+                period_frames: 4_800,
+                buffer_frames: 14_400,
+                ring_frames: 24_000
+            },
             "96 kHz auto timing"
         );
         drop(calls);
@@ -4196,7 +5184,10 @@ mod tests {
     #[test]
     fn custom_timing_pair_reaches_output() {
         let mut plan = HashMap::new();
-        plan.insert(PathBuf::from("a.flac"), FakeTrack::Pcm(test_spec(44_100), 512));
+        plan.insert(
+            PathBuf::from("a.flac"),
+            FakeTrack::Pcm(test_spec(44_100), 512),
+        );
         let harness = spawn_engine_timed(
             plan,
             Duration::from_secs(5),
@@ -4208,7 +5199,9 @@ mod tests {
         );
         enqueue(&harness, "a.flac");
         harness.commands.send(PlayerCommand::Play).unwrap();
-        recv_until(&harness.events, |event| matches!(event, PlayerEvent::Playing { .. }));
+        recv_until(&harness.events, |event| {
+            matches!(event, PlayerEvent::Playing { .. })
+        });
         let calls = harness.calls.lock();
         assert_eq!(calls.buffers_seen[0].period_frames, 1_024);
         assert_eq!(calls.buffers_seen[0].buffer_frames, 4_096);
@@ -4221,13 +5214,21 @@ mod tests {
     #[test]
     fn set_timing_command_applies_to_next_configure() {
         let mut plan = HashMap::new();
-        plan.insert(PathBuf::from("a.flac"), FakeTrack::Pcm(test_spec(44_100), 100_000));
-        plan.insert(PathBuf::from("b.flac"), FakeTrack::Pcm(test_spec(44_100), 512));
+        plan.insert(
+            PathBuf::from("a.flac"),
+            FakeTrack::Pcm(test_spec(44_100), 100_000),
+        );
+        plan.insert(
+            PathBuf::from("b.flac"),
+            FakeTrack::Pcm(test_spec(44_100), 512),
+        );
         let harness = spawn_engine(plan);
         enqueue(&harness, "a.flac");
         enqueue(&harness, "b.flac");
         harness.commands.send(PlayerCommand::Play).unwrap();
-        recv_until(&harness.events, |event| matches!(event, PlayerEvent::Playing { track: 1, .. }));
+        recv_until(&harness.events, |event| {
+            matches!(event, PlayerEvent::Playing { track: 1, .. })
+        });
         harness
             .commands
             .send(PlayerCommand::SetTiming {
@@ -4236,7 +5237,9 @@ mod tests {
             })
             .unwrap();
         harness.commands.send(PlayerCommand::Next).unwrap();
-        recv_until(&harness.events, |event| matches!(event, PlayerEvent::Playing { track: 2, .. }));
+        recv_until(&harness.events, |event| {
+            matches!(event, PlayerEvent::Playing { track: 2, .. })
+        });
         let calls = harness.calls.lock();
         let last = calls.buffers_seen.last().unwrap();
         assert_eq!(last.period_frames, 512);
@@ -4249,10 +5252,22 @@ mod tests {
     #[test]
     fn remove_pending_middle_entry_keeps_output_running() {
         let mut plan = HashMap::new();
-        plan.insert(PathBuf::from("a.flac"), FakeTrack::Pcm(test_spec(44_100), 200_000));
-        plan.insert(PathBuf::from("b.flac"), FakeTrack::Pcm(test_spec(44_100), 512));
-        plan.insert(PathBuf::from("c.flac"), FakeTrack::Pcm(test_spec(44_100), 512));
-        plan.insert(PathBuf::from("d.flac"), FakeTrack::Pcm(test_spec(44_100), 512));
+        plan.insert(
+            PathBuf::from("a.flac"),
+            FakeTrack::Pcm(test_spec(44_100), 200_000),
+        );
+        plan.insert(
+            PathBuf::from("b.flac"),
+            FakeTrack::Pcm(test_spec(44_100), 512),
+        );
+        plan.insert(
+            PathBuf::from("c.flac"),
+            FakeTrack::Pcm(test_spec(44_100), 512),
+        );
+        plan.insert(
+            PathBuf::from("d.flac"),
+            FakeTrack::Pcm(test_spec(44_100), 512),
+        );
         let harness = spawn_engine(plan);
         enqueue(&harness, "a.flac");
         enqueue(&harness, "b.flac");
@@ -4274,7 +5289,10 @@ mod tests {
             (calls.stops, calls.configures)
         };
         // Remove the middle pending entry (c, id 3).
-        harness.commands.send(PlayerCommand::RemoveQueueEntry(3)).unwrap();
+        harness
+            .commands
+            .send(PlayerCommand::RemoveQueueEntry(3))
+            .unwrap();
         let (_, pending) = recv_queue_until(&harness.events, |_, pending| {
             !pending.iter().any(|item| item.id == 3)
         });
@@ -4287,7 +5305,10 @@ mod tests {
         {
             let calls = harness.calls.lock();
             assert_eq!(calls.stops, stops_before, "remove must not stop the output");
-            assert_eq!(calls.configures, configures_before, "remove must not reconfigure");
+            assert_eq!(
+                calls.configures, configures_before,
+                "remove must not reconfigure"
+            );
         }
         assert_eq!(
             count_events(
@@ -4313,8 +5334,14 @@ mod tests {
     #[test]
     fn remove_rejects_audible_track() {
         let mut plan = HashMap::new();
-        plan.insert(PathBuf::from("a.flac"), FakeTrack::Pcm(test_spec(44_100), 200_000));
-        plan.insert(PathBuf::from("b.flac"), FakeTrack::Pcm(test_spec(44_100), 512));
+        plan.insert(
+            PathBuf::from("a.flac"),
+            FakeTrack::Pcm(test_spec(44_100), 200_000),
+        );
+        plan.insert(
+            PathBuf::from("b.flac"),
+            FakeTrack::Pcm(test_spec(44_100), 512),
+        );
         let harness = spawn_engine(plan);
         enqueue(&harness, "a.flac");
         enqueue(&harness, "b.flac");
@@ -4325,12 +5352,12 @@ mod tests {
         let (_, pending) = recv_queue_until(&harness.events, |_, pending| {
             pending.iter().any(|item| item.id == 2)
         });
-        assert_eq!(
-            pending.iter().map(|item| item.id).collect::<Vec<_>>(),
-            [2]
-        );
+        assert_eq!(pending.iter().map(|item| item.id).collect::<Vec<_>>(), [2]);
         let stops_before = harness.calls.lock().stops;
-        harness.commands.send(PlayerCommand::RemoveQueueEntry(1)).unwrap();
+        harness
+            .commands
+            .send(PlayerCommand::RemoveQueueEntry(1))
+            .unwrap();
         let rejected = recv_until(&harness.events, |event| {
             matches!(event, PlayerEvent::QueueEditRejected { id: 1, .. })
         });
@@ -4359,9 +5386,18 @@ mod tests {
     #[test]
     fn remove_prepared_next_rebuilds_preparation() {
         let mut plan = HashMap::new();
-        plan.insert(PathBuf::from("a.flac"), FakeTrack::Pcm(test_spec(44_100), 200_000));
-        plan.insert(PathBuf::from("b.flac"), FakeTrack::Pcm(test_spec(44_100), 512));
-        plan.insert(PathBuf::from("c.flac"), FakeTrack::Pcm(test_spec(44_100), 512));
+        plan.insert(
+            PathBuf::from("a.flac"),
+            FakeTrack::Pcm(test_spec(44_100), 200_000),
+        );
+        plan.insert(
+            PathBuf::from("b.flac"),
+            FakeTrack::Pcm(test_spec(44_100), 512),
+        );
+        plan.insert(
+            PathBuf::from("c.flac"),
+            FakeTrack::Pcm(test_spec(44_100), 512),
+        );
         let harness = spawn_engine(plan);
         enqueue(&harness, "a.flac");
         enqueue(&harness, "b.flac");
@@ -4380,7 +5416,10 @@ mod tests {
         let stops_before = harness.calls.lock().stops;
         // Removing the prepared next track drops its decoder and lets
         // preopen_next rebuild preparation for c.
-        harness.commands.send(PlayerCommand::RemoveQueueEntry(2)).unwrap();
+        harness
+            .commands
+            .send(PlayerCommand::RemoveQueueEntry(2))
+            .unwrap();
         recv_queue_until(&harness.events, |_, pending| {
             pending.iter().map(|item| item.id).collect::<Vec<_>>() == [3]
         });
@@ -4404,10 +5443,22 @@ mod tests {
     #[test]
     fn move_before_anchor_and_append_preserve_pending_order() {
         let mut plan = HashMap::new();
-        plan.insert(PathBuf::from("a.flac"), FakeTrack::Pcm(test_spec(44_100), 200_000));
-        plan.insert(PathBuf::from("b.flac"), FakeTrack::Pcm(test_spec(44_100), 512));
-        plan.insert(PathBuf::from("c.flac"), FakeTrack::Pcm(test_spec(44_100), 512));
-        plan.insert(PathBuf::from("d.flac"), FakeTrack::Pcm(test_spec(44_100), 512));
+        plan.insert(
+            PathBuf::from("a.flac"),
+            FakeTrack::Pcm(test_spec(44_100), 200_000),
+        );
+        plan.insert(
+            PathBuf::from("b.flac"),
+            FakeTrack::Pcm(test_spec(44_100), 512),
+        );
+        plan.insert(
+            PathBuf::from("c.flac"),
+            FakeTrack::Pcm(test_spec(44_100), 512),
+        );
+        plan.insert(
+            PathBuf::from("d.flac"),
+            FakeTrack::Pcm(test_spec(44_100), 512),
+        );
         let range = sointty_core::CueRange {
             start_cd: 75,
             end_cd: None,
@@ -4432,20 +5483,29 @@ mod tests {
         // the prepared b.
         harness
             .commands
-            .send(PlayerCommand::MoveQueueEntry { id: 4, before: Some(3) })
+            .send(PlayerCommand::MoveQueueEntry {
+                id: 4,
+                before: Some(3),
+            })
             .unwrap();
         let (_, pending) = recv_queue_until(&harness.events, |_, pending| {
             pending.iter().map(|item| item.id).collect::<Vec<_>>() == [2, 4, 3]
         });
         // The CUE range rides along with its entry.
-        let moved = pending.iter().find(|item| item.id == 3).expect("c in pending");
+        let moved = pending
+            .iter()
+            .find(|item| item.id == 3)
+            .expect("c in pending");
         assert_eq!(moved.entry.cue_range, Some(range));
         // Move the prepared next track (b, id 2) to the end: it returns to
         // its queue-front position first, then appends, and preopen_next
         // rebuilds preparation for the new front.
         harness
             .commands
-            .send(PlayerCommand::MoveQueueEntry { id: 2, before: None })
+            .send(PlayerCommand::MoveQueueEntry {
+                id: 2,
+                before: None,
+            })
             .unwrap();
         recv_queue_until(&harness.events, |_, pending| {
             pending.iter().map(|item| item.id).collect::<Vec<_>>() == [4, 3, 2]
@@ -4453,7 +5513,10 @@ mod tests {
         // Move c (id 3) before d (id 4), which is now the prepared track.
         harness
             .commands
-            .send(PlayerCommand::MoveQueueEntry { id: 3, before: Some(4) })
+            .send(PlayerCommand::MoveQueueEntry {
+                id: 3,
+                before: Some(4),
+            })
             .unwrap();
         recv_queue_until(&harness.events, |_, pending| {
             pending.iter().map(|item| item.id).collect::<Vec<_>>() == [3, 4, 2]
@@ -4462,7 +5525,10 @@ mod tests {
         {
             let calls = harness.calls.lock();
             assert_eq!(calls.stops, stops_before, "move must not stop the output");
-            assert_eq!(calls.configures, configures_before, "move must not reconfigure");
+            assert_eq!(
+                calls.configures, configures_before,
+                "move must not reconfigure"
+            );
         }
         assert_eq!(
             count_events(
@@ -4475,9 +5541,10 @@ mod tests {
         // Playback follows the new pending order.
         for expected in [3, 4, 2] {
             harness.commands.send(PlayerCommand::Next).unwrap();
-            recv_until(&harness.events, |event| {
-                matches!(event, PlayerEvent::Playing { track, .. } if *track == expected)
-            });
+            recv_until(
+                &harness.events,
+                |event| matches!(event, PlayerEvent::Playing { track, .. } if *track == expected),
+            );
         }
         harness.commands.send(PlayerCommand::Quit).unwrap();
         harness.join().unwrap();
@@ -4486,9 +5553,18 @@ mod tests {
     #[test]
     fn jump_to_pending_entry_starts_it_with_its_id() {
         let mut plan = HashMap::new();
-        plan.insert(PathBuf::from("a.flac"), FakeTrack::Pcm(test_spec(44_100), 200_000));
-        plan.insert(PathBuf::from("b.flac"), FakeTrack::Pcm(test_spec(44_100), 512));
-        plan.insert(PathBuf::from("c.flac"), FakeTrack::Pcm(test_spec(44_100), 512));
+        plan.insert(
+            PathBuf::from("a.flac"),
+            FakeTrack::Pcm(test_spec(44_100), 200_000),
+        );
+        plan.insert(
+            PathBuf::from("b.flac"),
+            FakeTrack::Pcm(test_spec(44_100), 512),
+        );
+        plan.insert(
+            PathBuf::from("c.flac"),
+            FakeTrack::Pcm(test_spec(44_100), 512),
+        );
         let harness = spawn_engine(plan);
         enqueue(&harness, "a.flac");
         enqueue(&harness, "b.flac");
@@ -4502,7 +5578,10 @@ mod tests {
         });
         // Jump to c: it becomes audible under its own existing ID and the
         // remaining pending order is preserved.
-        harness.commands.send(PlayerCommand::JumpToQueueEntry(3)).unwrap();
+        harness
+            .commands
+            .send(PlayerCommand::JumpToQueueEntry(3))
+            .unwrap();
         recv_until(&harness.events, |event| {
             matches!(event, PlayerEvent::Playing { track: 3, .. })
         });
@@ -4525,8 +5604,14 @@ mod tests {
     #[test]
     fn jump_to_audible_entry_is_noop() {
         let mut plan = HashMap::new();
-        plan.insert(PathBuf::from("a.flac"), FakeTrack::Pcm(test_spec(44_100), 200_000));
-        plan.insert(PathBuf::from("b.flac"), FakeTrack::Pcm(test_spec(44_100), 512));
+        plan.insert(
+            PathBuf::from("a.flac"),
+            FakeTrack::Pcm(test_spec(44_100), 200_000),
+        );
+        plan.insert(
+            PathBuf::from("b.flac"),
+            FakeTrack::Pcm(test_spec(44_100), 512),
+        );
         let harness = spawn_engine(plan);
         enqueue(&harness, "a.flac");
         enqueue(&harness, "b.flac");
@@ -4538,12 +5623,18 @@ mod tests {
             pending.iter().any(|item| item.id == 2)
         });
         let stops_before = harness.calls.lock().stops;
-        harness.commands.send(PlayerCommand::JumpToQueueEntry(1)).unwrap();
+        harness
+            .commands
+            .send(PlayerCommand::JumpToQueueEntry(1))
+            .unwrap();
         // A no-op: no reconfigure, no restart, no new Playing, queue intact.
         assert_eq!(
             count_events(
                 &harness.events,
-                |event| matches!(event, PlayerEvent::Playing { .. } | PlayerEvent::Reconfiguring),
+                |event| matches!(
+                    event,
+                    PlayerEvent::Playing { .. } | PlayerEvent::Reconfiguring
+                ),
                 Duration::from_millis(400),
             ),
             0
@@ -4562,9 +5653,18 @@ mod tests {
     #[test]
     fn stale_jump_remove_move_ids_reject_without_changes() {
         let mut plan = HashMap::new();
-        plan.insert(PathBuf::from("a.flac"), FakeTrack::Pcm(test_spec(44_100), 200_000));
-        plan.insert(PathBuf::from("b.flac"), FakeTrack::Pcm(test_spec(44_100), 512));
-        plan.insert(PathBuf::from("c.flac"), FakeTrack::Pcm(test_spec(44_100), 512));
+        plan.insert(
+            PathBuf::from("a.flac"),
+            FakeTrack::Pcm(test_spec(44_100), 200_000),
+        );
+        plan.insert(
+            PathBuf::from("b.flac"),
+            FakeTrack::Pcm(test_spec(44_100), 512),
+        );
+        plan.insert(
+            PathBuf::from("c.flac"),
+            FakeTrack::Pcm(test_spec(44_100), 512),
+        );
         let harness = spawn_engine(plan);
         enqueue(&harness, "a.flac");
         enqueue(&harness, "b.flac");
@@ -4578,13 +5678,10 @@ mod tests {
         });
         let stops_before = harness.calls.lock().stops;
 
-        harness.commands.send(PlayerCommand::JumpToQueueEntry(99)).unwrap();
-        let rejected = recv_until(&harness.events, |event| {
-            matches!(event, PlayerEvent::QueueEditRejected { id: 99, .. })
-        });
-        assert_reject_reason(rejected, REJECT_MISSING_ID);
-
-        harness.commands.send(PlayerCommand::RemoveQueueEntry(99)).unwrap();
+        harness
+            .commands
+            .send(PlayerCommand::JumpToQueueEntry(99))
+            .unwrap();
         let rejected = recv_until(&harness.events, |event| {
             matches!(event, PlayerEvent::QueueEditRejected { id: 99, .. })
         });
@@ -4592,7 +5689,19 @@ mod tests {
 
         harness
             .commands
-            .send(PlayerCommand::MoveQueueEntry { id: 99, before: None })
+            .send(PlayerCommand::RemoveQueueEntry(99))
+            .unwrap();
+        let rejected = recv_until(&harness.events, |event| {
+            matches!(event, PlayerEvent::QueueEditRejected { id: 99, .. })
+        });
+        assert_reject_reason(rejected, REJECT_MISSING_ID);
+
+        harness
+            .commands
+            .send(PlayerCommand::MoveQueueEntry {
+                id: 99,
+                before: None,
+            })
             .unwrap();
         let rejected = recv_until(&harness.events, |event| {
             matches!(event, PlayerEvent::QueueEditRejected { id: 99, .. })
@@ -4602,7 +5711,10 @@ mod tests {
         // The source exists (prepared b) but the anchor does not.
         harness
             .commands
-            .send(PlayerCommand::MoveQueueEntry { id: 2, before: Some(99) })
+            .send(PlayerCommand::MoveQueueEntry {
+                id: 2,
+                before: Some(99),
+            })
             .unwrap();
         let rejected = recv_until(&harness.events, |event| {
             matches!(event, PlayerEvent::QueueEditRejected { id: 2, .. })
@@ -4614,16 +5726,20 @@ mod tests {
         assert_eq!(
             count_events(
                 &harness.events,
-                |event| matches!(event, PlayerEvent::Playing { .. } | PlayerEvent::Reconfiguring),
+                |event| matches!(
+                    event,
+                    PlayerEvent::Playing { .. } | PlayerEvent::Reconfiguring
+                ),
                 Duration::from_millis(400),
             ),
             0
         );
         for expected in [2, 3] {
             harness.commands.send(PlayerCommand::Next).unwrap();
-            recv_until(&harness.events, |event| {
-                matches!(event, PlayerEvent::Playing { track, .. } if *track == expected)
-            });
+            recv_until(
+                &harness.events,
+                |event| matches!(event, PlayerEvent::Playing { track, .. } if *track == expected),
+            );
         }
         harness.commands.send(PlayerCommand::Quit).unwrap();
         harness.join().unwrap();
@@ -4632,12 +5748,27 @@ mod tests {
     #[test]
     fn play_now_fronts_queue_regardless_of_shuffle() {
         let mut plan = HashMap::new();
-        plan.insert(PathBuf::from("a.flac"), FakeTrack::Pcm(test_spec(44_100), 512));
-        plan.insert(PathBuf::from("b.flac"), FakeTrack::Pcm(test_spec(44_100), 512));
-        plan.insert(PathBuf::from("c.flac"), FakeTrack::Pcm(test_spec(44_100), 512));
-        plan.insert(PathBuf::from("d.flac"), FakeTrack::Pcm(test_spec(44_100), 512));
+        plan.insert(
+            PathBuf::from("a.flac"),
+            FakeTrack::Pcm(test_spec(44_100), 512),
+        );
+        plan.insert(
+            PathBuf::from("b.flac"),
+            FakeTrack::Pcm(test_spec(44_100), 512),
+        );
+        plan.insert(
+            PathBuf::from("c.flac"),
+            FakeTrack::Pcm(test_spec(44_100), 512),
+        );
+        plan.insert(
+            PathBuf::from("d.flac"),
+            FakeTrack::Pcm(test_spec(44_100), 512),
+        );
         let harness = spawn_engine(plan);
-        harness.commands.send(PlayerCommand::SetShuffle(true)).unwrap();
+        harness
+            .commands
+            .send(PlayerCommand::SetShuffle(true))
+            .unwrap();
         enqueue(&harness, "a.flac");
         enqueue(&harness, "b.flac");
         enqueue(&harness, "c.flac");
@@ -4675,10 +5806,19 @@ mod tests {
         // (id 1) is still audible until the boundary crosses; c (id 3) waits
         // in the queue.
         let mut plan = HashMap::new();
-        plan.insert(PathBuf::from("a.flac"), FakeTrack::Pcm(test_spec(44_100), 512));
-        plan.insert(PathBuf::from("b.flac"), FakeTrack::Pcm(test_spec(44_100), 512));
-        plan.insert(PathBuf::from("c.flac"), FakeTrack::Pcm(test_spec(44_100), 512));
-        let (mut worker, events, calls) = make_test_worker(plan);
+        plan.insert(
+            PathBuf::from("a.flac"),
+            FakeTrack::Pcm(test_spec(44_100), 512),
+        );
+        plan.insert(
+            PathBuf::from("b.flac"),
+            FakeTrack::Pcm(test_spec(44_100), 512),
+        );
+        plan.insert(
+            PathBuf::from("c.flac"),
+            FakeTrack::Pcm(test_spec(44_100), 512),
+        );
+        let (mut worker, events, calls, _seeks) = make_test_worker(plan);
         worker.current = Some(queued(2, "b.flac", None));
         worker.audible = Some(queued(1, "a.flac", None));
         worker.boundary = Some((2, 512));
@@ -4690,21 +5830,36 @@ mod tests {
         });
         assert_reject_reason(rejected, REJECT_COMMITTED_CURRENT);
         assert_eq!(
-            worker.queue.iter().map(|track| track.id).collect::<Vec<_>>(),
+            worker
+                .queue
+                .iter()
+                .map(|track| track.id)
+                .collect::<Vec<_>>(),
             [3],
             "rejection must not touch the queue"
         );
-        assert_eq!(calls.lock().starts, 0, "rejection must not start the output");
+        assert_eq!(
+            calls.lock().starts,
+            0,
+            "rejection must not start the output"
+        );
 
         worker
-            .handle(WorkerMsg::MoveQueueEntry { id: 2, before: Some(3) })
+            .handle(WorkerMsg::MoveQueueEntry {
+                id: 2,
+                before: Some(3),
+            })
             .unwrap();
         let rejected = recv_until(&events, |event| {
             matches!(event, PlayerEvent::QueueEditRejected { id: 2, .. })
         });
         assert_reject_reason(rejected, REJECT_COMMITTED_CURRENT);
         assert_eq!(
-            worker.queue.iter().map(|track| track.id).collect::<Vec<_>>(),
+            worker
+                .queue
+                .iter()
+                .map(|track| track.id)
+                .collect::<Vec<_>>(),
             [3]
         );
         assert_eq!(calls.lock().starts, 0);
@@ -4716,13 +5871,19 @@ mod tests {
         // it shows as pending; jumping to it must play it under its original
         // ID with its CUE range intact.
         let mut plan = HashMap::new();
-        plan.insert(PathBuf::from("a.flac"), FakeTrack::Pcm(test_spec(44_100), 512));
+        plan.insert(
+            PathBuf::from("a.flac"),
+            FakeTrack::Pcm(test_spec(44_100), 512),
+        );
         plan.insert(
             PathBuf::from("b.flac"),
             FakeTrack::Pcm(test_spec(44_100), 176_400),
         );
-        plan.insert(PathBuf::from("c.flac"), FakeTrack::Pcm(test_spec(44_100), 512));
-        let (mut worker, events, _calls) = make_test_worker(plan);
+        plan.insert(
+            PathBuf::from("c.flac"),
+            FakeTrack::Pcm(test_spec(44_100), 512),
+        );
+        let (mut worker, events, _calls, _seeks) = make_test_worker(plan);
         let range = sointty_core::CueRange {
             start_cd: 75,
             end_cd: Some(150),
@@ -4750,10 +5911,7 @@ mod tests {
             audible.as_ref().is_some_and(|item| item.id == 2)
         });
         assert_eq!(audible.map(|item| item.id), Some(2));
-        assert_eq!(
-            pending.iter().map(|item| item.id).collect::<Vec<_>>(),
-            [3]
-        );
+        assert_eq!(pending.iter().map(|item| item.id).collect::<Vec<_>>(), [3]);
         worker.output.stop().unwrap();
     }
 
@@ -4768,25 +5926,570 @@ mod tests {
         let first = recv_until(&harness.events, |event| {
             matches!(event, PlayerEvent::Playing { track: 1, .. })
         });
-        let PlayerEvent::Playing { source, buffers, output, converted, .. } = first else {
+        let PlayerEvent::Playing {
+            source,
+            buffers,
+            output,
+            converted,
+            ..
+        } = first
+        else {
             unreachable!("matched Playing above");
         };
         assert_eq!(source, DecodedSpec::Pcm(spec));
         assert_eq!(buffers, test_buffers());
         assert_eq!(output.rate_hz, 44_100);
         assert!(!converted);
-        harness.commands.send(PlayerCommand::SeekFrame(44_100)).unwrap();
+        harness
+            .commands
+            .send(PlayerCommand::SeekFrame(44_100))
+            .unwrap();
         let sought = recv_until(&harness.events, |event| {
             matches!(event, PlayerEvent::Playing { track: 1, .. })
         });
-        let PlayerEvent::Playing { source, buffers, output, converted, .. } = sought else {
+        let PlayerEvent::Playing {
+            source,
+            buffers,
+            output,
+            converted,
+            ..
+        } = sought
+        else {
             unreachable!("matched Playing above");
         };
         assert_eq!(source, DecodedSpec::Pcm(spec), "seek keeps decoder source");
-        assert_eq!(buffers, test_buffers(), "seek reports the new configure timing");
+        assert_eq!(
+            buffers,
+            test_buffers(),
+            "seek reports the new configure timing"
+        );
         assert_eq!(output.rate_hz, 44_100);
         assert!(!converted);
         harness.commands.send(PlayerCommand::Quit).unwrap();
         harness.join().unwrap();
+    }
+
+    #[test]
+    fn active_access_switch_restarts_same_track_and_queue_in_both_directions() {
+        let mut plan = HashMap::new();
+        plan.insert(
+            PathBuf::from("long.wav"),
+            FakeTrack::Pcm(test_spec(44_100), 1_000_000),
+        );
+        plan.insert(
+            PathBuf::from("next.wav"),
+            FakeTrack::Pcm(test_spec(44_100), 512),
+        );
+        let (harness, _, _) = spawn_engine_access(plan, OutputAccess::Direct, false, false);
+        enqueue(&harness, "long.wav");
+        enqueue(&harness, "next.wav");
+        harness.commands.send(PlayerCommand::Play).unwrap();
+        let first = recv_until(&harness.events, |event| {
+            matches!(event, PlayerEvent::Playing { track: 1, .. })
+        });
+        assert!(matches!(
+            first,
+            PlayerEvent::Playing {
+                shared_playback: false,
+                ..
+            }
+        ));
+        recv_queue_until(&harness.events, |audible, pending| {
+            audible.as_ref().is_some_and(|item| item.id == 1)
+                && pending.iter().map(|item| item.id).collect::<Vec<_>>() == [2]
+        });
+
+        harness
+            .commands
+            .send(PlayerCommand::SetSharedPlayback(true))
+            .unwrap();
+        recv_until(&harness.events, |event| {
+            matches!(event, PlayerEvent::Reconfiguring)
+        });
+        let shared = recv_until(&harness.events, |event| {
+            matches!(
+                event,
+                PlayerEvent::Playing {
+                    track: 1,
+                    shared_playback: true,
+                    ..
+                }
+            )
+        });
+        assert!(matches!(
+            shared,
+            PlayerEvent::Playing {
+                converted: false,
+                ..
+            }
+        ));
+        recv_queue_until(&harness.events, |audible, pending| {
+            audible.as_ref().is_some_and(|item| item.id == 1)
+                && pending.iter().map(|item| item.id).collect::<Vec<_>>() == [2]
+        });
+
+        harness
+            .commands
+            .send(PlayerCommand::SetSharedPlayback(false))
+            .unwrap();
+        recv_until(&harness.events, |event| {
+            matches!(event, PlayerEvent::Reconfiguring)
+        });
+        recv_until(&harness.events, |event| {
+            matches!(
+                event,
+                PlayerEvent::Playing {
+                    track: 1,
+                    shared_playback: false,
+                    ..
+                }
+            )
+        });
+        recv_queue_until(&harness.events, |audible, pending| {
+            audible.as_ref().is_some_and(|item| item.id == 1)
+                && pending.iter().map(|item| item.id).collect::<Vec<_>>() == [2]
+        });
+
+        let calls = harness.calls.lock();
+        let events = &calls.backend_events;
+        let shared_configure = events
+            .iter()
+            .position(|e| *e == BackendEvent::Configure(OutputAccess::Shared))
+            .unwrap();
+        let direct_stop = events[..shared_configure]
+            .iter()
+            .rposition(|e| *e == BackendEvent::Stop(OutputAccess::Direct))
+            .unwrap();
+        let shared_construct = events[..shared_configure]
+            .iter()
+            .position(|e| *e == BackendEvent::Construct(OutputAccess::Shared))
+            .unwrap();
+        assert!(direct_stop < shared_construct && shared_construct < shared_configure);
+        let direct_configure = events
+            .iter()
+            .enumerate()
+            .skip(shared_configure + 1)
+            .find_map(|(i, e)| (*e == BackendEvent::Configure(OutputAccess::Direct)).then_some(i))
+            .unwrap();
+        let shared_stop = events[..direct_configure]
+            .iter()
+            .rposition(|e| *e == BackendEvent::Stop(OutputAccess::Shared))
+            .unwrap();
+        assert!(
+            shared_stop < direct_configure,
+            "shared backend must stop before direct configures"
+        );
+        drop(calls);
+
+        harness.commands.send(PlayerCommand::Quit).unwrap();
+        harness.join().unwrap();
+    }
+
+    #[test]
+    fn initial_shared_access_plays_only_through_shared_backend() {
+        let mut plan = HashMap::new();
+        plan.insert(
+            PathBuf::from("long.wav"),
+            FakeTrack::Pcm(test_spec(44_100), 1_000_000),
+        );
+        let (harness, _, _) = spawn_engine_access(plan, OutputAccess::Shared, false, false);
+        enqueue(&harness, "long.wav");
+        harness.commands.send(PlayerCommand::Play).unwrap();
+        let playing = recv_until(&harness.events, |event| {
+            matches!(event, PlayerEvent::Playing { track: 1, .. })
+        });
+        assert!(matches!(
+            playing,
+            PlayerEvent::Playing {
+                shared_playback: true,
+                converted: false,
+                ..
+            }
+        ));
+        {
+            let calls = harness.calls.lock();
+            let events = &calls.backend_events;
+            assert!(events.contains(&BackendEvent::Configure(OutputAccess::Shared)));
+            assert!(events.contains(&BackendEvent::Start(OutputAccess::Shared)));
+            assert!(!events.contains(&BackendEvent::Configure(OutputAccess::Direct)));
+        }
+        harness.commands.send(PlayerCommand::Quit).unwrap();
+        harness.join().unwrap();
+    }
+
+    #[test]
+    fn idle_switch_replaces_backend_without_autoplay() {
+        let mut plan = HashMap::new();
+        plan.insert(
+            PathBuf::from("long.wav"),
+            FakeTrack::Pcm(test_spec(44_100), 1_000_000),
+        );
+        let (harness, _, _) = spawn_engine_access(plan, OutputAccess::Direct, false, false);
+        harness
+            .commands
+            .send(PlayerCommand::SetSharedPlayback(true))
+            .unwrap();
+        enqueue(&harness, "long.wav");
+        // The queue snapshot proves the worker processed the prior idle
+        // switch. No output has started merely because the mode changed.
+        recv_queue_until(&harness.events, |_, pending| {
+            pending.iter().any(|item| item.id == 1)
+        });
+        {
+            let calls = harness.calls.lock();
+            assert_eq!(calls.starts, 0);
+            assert!(
+                calls
+                    .backend_events
+                    .contains(&BackendEvent::Construct(OutputAccess::Shared))
+            );
+            assert!(
+                !calls
+                    .backend_events
+                    .contains(&BackendEvent::Configure(OutputAccess::Direct))
+            );
+        }
+        harness.commands.send(PlayerCommand::Play).unwrap();
+        recv_until(&harness.events, |event| {
+            matches!(
+                event,
+                PlayerEvent::Playing {
+                    track: 1,
+                    shared_playback: true,
+                    ..
+                }
+            )
+        });
+        harness.commands.send(PlayerCommand::Quit).unwrap();
+        harness.join().unwrap();
+    }
+
+    #[test]
+    fn mid_cue_access_restart_uses_consumed_frame_and_keeps_prepared_next() {
+        let mut plan = HashMap::new();
+        plan.insert(
+            PathBuf::from("cue.wav"),
+            FakeTrack::Pcm(test_spec(44_100), 500_000),
+        );
+        plan.insert(
+            PathBuf::from("next.wav"),
+            FakeTrack::Pcm(test_spec(44_100), 512),
+        );
+        let range = sointty_core::CueRange {
+            start_cd: 2,
+            end_cd: Some(600),
+        };
+        let start_sample = cd_frames_to_samples(range.start_cd, 44_100);
+        let end_frames = cd_frames_to_samples(600, 44_100) - start_sample;
+        let (harness, _, _) = spawn_engine_access(plan, OutputAccess::Direct, false, false);
+        enqueue_ranged(&harness, "cue.wav", range);
+        enqueue(&harness, "next.wav");
+        harness.commands.send(PlayerCommand::Play).unwrap();
+        recv_until(&harness.events, |event| {
+            matches!(
+                event,
+                PlayerEvent::Playing {
+                    track: 1,
+                    shared_playback: false,
+                    ..
+                }
+            )
+        });
+        recv_queue_until(&harness.events, |audible, pending| {
+            audible.as_ref().is_some_and(|item| item.id == 1)
+                && pending.iter().map(|item| item.id).collect::<Vec<_>>() == [2]
+        });
+        // Seek inside the CUE span first: the restart must preserve that
+        // range-relative offset and continue to honor the CUE end.
+        harness
+            .commands
+            .send(PlayerCommand::SeekFrame(10_000))
+            .unwrap();
+        recv_until(&harness.events, |event| {
+            matches!(
+                event,
+                PlayerEvent::Position {
+                    track: 1,
+                    frame: 10_000
+                }
+            )
+        });
+        harness
+            .commands
+            .send(PlayerCommand::SetSharedPlayback(true))
+            .unwrap();
+        let playing = recv_until(&harness.events, |event| {
+            matches!(
+                event,
+                PlayerEvent::Playing {
+                    track: 1,
+                    shared_playback: true,
+                    ..
+                }
+            )
+        });
+        assert!(matches!(
+            playing,
+            PlayerEvent::Playing {
+                converted: false,
+                ..
+            }
+        ));
+        let position = recv_until(&harness.events, |event| {
+            matches!(event, PlayerEvent::Position { track: 1, .. })
+        });
+        let PlayerEvent::Position { frame, .. } = position else {
+            unreachable!()
+        };
+        let last_seek = *harness.seeks.lock().last().unwrap();
+        assert_eq!(
+            last_seek,
+            start_sample + frame,
+            "restart re-seeks the consumed CUE frame"
+        );
+        assert!(
+            frame >= 10_000 && frame < end_frames,
+            "restart stays inside the CUE span"
+        );
+        let (audible, pending) = recv_queue_until(&harness.events, |audible, pending| {
+            audible.as_ref().is_some_and(|item| item.id == 1)
+                && pending.iter().map(|item| item.id).collect::<Vec<_>>() == [2]
+        });
+        assert_eq!(audible.unwrap().entry.cue_range, Some(range));
+        assert_eq!(pending[0].id, 2, "prepared next entry survives the switch");
+        // The next progress event retains the resume base, rather than
+        // jumping back to zero after the seek/restart.
+        let later = recv_until(
+            &harness.events,
+            |event| matches!(event, PlayerEvent::Position { track: 1, frame: next } if *next > frame),
+        );
+        assert!(matches!(later, PlayerEvent::Position { frame: next, .. } if next > frame));
+        harness.commands.send(PlayerCommand::Next).unwrap();
+        recv_until(&harness.events, |event| {
+            matches!(
+                event,
+                PlayerEvent::Playing {
+                    track: 2,
+                    shared_playback: true,
+                    ..
+                }
+            )
+        });
+        harness.commands.send(PlayerCommand::Quit).unwrap();
+        harness.join().unwrap();
+    }
+
+    #[test]
+    fn failed_access_backend_requeues_original_cue_entry_without_direct_fallback() {
+        for (reject_construct, reject_configure) in [(true, false), (false, true)] {
+            let mut plan = HashMap::new();
+            plan.insert(
+                PathBuf::from("cue.wav"),
+                FakeTrack::Pcm(test_spec(44_100), 500_000),
+            );
+            plan.insert(
+                PathBuf::from("next.wav"),
+                FakeTrack::Pcm(test_spec(44_100), 512),
+            );
+            let range = sointty_core::CueRange {
+                start_cd: 2,
+                end_cd: Some(600),
+            };
+            let start_sample = cd_frames_to_samples(range.start_cd, 44_100);
+            let (harness, construct_flag, configure_flag) = spawn_engine_access(
+                plan,
+                OutputAccess::Direct,
+                reject_construct,
+                reject_configure,
+            );
+            enqueue_ranged(&harness, "cue.wav", range);
+            enqueue(&harness, "next.wav");
+            harness.commands.send(PlayerCommand::Play).unwrap();
+            recv_until(&harness.events, |event| {
+                matches!(
+                    event,
+                    PlayerEvent::Playing {
+                        track: 1,
+                        shared_playback: false,
+                        ..
+                    }
+                )
+            });
+            recv_queue_until(&harness.events, |audible, pending| {
+                audible.as_ref().is_some_and(|item| item.id == 1)
+                    && pending.iter().map(|item| item.id).collect::<Vec<_>>() == [2]
+            });
+            harness
+                .commands
+                .send(PlayerCommand::SetSharedPlayback(true))
+                .unwrap();
+            let error = recv_until(&harness.events, |event| {
+                matches!(event, PlayerEvent::Error { track: Some(1), .. })
+            });
+            assert!(matches!(
+                error,
+                PlayerEvent::Error {
+                    kind: PlayerError::DeviceBusy | PlayerError::UnsupportedFormat { .. },
+                    ..
+                }
+            ));
+            let (audible, pending) = recv_queue_until(&harness.events, |audible, pending| {
+                audible.is_none()
+                    && pending.iter().map(|item| item.id).collect::<Vec<_>>() == [1, 2]
+            });
+            assert!(audible.is_none());
+            assert_eq!(pending[0].entry.cue_range, Some(range));
+            {
+                let calls = harness.calls.lock();
+                let events = &calls.backend_events;
+                let direct_stop = events
+                    .iter()
+                    .rposition(|e| *e == BackendEvent::Stop(OutputAccess::Direct))
+                    .unwrap();
+                assert!(
+                    !events[direct_stop + 1..]
+                        .iter()
+                        .any(|e| *e == BackendEvent::Start(OutputAccess::Direct))
+                );
+                assert!(
+                    !events
+                        .iter()
+                        .any(|e| *e == BackendEvent::Start(OutputAccess::Shared))
+                );
+            }
+            // Clear the scripted failure. The next Play must reopen the
+            // same queued ID/CUE range at its start in the still-desired
+            // Shared mode, not resume on the stopped Direct backend.
+            construct_flag.store(false, Ordering::SeqCst);
+            configure_flag.store(false, Ordering::SeqCst);
+            harness.commands.send(PlayerCommand::Play).unwrap();
+            recv_until(&harness.events, |event| {
+                matches!(
+                    event,
+                    PlayerEvent::Playing {
+                        track: 1,
+                        shared_playback: true,
+                        ..
+                    }
+                )
+            });
+            assert_eq!(*harness.seeks.lock().last().unwrap(), start_sample);
+            harness.commands.send(PlayerCommand::Quit).unwrap();
+            harness.join().unwrap();
+        }
+    }
+
+    #[test]
+    fn deferred_boundary_switch_waits_until_next_track_is_audible() {
+        let (mut worker, events, calls, seeks, range) = make_committed_boundary_worker();
+        let stops_before = calls.lock().stops;
+        worker.handle(WorkerMsg::SetSharedPlayback(true)).unwrap();
+        assert_eq!(worker.access, OutputAccess::Shared);
+        assert_eq!(worker.output_access, OutputAccess::Direct);
+        assert_eq!(
+            calls.lock().stops,
+            stops_before,
+            "do not cut off the still-audible old track"
+        );
+
+        // The next track becomes audible 20 frames past the committed
+        // boundary. Only now may the switch restart that track in Shared.
+        worker.counters.played_frames.store(532, Ordering::Relaxed);
+        worker.emit_pending_boundary();
+        let old_mode = recv_until(&events, |event| {
+            matches!(event, PlayerEvent::Playing { track: 2, .. })
+        });
+        assert!(matches!(
+            old_mode,
+            PlayerEvent::Playing {
+                shared_playback: false,
+                ..
+            }
+        ));
+        recv_until(&events, |event| matches!(event, PlayerEvent::Reconfiguring));
+        let new_mode = recv_until(&events, |event| {
+            matches!(
+                event,
+                PlayerEvent::Playing {
+                    track: 2,
+                    shared_playback: true,
+                    ..
+                }
+            )
+        });
+        assert!(matches!(
+            new_mode,
+            PlayerEvent::Playing {
+                converted: false,
+                ..
+            }
+        ));
+        let position = recv_until(&events, |event| {
+            matches!(event, PlayerEvent::Position { track: 2, .. })
+        });
+        assert!(matches!(position, PlayerEvent::Position { frame: 20, .. }));
+        assert_eq!(
+            *seeks.lock().last().unwrap(),
+            cd_frames_to_samples(range.start_cd, 44_100) + 20,
+            "restart seeks into the now-audible CUE span, not past the old track's frames",
+        );
+        let (audible, pending) = recv_queue_until(&events, |audible, pending| {
+            audible.as_ref().is_some_and(|item| item.id == 2)
+                && pending.iter().map(|item| item.id).collect::<Vec<_>>() == [3]
+        });
+        assert_eq!(audible.unwrap().entry.cue_range, Some(range));
+        assert_eq!(pending[0].id, 3);
+        {
+            let calls = calls.lock();
+            let events = &calls.backend_events;
+            let shared_configure = events
+                .iter()
+                .position(|e| *e == BackendEvent::Configure(OutputAccess::Shared))
+                .unwrap();
+            assert!(
+                events[..shared_configure]
+                    .iter()
+                    .any(|e| *e == BackendEvent::Stop(OutputAccess::Direct))
+            );
+        }
+        worker.output.stop().unwrap();
+    }
+
+    #[test]
+    fn deferred_switch_applies_on_suspended_resume_if_stall_precedes_boundary() {
+        let (mut worker, events, _calls, seeks, range) = make_committed_boundary_worker();
+        worker.handle(WorkerMsg::SetSharedPlayback(true)).unwrap();
+        // The old track is still audible when the stall forces a stop.
+        worker.suspend_for_stall().unwrap();
+        assert_eq!(worker.suspended.as_ref().unwrap().resume_frame, 0);
+        worker.resume_after_stall().unwrap();
+        let playing = recv_until(&events, |event| {
+            matches!(event, PlayerEvent::Playing { track: 2, .. })
+        });
+        assert!(matches!(
+            playing,
+            PlayerEvent::Playing {
+                shared_playback: true,
+                ..
+            }
+        ));
+        let position = recv_until(&events, |event| {
+            matches!(event, PlayerEvent::Position { track: 2, .. })
+        });
+        assert!(matches!(position, PlayerEvent::Position { frame: 0, .. }));
+        assert_eq!(
+            *seeks.lock().last().unwrap(),
+            cd_frames_to_samples(range.start_cd, 44_100)
+        );
+        assert!(
+            worker.boundary.is_none(),
+            "new ring cannot retain the old committed boundary"
+        );
+        let (audible, _pending) = recv_queue_until(&events, |audible, pending| {
+            audible.as_ref().is_some_and(|item| item.id == 2)
+                && pending.iter().map(|item| item.id).collect::<Vec<_>>() == [3]
+        });
+        assert_eq!(audible.unwrap().entry.cue_range, Some(range));
+        worker.output.stop().unwrap();
     }
 }

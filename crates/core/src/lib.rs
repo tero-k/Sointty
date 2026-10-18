@@ -6,6 +6,17 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 pub type TrackId = u64;
 pub type DeviceId = String;
 
+/// How the output endpoint is opened. `Direct` (the default) is the
+/// exclusive/bit-perfect path; `Shared` is the explicitly opted-in system
+/// mixer path, where the OS may convert, resample, remix and apply volume
+/// processing (never bit-perfect).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum OutputAccess {
+    #[default]
+    Direct,
+    Shared,
+}
+
 pub type CoreResult<T> = Result<T, PlayerError>;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -103,9 +114,7 @@ impl DeviceFormat {
             Self::S24_3Le | Self::S24In32Low | Self::S24In32High => SampleEncoding::S24,
             Self::S32Le => SampleEncoding::S32,
             Self::F32Le => SampleEncoding::F32,
-            Self::DsdU8 | Self::DsdU16Le | Self::DsdU32Le | Self::Dop24 => {
-                SampleEncoding::Dsd
-            }
+            Self::DsdU8 | Self::DsdU16Le | Self::DsdU32Le | Self::Dop24 => SampleEncoding::Dsd,
         }
     }
 
@@ -231,7 +240,6 @@ impl fmt::Display for PlayerError {
 
 impl std::error::Error for PlayerError {}
 
-
 /// A playable queue item: one file, optionally restricted to a CUE sub-range.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct QueueEntry {
@@ -305,6 +313,11 @@ pub enum PlayerCommand {
     /// integer format. S16/S24 convert exactly (both fit the F32 mantissa);
     /// S32 rounds to 24-bit precision.
     SetIntToFloat(bool),
+    /// Opt in to shared/system-mixer output (OS may resample, remix and
+    /// process; never bit-perfect). `false` restores direct/exclusive
+    /// output. Applies immediately, restarting the current stream near its
+    /// consumed position; there is no automatic fallback between modes.
+    SetSharedPlayback(bool),
     /// Override DAC timing; `None` restores the rate-relative default for
     /// that field. Applies on the next output configure.
     SetTiming {
@@ -345,6 +358,11 @@ pub enum PlayerEvent {
         /// True only when samples underwent an opted-in format conversion
         /// (F32→integer or integer→F32) instead of the exact path.
         converted: bool,
+        /// True when the stream plays through the shared system mixer (the
+        /// `shared_playback` opt-in). Shared playback is never bit-perfect
+        /// even when `converted` is false: the OS may still resample, remix
+        /// or process the submitted PCM.
+        shared_playback: bool,
     },
     Position {
         track: TrackId,
@@ -845,7 +863,9 @@ mod tests {
         .unwrap();
         assert_eq!(
             bytes,
-            [0, 0, 0, 0x40, 0, 0, 0, 0xc0, 0, 0xff, 0xff, 0x7f, 0, 0, 0, 0x80]
+            [
+                0, 0, 0, 0x40, 0, 0, 0, 0xc0, 0, 0xff, 0xff, 0x7f, 0, 0, 0, 0x80
+            ]
         );
     }
 
@@ -890,11 +910,15 @@ mod tests {
         // Two stereo PCM frames: each channel shares the marker, then it
         // alternates for the next frame.
         let mut out = Vec::new();
-        packer.pack(&[0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88], &mut out).unwrap();
-        assert_eq!(out, [
-            0x11, 0x33, 0x05, 0x22, 0x44, 0x05,
-            0x55, 0x77, 0xfa, 0x66, 0x88, 0xfa,
-        ]);
+        packer
+            .pack(&[0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88], &mut out)
+            .unwrap();
+        assert_eq!(
+            out,
+            [
+                0x11, 0x33, 0x05, 0x22, 0x44, 0x05, 0x55, 0x77, 0xfa, 0x66, 0x88, 0xfa,
+            ]
+        );
     }
 
     #[test]

@@ -101,6 +101,7 @@ pub enum Action {
     SaveCatalog,
     ToggleFloatToInt,
     ToggleIntToFloat,
+    ToggleSharedPlayback,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -942,6 +943,13 @@ pub static BINDINGS: &[Binding] = &[
         "Settings",
     ),
     global(
+        KeyCode::Char('g'),
+        Action::ToggleSharedPlayback,
+        "g",
+        "shared/exclusive",
+        "Settings",
+    ),
+    global(
         KeyCode::Char('a'),
         Action::EnqueueSelected,
         "a",
@@ -1096,11 +1104,12 @@ pub fn footer_pairs(focus: Focus, mode: ModeKind) -> Vec<(&'static str, &'static
                             && matches!(binding.scope, Scope::On(scope) if scope == focus)
                     })
                     .or_else(|| {
-                        let pause_key = if matches!(focus, Focus::PlaylistTracks | Focus::SettingsRows) {
-                            "ctrl+space"
-                        } else {
-                            "space"
-                        };
+                        let pause_key =
+                            if matches!(focus, Focus::PlaylistTracks | Focus::SettingsRows) {
+                                "ctrl+space"
+                            } else {
+                                "space"
+                            };
                         BINDINGS.iter().find(|binding| {
                             binding.footer
                                 && binding.action == *action

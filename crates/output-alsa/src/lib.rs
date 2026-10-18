@@ -7,8 +7,8 @@ use std::thread::JoinHandle;
 
 #[cfg(target_os = "linux")]
 use sointty_core::{
-    AudioOutput, BufferConfig, DsdSpec, OutputCounters, OutputSpec, PlayerError, SampleEncoding,
-    StreamSpec, validate_device_selection, validate_exact_spec,
+    AudioOutput, BufferConfig, DsdSpec, OutputAccess, OutputCounters, OutputSpec, PlayerError,
+    SampleEncoding, StreamSpec, validate_device_selection, validate_exact_spec,
 };
 use sointty_core::{ChannelLayout, DeviceFormat, DeviceId};
 
@@ -28,20 +28,38 @@ mod imp {
 
     pub struct AlsaOutput {
         device: DeviceId,
+        /// Direct validates and opens the selected `hw:` endpoint; Shared
+        /// always opens the ALSA `default` PCM (the system-configured mixer
+        /// route) and never the retained `hw:` selection.
+        access: OutputAccess,
         pcm: Option<PCM>,
         spec: Option<OutputSpec>,
         thread: Option<JoinHandle<()>>,
     }
 
     impl AlsaOutput {
-        pub fn new(device: DeviceId) -> Result<Self, PlayerError> {
-            validate_device_selection(&device)?;
+        pub fn new(device: DeviceId, access: OutputAccess) -> Result<Self, PlayerError> {
+            // Only the direct path requires (and may use) a `hw:` endpoint;
+            // in shared mode the selection is retained for later direct use
+            // and the literal `default` PCM is opened instead.
+            if access == OutputAccess::Direct {
+                validate_device_selection(&device)?;
+            }
             Ok(Self {
                 device,
+                access,
                 pcm: None,
                 spec: None,
                 thread: None,
             })
+        }
+
+        /// The PCM name to open for the current access mode.
+        fn pcm_name(&self) -> &str {
+            match self.access {
+                OutputAccess::Direct => &self.device,
+                OutputAccess::Shared => "default",
+            }
         }
     }
 
@@ -54,7 +72,7 @@ mod imp {
             validate_exact_spec(input)?;
             self.stop()?;
 
-            let pcm = PCM::new(&self.device, Direction::Playback, false).map_err(|error| {
+            let pcm = PCM::new(self.pcm_name(), Direction::Playback, false).map_err(|error| {
                 if error.errno() == 16 {
                     PlayerError::DeviceBusy
                 } else {
@@ -75,8 +93,14 @@ mod imp {
 
             let mut configured = None;
             for (device_format, alsa_format) in candidates {
-                let result =
-                    configure_candidate(&pcm, input, buffers, *alsa_format, *device_format);
+                let result = configure_candidate(
+                    &pcm,
+                    input,
+                    buffers,
+                    *alsa_format,
+                    *device_format,
+                    self.access,
+                );
                 match result {
                     Ok(spec) => {
                         configured = Some(spec);
@@ -90,9 +114,16 @@ mod imp {
                 rate_hz: input.rate_hz,
                 channels: input.layout.channels,
                 encoding: input.encoding,
-                reason: "device rejected all exact-rate hardware-native PCM candidates",
+                reason: match self.access {
+                    OutputAccess::Direct => {
+                        "device rejected all exact-rate hardware-native PCM candidates"
+                    }
+                    OutputAccess::Shared => "no supported shared PCM input format",
+                },
             })?;
-            spec.device = self.device.clone();
+            // Name the actual route: the selected endpoint in Direct, the
+            // system-configured `default` PCM in Shared.
+            spec.device = self.pcm_name().to_owned();
             self.spec = Some(spec.clone());
             self.pcm = Some(pcm);
             Ok(spec)
@@ -103,6 +134,16 @@ mod imp {
             input: &DsdSpec,
             buffers: BufferConfig,
         ) -> Result<OutputSpec, PlayerError> {
+            // A shared PCM mixer cannot carry raw DSD or DoP frames; reject
+            // explicitly instead of letting a plugin reinterpret the bytes.
+            if self.access == OutputAccess::Shared {
+                return Err(PlayerError::UnsupportedFormat {
+                    rate_hz: input.dsd_rate_hz,
+                    channels: input.layout.channels,
+                    encoding: SampleEncoding::Dsd,
+                    reason: "shared PCM output cannot carry DSD/DoP; use direct mode for DSD",
+                });
+            }
             self.stop()?;
 
             let pcm = PCM::new(&self.device, Direction::Playback, false).map_err(|error| {
@@ -134,8 +175,8 @@ mod imp {
             }
             // Negotiated parameters are surfaced through the returned
             // `OutputSpec`; printing here would corrupt the TUI.
-            let (_, mut spec) =
-                configured.ok_or_else(|| no_dsd_mode_error(input.dsd_rate_hz, input.layout.channels))?;
+            let (_, mut spec) = configured
+                .ok_or_else(|| no_dsd_mode_error(input.dsd_rate_hz, input.layout.channels))?;
             spec.device = self.device.clone();
             self.spec = Some(spec.clone());
             self.pcm = Some(pcm);
@@ -182,7 +223,9 @@ mod imp {
         buffers: BufferConfig,
         format: Format,
         device_format: DeviceFormat,
+        access: OutputAccess,
     ) -> Result<OutputSpec, PlayerError> {
+        let shared = access == OutputAccess::Shared;
         let hw = HwParams::any(pcm).map_err(|_| PlayerError::Output)?;
         hw.set_access(Access::RWInterleaved)
             .map_err(|_| unsupported(input, "interleaved output unavailable"))?;
@@ -193,13 +236,16 @@ mod imp {
         hw.set_rate(input.rate_hz, ValueOr::Nearest)
             .map_err(|_| unsupported(input, "device rejected exact sample rate"))?;
         let actual_rate = hw.get_rate().map_err(|_| PlayerError::Output)?;
-        if actual_rate != input.rate_hz {
+        if actual_rate != input.rate_hz && !shared {
             return Err(unsupported(
                 input,
                 "device would run at a different sample rate",
             ));
         }
-        if hw.get_rate_resample().map_err(|_| PlayerError::Output)? {
+        // Direct-only assertion: a `hw:` endpoint must not resample. The
+        // shared `default` PCM's plugin/server may convert; that processing
+        // is exactly what the labeled shared opt-in authorizes.
+        if !shared && hw.get_rate_resample().map_err(|_| PlayerError::Output)? {
             return Err(unsupported(input, "ALSA hardware resampling is enabled"));
         }
         hw.set_period_size(i64::from(buffers.period_frames), ValueOr::Nearest)
@@ -361,7 +407,10 @@ pub struct AlsaOutput {
 
 #[cfg(not(target_os = "linux"))]
 impl AlsaOutput {
-    pub fn new(_device: DeviceId) -> Result<Self, PlayerError> {
+    pub fn new(
+        _device: DeviceId,
+        _access: sointty_core::OutputAccess,
+    ) -> Result<Self, PlayerError> {
         Err(PlayerError::InvalidInput(
             "ALSA output is only available on Linux",
         ))

@@ -1,8 +1,9 @@
 # Sointty
 
-A terminal music player with a bit-perfect output path. What the decoder
-produces is what the device gets: same samples, same rate, same channels.
-No resampling, no volume processing, no EQ, no mixer in between.
+A terminal music player with a bit-perfect direct/exclusive output path by
+default. An explicit `--shared` or TUI `g` opt-in uses the OS/system mixer:
+it may resample, remix or process PCM, and is never bit-perfect. There is
+no automatic fallback between access modes.
 
 [![License: MIT OR Apache-2.0](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg)](LICENSE-MIT)
 [![MSRV: 1.98.1](https://img.shields.io/badge/rustc-1.98.1%2B-orange.svg)](https://blog.rust-lang.org/releases/)
@@ -30,6 +31,8 @@ sointty --list-devices                 # list output endpoints
 sointty /path/to/album/                # play files or folders
 sointty playlist.m3u                   # playlists expand into tracks
 sointty                                # no arguments: open the Library browser
+sointty --exclusive /path/to/track.wav  # direct/exclusive (the default)
+sointty --shared /path/to/track.wav     # OS mixer, not bit-perfect
 ```
 
 With no arguments, sointty opens the Library screen where you last left it
@@ -56,9 +59,9 @@ tracks to a playlist never touches the playback queue.
 
 ![Sointty Playlists screen: playlist names and track rows](docs/assets/tui-playlists.png)
 
-**3: Settings.** Pick the output device, adjust buffer timing, and toggle the
-conversion opt-ins. Press `d` from anywhere to jump straight to the output
-device setting.
+**3: Settings.** Pick the output device, toggle direct/shared access, adjust
+buffer timing, and toggle the conversion opt-ins. Press `d` from anywhere to
+jump to Output settings, or `g` in Normal mode to toggle access immediately.
 
 ![Sointty Settings screen: output and playback options](docs/assets/tui-settings.png)
 
@@ -84,20 +87,35 @@ throwaway demo files, not recordings of real libraries or hardware playback.
 
 ## Behavior
 
-- If the output device can't take the stream exactly as decoded, playback fails
-  with a typed error instead of a silent conversion. Two explicit opt-ins relax
-  this: `--allow-float-to-int` (TUI `c`) enables F32→integer conversion for
-  float-decoding formats on integer-only devices, and `--allow-int-to-float`
-  (TUI `i`) enables integer→F32 conversion on float-only endpoints such as the
-  macOS internal speakers (S16/S24 convert exactly; S32 loses its low 8 bits).
-  Converted output is labeled `converted` in the Now playing panel.
-- On macOS, hog mode is paired with Core Audio Integer Mode: non-mixable
-  integer stream formats are selected for both the hardware and IOProc sides
-  when the driver offers them, so capable USB DACs receive the exact integer
-  samples with no conversion anywhere. The integer→F32 opt-in is only needed
-  on endpoints whose IOProc interface is float-only.
-- The negotiated format (rate, channels, packing, valid bits) is shown on
-  screen as established with the device, not as requested.
+- In the default direct/exclusive mode, if the output device can't take the
+  stream exactly as decoded, playback fails with a typed error instead of a
+  silent conversion. Two separate opt-ins relax this: `--allow-float-to-int`
+  (TUI `c`) enables F32→integer conversion for float-decoding formats on
+  integer-only devices, and `--allow-int-to-float` (TUI `i`) enables
+  integer→F32 conversion on float-only endpoints such as the macOS internal
+  speakers (S16/S24 convert exactly; S32 loses its low 8 bits). Converted
+  output is labeled `converted` in the Now playing panel.
+- `--shared` (TUI `g`, persisted as `shared_playback = true`) sends PCM through
+  the selected endpoint's OS mixer on Windows/macOS, or the system-configured
+  ALSA `default` PCM on Linux. The OS may convert, resample, remix or process
+  it; the Now playing badge says `shared` even when the submitted client bytes
+  were unchanged. App-side F32/integer conversion, when used, is still named
+  in the status line. Another application can play on the same route only
+  when that endpoint and the OS mixer configuration support concurrency.
+  An absent/busy shared route reports an error; it never falls back to Direct.
+- Toggling access during playback stops the old backend and resumes the same
+  track near its consumed source frame. The track ID, CUE bounds and upcoming
+  queue survive, but the restart is not seamless. If reopening fails, the
+  current entry returns to the queue front for a later Play in the requested
+  mode; no old-mode fallback occurs.
+- On macOS Direct, hog mode is paired with Core Audio Integer Mode:
+  non-mixable integer stream formats are selected for both hardware and
+  IOProc when the driver offers them. Capable USB DACs then receive exact
+  integer samples with no conversion anywhere. Shared uses a separate AUHAL
+  output unit and never changes the device's global nominal/physical/virtual
+  formats.
+- The reported output format describes the submitted client bytes. Shared
+  mode does not claim the physical DAC format or a bit-perfect path.
 - Tracks with an identical stream specification play gaplessly through one
   open device.
 - File reads go through a bounded read-ahead worker, so slow or mounted drives
@@ -118,6 +136,7 @@ Beyond the everyday keys above:
 | `x` | actions overlay for the current pane |
 | `r` | toggle random play for the live queue; the current song and preopened next song stay in place |
 | `d` | jump to the output device setting |
+| `g` | toggle shared OS-mixer playback / direct exclusive playback (off by default) |
 | `c` | allow F32→integer conversion (off by default) |
 | `i` | allow integer→F32 conversion for float-only devices (off by default) |
 | `Esc` | close the current overlay or step back; quit from the Library home |
@@ -134,20 +153,26 @@ empty instead of estimating from file size.
 
 ## Fidelity rules
 
-- PCM passes through unchanged. The only permitted transforms are lossless:
-  channel interleaving, byte-order packing, and widening into a larger
-  container with zeroed low bits (e.g. 24-bit samples in a 32-bit slot).
-- Rate, channel mask, packing, and valid bits are confirmed with the device at
-  initialization; mismatches raise `UnsupportedFormat`.
+- In default Direct mode, PCM passes through unchanged. The only permitted
+  transforms are lossless: channel interleaving, byte-order packing, and
+  widening into a larger container with zeroed low bits (e.g. 24-bit samples
+  in a 32-bit slot).
+- Direct mode confirms rate, channel mask, packing, and valid bits with the
+  device at initialization; mismatches raise `UnsupportedFormat`.
+- Shared mode is an explicit, labeled opt-in to OS-managed PCM conversion,
+  resampling, mixing and volume processing. It is never labeled bit-perfect,
+  even if no app-side packer converts the submitted client format.
 - F32→integer conversion, when enabled, is round-to-nearest-even with clipping
   and no dither, and runs on the decoder thread, not the render thread.
-- Integer→F32 conversion, when enabled, divides by the full-scale integer
-  range with no dither and likewise runs on the decoder thread. S16 and S24
-  values land exactly in the F32 mantissa; S32 rounds to 24-bit precision.
-- DSD is a separate stream type: native DSD or DoP on ALSA, never converted to
-  PCM.
-- No `cpal`, no ALSA `plug`/`plughw`/`default`, no WASAPI shared mode, no
-  Core Audio system mixer or aggregate devices.
+- Integer→F32 conversion, when enabled (or authorized by shared mode), divides
+  by the full-scale integer range with no dither and likewise runs on the
+  decoder thread. S16 and S24 values land exactly in the F32 mantissa; S32
+  rounds to 24-bit precision.
+- DSD is a separate stream type: native DSD or DoP on direct ALSA, never
+  converted to PCM. Shared PCM explicitly rejects DSD/DoP.
+- No `cpal`. Direct ALSA uses only explicit `hw:` endpoints (never `plug`,
+  `plughw` or `default`); shared ALSA uses only the configured `default` PCM,
+  never a hidden `dmix`/`plug`/other fallback.
 
 ## Formats
 
@@ -164,9 +189,9 @@ adjacent ranges.
 
 | OS | Backend | Status |
 |---|---|---|
-| Linux | ALSA `hw:` direct, native DSD and DoP | implemented, awaiting hardware test |
-| Windows | WASAPI exclusive, push-mode fallback for drivers that force whole-buffer periods | tested on an iFi ZEN DAC V2 |
-| macOS | Core Audio HAL hog mode | tested on an iFi ZEN DAC V2 |
+| Linux | ALSA `hw:` Direct (native DSD/DoP); configured `default` PCM Shared | implemented; native hardware/concurrency verification pending |
+| Windows | WASAPI exclusive Direct; WASAPI shared audio engine | Direct tested on an iFi ZEN DAC V2; Shared native concurrency verification pending |
+| macOS | Core Audio HAL hog-mode Direct; separate AUHAL Shared | Direct tested on an iFi ZEN DAC V2; Shared native hardware verification pending |
 
 ### Tested devices
 
@@ -185,6 +210,14 @@ tracks never touches the playback queue.
 
 Buffer timing (period/buffer frames) is adjustable on the Settings screen
 under Output; Auto derives timing from each track's sample rate.
+
+`shared_playback = true` is the persisted, off-by-default OS-mixer opt-in.
+`--shared` and `--exclusive` override it for one run. In the TUI, `g` and
+Settings → Output → Access save the choice before switching; a failed save
+leaves playback unchanged. On Linux the device picker selects a `hw:` endpoint
+for Direct only; Shared always follows the system-configured ALSA `default`
+route. That route must be mixer-backed for concurrent playback. A direct-only
+`default` cannot offer concurrency, and Sointty does not retarget it.
 
 Random play shuffles only upcoming queue entries, not saved playlists. Turning
 it off keeps the current queue order and appends future songs in order. The

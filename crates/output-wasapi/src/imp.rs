@@ -1,19 +1,21 @@
-//! WASAPI exclusive-mode output backend (Windows only).
+//! WASAPI exclusive Direct and OS-mixed Shared output (Windows only).
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread::JoinHandle;
 
 use sointty_core::{
-    AudioOutput, BufferConfig, DeviceId, OutputCounters, OutputSpec, PlayerError, StreamSpec,
-    validate_exact_spec,
+    AudioOutput, BufferConfig, DeviceId, OutputAccess, OutputCounters, OutputSpec, PlayerError,
+    StreamSpec, validate_exact_spec,
 };
 use windows::Win32::Foundation::CloseHandle;
 use windows::Win32::Foundation::{
-    HANDLE, PROPERTYKEY, RPC_E_CHANGED_MODE, S_FALSE, S_OK, WAIT_TIMEOUT,
+    E_INVALIDARG, HANDLE, PROPERTYKEY, RPC_E_CHANGED_MODE, S_FALSE, S_OK, WAIT_TIMEOUT,
 };
 use windows::Win32::Media::Audio::{
-    AUDCLNT_E_DEVICE_IN_USE, AUDCLNT_SHAREMODE_EXCLUSIVE, AUDCLNT_STREAMFLAGS_EVENTCALLBACK,
+    AUDCLNT_E_DEVICE_IN_USE, AUDCLNT_E_DEVICE_INVALIDATED, AUDCLNT_E_UNSUPPORTED_FORMAT,
+    AUDCLNT_SHAREMODE_EXCLUSIVE, AUDCLNT_SHAREMODE_SHARED, AUDCLNT_STREAMFLAGS_AUTOCONVERTPCM,
+    AUDCLNT_STREAMFLAGS_EVENTCALLBACK, AUDCLNT_STREAMFLAGS_SRC_DEFAULT_QUALITY,
     DEVICE_STATE_ACTIVE, IAudioClient, IAudioRenderClient, IMMDevice, IMMDeviceEnumerator,
     MMDeviceEnumerator, WAVEFORMATEX, WAVEFORMATEXTENSIBLE, WAVEFORMATEXTENSIBLE_0, eConsole,
     eRender,
@@ -32,9 +34,9 @@ use windows::Win32::UI::Shell::PropertiesSystem::IPropertyStore;
 use windows::core::{Error, GUID, HSTRING};
 
 use crate::candidates::{
-    CandidateDesc, SUBTYPE_IEEE_FLOAT, SUBTYPE_PCM, WAVE_FORMAT_EXTENSIBLE,
-    WAVEFORMATEXTENSIBLE_EXTRA, WAVE_FORMAT_IEEE_FLOAT, WAVE_FORMAT_PCM, block_align,
-    candidates_for, channel_mask, frames_to_hns,
+    CandidateDesc, SUBTYPE_IEEE_FLOAT, SUBTYPE_PCM, WAVE_FORMAT_EXTENSIBLE, WAVE_FORMAT_IEEE_FLOAT,
+    WAVE_FORMAT_PCM, WAVEFORMATEXTENSIBLE_EXTRA, block_align, candidates_for, channel_mask,
+    frames_to_hns,
 };
 
 /// `PKEY_Device_FriendlyName` (defined locally to avoid pulling in the
@@ -78,6 +80,9 @@ impl<T> std::ops::Deref for SendCom<T> {
 
 pub struct WasapiOutput {
     device: DeviceId,
+    /// Direct keeps the exclusive-mode negotiation; Shared initializes the
+    /// WASAPI shared audio engine with OS-managed conversion.
+    access: OutputAccess,
     client: Option<SendCom<IAudioClient>>,
     render: Option<SendCom<IAudioRenderClient>>,
     event: Option<SendCom<HANDLE>>,
@@ -101,7 +106,7 @@ pub struct WasapiOutput {
 }
 
 impl WasapiOutput {
-    pub fn new(device: &DeviceId) -> Result<Self, PlayerError> {
+    pub fn new(device: &DeviceId, access: OutputAccess) -> Result<Self, PlayerError> {
         if device.is_empty() {
             return Err(PlayerError::InvalidInput("device id must not be empty"));
         }
@@ -114,6 +119,7 @@ impl WasapiOutput {
         }
         Ok(Self {
             device: device.clone(),
+            access,
             client: None,
             render: None,
             event: None,
@@ -143,13 +149,15 @@ impl WasapiOutput {
     }
 }
 
-impl AudioOutput for WasapiOutput {
-    fn configure(
+impl WasapiOutput {
+    /// Exclusive-mode configuration: exact candidate negotiation, device
+    /// period clamping, and the push/timer retry ladder. Unchanged direct
+    /// path.
+    fn configure_exclusive(
         &mut self,
         input: &StreamSpec,
         buffers: BufferConfig,
     ) -> Result<OutputSpec, PlayerError> {
-        validate_exact_spec(input)?;
         self.stop()?;
 
         let enumerator = create_enumerator()?;
@@ -293,11 +301,17 @@ impl AudioOutput for WasapiOutput {
 
         let event =
             unsafe { CreateEventW(None, false, false, None) }.map_err(|_| PlayerError::Output)?;
-        if !push_mode {
-            unsafe { client.SetEventHandle(event) }.map_err(|_| PlayerError::Output)?;
+        if !push_mode && unsafe { client.SetEventHandle(event) }.is_err() {
+            let _ = unsafe { CloseHandle(event) };
+            return Err(PlayerError::Output);
         }
-        let render: IAudioRenderClient =
-            unsafe { client.GetService() }.map_err(|_| PlayerError::Output)?;
+        let render: IAudioRenderClient = match unsafe { client.GetService() } {
+            Ok(render) => render,
+            Err(_) => {
+                let _ = unsafe { CloseHandle(event) };
+                return Err(PlayerError::Output);
+            }
+        };
         // Negotiated parameters are surfaced through the returned `OutputSpec`;
         // printing here would corrupt the TUI's alternate screen.
         let spec = OutputSpec {
@@ -315,6 +329,132 @@ impl AudioOutput for WasapiOutput {
         self.timer_mode = push_mode || needs_timer_topup(period_frames, buffer_frames);
         self.spec = Some(spec.clone());
         Ok(spec)
+    }
+
+    /// Shared-mode configuration: the WASAPI audio engine owns the endpoint
+    /// and may convert, resample, mix and apply volume processing (the
+    /// labeled `shared_playback` opt-in; never bit-perfect). The same
+    /// source-rate/layout PCM candidates are submitted as the client format
+    /// with `AUTOCONVERTPCM | SRC_DEFAULT_QUALITY`, so the OS performs any
+    /// necessary conversion behind the submitted format; a closest-match/mix
+    /// descriptor is never queried or submitted. Buffer duration and
+    /// periodicity are engine-managed (`0`); cadence comes from the default
+    /// device period and the actual buffer size.
+    fn configure_shared(&mut self, input: &StreamSpec) -> Result<OutputSpec, PlayerError> {
+        self.stop()?;
+
+        let enumerator = create_enumerator()?;
+        let endpoint = self.resolve_endpoint(&enumerator)?;
+
+        let mut accepted: Option<(SendCom<IAudioClient>, CandidateDesc)> = None;
+        'candidates: for candidate in candidates_for(input.encoding) {
+            let extensible = AcceptedFormat::Extensible(build_extensible(input, candidate));
+            // Same driver quirk as exclusive mode: 1/2-channel PCM may only
+            // be accepted as a plain WAVEFORMATEX. Do not build that
+            // descriptor for a layout where it is not legal.
+            let plain = (input.layout.channels <= 2)
+                .then(|| AcceptedFormat::Plain(build_plain(input, candidate)));
+            for format in std::iter::once(&extensible).chain(plain.as_ref()) {
+                // A failed `Initialize` cannot reliably be retried on the
+                // same COM object: activate a fresh client per attempt and
+                // release every failed one.
+                let client: IAudioClient = unsafe { endpoint.Activate(CLSCTX_ALL, None) }
+                    .map_err(|error| map_activate_error(&error))?;
+                let result = unsafe {
+                    client.Initialize(
+                        AUDCLNT_SHAREMODE_SHARED,
+                        AUDCLNT_STREAMFLAGS_EVENTCALLBACK
+                            | AUDCLNT_STREAMFLAGS_AUTOCONVERTPCM
+                            | AUDCLNT_STREAMFLAGS_SRC_DEFAULT_QUALITY,
+                        0,
+                        0,
+                        format.as_waveformatex_ptr(),
+                        None,
+                    )
+                };
+                match result {
+                    Ok(()) => {
+                        accepted = Some((SendCom(client), *candidate));
+                        break 'candidates;
+                    }
+                    Err(error) => {
+                        let code = error.code();
+                        if code == AUDCLNT_E_DEVICE_IN_USE {
+                            return Err(PlayerError::DeviceBusy);
+                        }
+                        if code == AUDCLNT_E_DEVICE_INVALIDATED {
+                            return Err(PlayerError::DeviceLost);
+                        }
+                        if code != AUDCLNT_E_UNSUPPORTED_FORMAT && code != E_INVALIDARG {
+                            return Err(map_activate_error(&error));
+                        }
+                        // Format rejected: release this client and try the
+                        // next descriptor/candidate.
+                    }
+                }
+            }
+        }
+        let (client, candidate) = accepted.ok_or(PlayerError::UnsupportedFormat {
+            rate_hz: input.rate_hz,
+            channels: input.layout.channels,
+            encoding: input.encoding,
+            reason: "no supported shared PCM input format",
+        })?;
+
+        let buffer_frames = unsafe { client.GetBufferSize() }.map_err(|_| PlayerError::Output)?;
+        let mut default_period = 0_i64;
+        unsafe { client.GetDevicePeriod(Some(&raw mut default_period), None) }
+            .map_err(|_| PlayerError::Output)?;
+        let period_frames =
+            (default_period.max(0) as u64 * u64::from(input.rate_hz) / 10_000_000).max(1) as u32;
+
+        // The event handle must be installed before `Start` (which happens
+        // in `start`); shared rendering stays event/padding-driven and never
+        // uses the exclusive whole-buffer timer fallback.
+        let event =
+            unsafe { CreateEventW(None, false, false, None) }.map_err(|_| PlayerError::Output)?;
+        if unsafe { client.SetEventHandle(event) }.is_err() {
+            let _ = unsafe { CloseHandle(event) };
+            return Err(PlayerError::Output);
+        }
+        let render: IAudioRenderClient = match unsafe { client.GetService() } {
+            Ok(render) => render,
+            Err(_) => {
+                let _ = unsafe { CloseHandle(event) };
+                return Err(PlayerError::Output);
+            }
+        };
+        // The spec describes the submitted client bytes; the engine's own
+        // mix format is deliberately not queried or claimed.
+        let spec = OutputSpec {
+            device: self.device.clone(),
+            rate_hz: input.rate_hz,
+            layout: input.layout,
+            format: candidate.format,
+            valid_bits: candidate.valid_bits as u8,
+        };
+        self.client = Some(client);
+        self.render = Some(SendCom(render));
+        self.event = Some(SendCom(event));
+        self.buffer_frames = buffer_frames;
+        self.period_frames = period_frames;
+        self.timer_mode = false;
+        self.spec = Some(spec.clone());
+        Ok(spec)
+    }
+}
+
+impl AudioOutput for WasapiOutput {
+    fn configure(
+        &mut self,
+        input: &StreamSpec,
+        buffers: BufferConfig,
+    ) -> Result<OutputSpec, PlayerError> {
+        validate_exact_spec(input)?;
+        match self.access {
+            OutputAccess::Direct => self.configure_exclusive(input, buffers),
+            OutputAccess::Shared => self.configure_shared(input),
+        }
     }
 
     fn start(
@@ -378,7 +518,11 @@ impl AudioOutput for WasapiOutput {
             let _ = unsafe { client.Reset() };
         }
         self.render = None;
-        self.event = None;
+        // The render thread (already joined above) holds the only other copy
+        // of this raw handle; close it exactly once here.
+        if let Some(event) = self.event.take() {
+            let _ = unsafe { CloseHandle(event.0) };
+        }
         self.spec = None;
         self.buffer_frames = 0;
         self.period_frames = 0;
@@ -394,10 +538,7 @@ impl Drop for WasapiOutput {
 }
 
 impl WasapiOutput {
-    fn resolve_endpoint(
-        &self,
-        enumerator: &IMMDeviceEnumerator,
-    ) -> Result<IMMDevice, PlayerError> {
+    fn resolve_endpoint(&self, enumerator: &IMMDeviceEnumerator) -> Result<IMMDevice, PlayerError> {
         if self.device == "default" {
             unsafe { enumerator.GetDefaultAudioEndpoint(eRender, eConsole) }
                 .map_err(|_| PlayerError::DeviceLost)
@@ -468,10 +609,8 @@ fn render_loop(
         period_frames
     };
     let rt_handle =
-        match audio_thread_priority::promote_current_thread_to_real_time(
-            rt_period_frames,
-            rate_hz,
-        ) {
+        match audio_thread_priority::promote_current_thread_to_real_time(rt_period_frames, rate_hz)
+        {
             Ok(handle) => Some(handle),
             Err(error) => {
                 eprintln!(
@@ -492,18 +631,11 @@ fn render_loop(
     shortage.fill(0);
     match unsafe { render.GetBuffer(buffer_frames) } {
         Ok(pointer) => {
-            unsafe {
-                std::ptr::copy_nonoverlapping(
-                    scratch.as_ptr(),
-                    pointer,
-                    scratch.len(),
-                )
-            };
+            unsafe { std::ptr::copy_nonoverlapping(scratch.as_ptr(), pointer, scratch.len()) };
             if unsafe { render.ReleaseBuffer(buffer_frames, 0) }.is_err() {
                 counters.fault.store(true, Ordering::Relaxed);
                 if let Some(handle) = rt_handle {
-                    let _ =
-                        audio_thread_priority::demote_current_thread_from_real_time(handle);
+                    let _ = audio_thread_priority::demote_current_thread_from_real_time(handle);
                 }
                 return;
             }
@@ -529,11 +661,9 @@ fn render_loop(
             .ok()
             .and_then(|handle| {
                 let due = -(i64::from(interval_ms)) * 10_000;
-                unsafe {
-                    SetWaitableTimer(handle, &due, interval_ms as i32, None, None, false)
-                }
-                .ok()
-                .map(|_| handle)
+                unsafe { SetWaitableTimer(handle, &due, interval_ms as i32, None, None, false) }
+                    .ok()
+                    .map(|_| handle)
             })
     } else {
         None
@@ -619,7 +749,6 @@ fn render_loop(
         }
     }
 
-
     let _ = unsafe { client.Stop() };
     let _ = unsafe { client.Reset() };
     if let Some(handle) = rt_handle {
@@ -658,7 +787,10 @@ fn is_supported_exact(client: &IAudioClient, format: *const WAVEFORMATEX) -> boo
 /// whole-buffer last resorts; duplicate steps are skipped.
 fn init_attempts(buffer_hns: i64, period_hns: i64, aligned_buffer_hns: i64) -> Vec<(i64, i64)> {
     let mut attempts = vec![(buffer_hns, period_hns)];
-    let ms_period = (u64::try_from(period_hns.max(0)).unwrap_or(0).div_ceil(10_000) * 10_000) as i64;
+    let ms_period = (u64::try_from(period_hns.max(0))
+        .unwrap_or(0)
+        .div_ceil(10_000)
+        * 10_000) as i64;
     if ms_period != period_hns && ms_period < buffer_hns {
         attempts.push((buffer_hns, ms_period));
     }
@@ -731,10 +863,10 @@ fn endpoint_id(endpoint: &IMMDevice) -> Result<DeviceId, PlayerError> {
 }
 
 fn friendly_name(endpoint: &IMMDevice) -> Result<String, PlayerError> {
-    let store: IPropertyStore = unsafe { endpoint.OpenPropertyStore(STGM_READ) }
-        .map_err(|_| PlayerError::Output)?;
-    let mut value: PROPVARIANT = unsafe { store.GetValue(&PKEY_DEVICE_FRIENDLY_NAME) }
-        .map_err(|_| PlayerError::Output)?;
+    let store: IPropertyStore =
+        unsafe { endpoint.OpenPropertyStore(STGM_READ) }.map_err(|_| PlayerError::Output)?;
+    let mut value: PROPVARIANT =
+        unsafe { store.GetValue(&PKEY_DEVICE_FRIENDLY_NAME) }.map_err(|_| PlayerError::Output)?;
     let name = unsafe { PropVariantToBSTR(&value) }
         .map_err(|_| PlayerError::Output)
         .map(|name| name.to_string());
@@ -842,7 +974,7 @@ mod tests {
             eprintln!("id={id} name={name}");
         }
         let (id, _) = devices.into_iter().next().unwrap();
-        let mut output = WasapiOutput::new(&id).unwrap();
+        let mut output = WasapiOutput::new(&id, OutputAccess::Direct).unwrap();
         let result = output.configure(
             &StreamSpec {
                 rate_hz: 44_100,
@@ -926,7 +1058,7 @@ mod tests {
     #[test]
     #[ignore = "requires a real WASAPI render endpoint"]
     fn renders_one_second_of_silence_on_default_device() {
-        let mut output = WasapiOutput::new(&"default".to_owned()).unwrap();
+        let mut output = WasapiOutput::new(&"default".to_owned(), OutputAccess::Direct).unwrap();
         let input = StreamSpec {
             rate_hz: 44_100,
             layout: ChannelLayout::discrete(2),
@@ -936,8 +1068,7 @@ mod tests {
             .configure(&input, BufferConfig::default_for_rate(44_100))
             .unwrap();
         let frame_bytes = spec.bytes_per_frame();
-        let (mut producer, consumer) =
-            rtrb::RingBuffer::<u8>::new(frame_bytes * 44_100);
+        let (mut producer, consumer) = rtrb::RingBuffer::<u8>::new(frame_bytes * 44_100);
         let counters = Arc::new(OutputCounters::default());
         output.start(consumer, counters.clone()).unwrap();
 
