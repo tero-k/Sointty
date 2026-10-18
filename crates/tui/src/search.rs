@@ -9,7 +9,8 @@
 //! - Lazy, generation-tagged search indexing over the configured roots
 //!   using incremental `browser::list_dir` traversal. Newer queries and
 //!   cancels are checked after every directory, so indexing never blocks
-//!   the UI and stale generations are discarded.
+//!   the UI and stale generations are discarded. Queries queued in one
+//!   burst (one per keystroke) are coalesced so only the newest runs.
 //!
 //! The optional SQLite library index is never opened here; this worker is
 //! the whole search backend for the TUI.
@@ -30,7 +31,12 @@ pub const METADATA_CACHE_LIMIT: usize = 2_048;
 /// Result batches are capped so one send never floods the UI channel.
 pub const RESULT_BATCH: usize = 64;
 
+/// Best hits kept per query; the UI truncates to the same limit, so
+/// sending more would only flood the channel with rows never shown.
+pub const SEARCH_RESULT_LIMIT: usize = 2_048;
+
 /// UI -> worker messages.
+#[derive(Debug)]
 pub enum WorkerMsg {
     /// Prioritized metadata for a currently visible row.
     Metadata(PathBuf),
@@ -209,7 +215,8 @@ struct IndexedItem {
 }
 
 impl IndexedItem {
-    fn into_hit(self, query: &str) -> Option<SearchHit> {
+    /// Match by reference; only actual hits pay for field clones.
+    fn to_hit(&self, query: &str) -> Option<SearchHit> {
         // Match across title and subtitle; keep the best.
         let mut best = match_spans(query, &self.title).map(|(score, spans)| (score, spans, false));
         if let Some(subtitle) = &self.subtitle
@@ -227,10 +234,10 @@ impl IndexedItem {
             self.path.to_string_lossy().into_owned(),
         );
         Some(SearchHit {
-            kind: self.kind,
-            path: self.path,
-            title: self.title,
-            subtitle: self.subtitle,
+            kind: self.kind.clone(),
+            path: self.path.clone(),
+            title: self.title.clone(),
+            subtitle: self.subtitle.clone(),
             rank,
             spans: if in_subtitle {
                 Vec::new()
@@ -396,10 +403,12 @@ impl Worker {
                     let mut hits: Vec<SearchHit> = self
                         .items
                         .iter()
-                        .cloned()
-                        .filter_map(|item| item.into_hit(&text))
+                        .filter_map(|item| item.to_hit(&text))
                         .collect();
                     hits.sort_by(|a, b| a.rank.cmp(&b.rank));
+                    // Only the best few are ever shown; sending everything
+                    // would flood the bounded UI channel on broad queries.
+                    hits.truncate(SEARCH_RESULT_LIMIT);
                     for chunk in hits.chunks(RESULT_BATCH) {
                         let _ = self.tx.send(WorkerEvent::Hits {
                             generation,
@@ -524,8 +533,8 @@ impl Worker {
         if let Some(query) = &self.query {
             let generation = query.generation;
             let mut hits: Vec<SearchHit> = new_items
-                .into_iter()
-                .filter_map(|item| item.into_hit(&query.text))
+                .iter()
+                .filter_map(|item| item.to_hit(&query.text))
                 .collect();
             hits.sort_by(|a, b| a.rank.cmp(&b.rank));
             for chunk in hits.chunks(RESULT_BATCH) {
@@ -536,6 +545,31 @@ impl Worker {
             }
         }
     }
+}
+
+/// Drop queries superseded by a later query-control message in the same
+/// drain batch. A burst of keystrokes queues one `Query` per char; running
+/// each against the whole index would starve the worker, so only the
+/// newest state-change in a batch is executed. `Cancel`, `SetRoots` and
+/// `Shutdown` also replace the active query, so they supersede too.
+fn coalesce_queries(batch: Vec<WorkerMsg>) -> Vec<WorkerMsg> {
+    let mut out = Vec::with_capacity(batch.len());
+    let mut supersede_seen = false;
+    for msg in batch.into_iter().rev() {
+        let is_query = matches!(msg, WorkerMsg::Query { .. });
+        let supersedes = is_query
+            || matches!(
+                msg,
+                WorkerMsg::Cancel | WorkerMsg::SetRoots(_) | WorkerMsg::Shutdown
+            );
+        if is_query && supersede_seen {
+            continue;
+        }
+        supersede_seen |= supersedes;
+        out.push(msg);
+    }
+    out.reverse();
+    out
 }
 
 fn run_worker(rx: Receiver<WorkerMsg>, priority_rx: Receiver<WorkerMsg>, tx: Sender<WorkerEvent>) {
@@ -561,7 +595,11 @@ fn run_worker(rx: Receiver<WorkerMsg>, priority_rx: Receiver<WorkerMsg>, tx: Sen
                 return;
             }
         }
+        let mut batch = Vec::new();
         while let Ok(msg) = worker.rx.try_recv() {
+            batch.push(msg);
+        }
+        for msg in coalesce_queries(batch) {
             if !worker.handle_msg(msg) {
                 return;
             }
@@ -624,6 +662,32 @@ mod tests {
         assert_eq!(roots.len(), 1, "{roots:?}");
         assert!(roots[0].ends_with(base.file_name().unwrap().to_string_lossy().as_ref()));
         std::fs::remove_dir_all(&base).ok();
+    }
+
+    #[test]
+    fn coalesce_queries_keeps_only_newest_query() {
+        let batch = vec![
+            WorkerMsg::Query {
+                generation: 1,
+                text: "a".to_owned(),
+            },
+            WorkerMsg::Query {
+                generation: 2,
+                text: "ab".to_owned(),
+            },
+            WorkerMsg::Cancel,
+            WorkerMsg::Query {
+                generation: 3,
+                text: "abc".to_owned(),
+            },
+        ];
+        let out = coalesce_queries(batch);
+        assert_eq!(out.len(), 2, "{out:?}");
+        assert!(matches!(out[0], WorkerMsg::Cancel));
+        assert!(
+            matches!(&out[1], WorkerMsg::Query { generation: 3, text } if text == "abc"),
+            "only the newest query survives: {out:?}"
+        );
     }
 
     /// Drive a worker against a temp tree and collect events until Done.

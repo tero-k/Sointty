@@ -322,6 +322,10 @@ struct SearchOverlay {
 impl SearchOverlay {
     fn refresh_visible(&mut self) {
         self.results.sort_by(|a, b| a.rank().cmp(b.rank()));
+        // Broad queries can match tens of thousands of entries; only the
+        // best-ranked rows are ever reachable, so keep memory and every
+        // re-sort bounded.
+        self.results.truncate(search::SEARCH_RESULT_LIMIT);
         self.visible = self
             .results
             .iter()
@@ -474,6 +478,9 @@ struct App {
     metadata_order: VecDeque<PathBuf>,
     metadata_requested: HashSet<PathBuf>,
     search_generation: u64,
+    /// Normalized roots last sent to the worker; re-indexing only happens
+    /// when this set changes, not on every search open.
+    search_roots_sent: Option<Vec<PathBuf>>,
     past: VecDeque<QueueItem>,
     queue_rows: Vec<screens::queue::QueueRow>,
     pending_duration_total: Option<Duration>,
@@ -522,6 +529,7 @@ impl App {
             metadata_order: VecDeque::new(),
             metadata_requested: HashSet::new(),
             search_generation: 0,
+            search_roots_sent: None,
             past: VecDeque::new(),
             queue_rows: Vec::new(),
             pending_duration_total: Some(Duration::ZERO),
@@ -759,8 +767,16 @@ impl App {
     }
 
     fn poll_worker(&mut self) -> bool {
+        // Bounded per tick: while indexing with an active query the worker
+        // refills the bounded event channel faster than the UI could drain
+        // it, so an unbounded loop here would starve drawing and input.
+        const MAX_EVENTS_PER_TICK: usize = 128;
         let mut changed = false;
-        while let Some(event) = self.worker.try_recv() {
+        let mut hits_changed = false;
+        for _ in 0..MAX_EVENTS_PER_TICK {
+            let Some(event) = self.worker.try_recv() else {
+                break;
+            };
             match event {
                 WorkerEvent::Metadata { path, meta } => {
                     if !self.metadata.contains_key(&path) {
@@ -784,7 +800,7 @@ impl App {
                         search
                             .results
                             .extend(hits.into_iter().map(SearchItem::Worker));
-                        search.refresh_visible();
+                        hits_changed = true;
                         changed = true;
                     }
                 }
@@ -797,6 +813,13 @@ impl App {
                     }
                 }
             }
+        }
+        // Re-sort and rebuild the visible rows once per drain pass instead
+        // of once per batch; each refresh is a full sort of all results.
+        if hits_changed
+            && let Mode::Search(search) = &mut self.mode
+        {
+            search.refresh_visible();
         }
         changed
     }
@@ -1788,7 +1811,13 @@ impl App {
         if let Some(browser) = &self.browser {
             roots.push(browser.current_dir.clone());
         }
-        self.worker.send(WorkerMsg::SetRoots(roots));
+        // Indexing whole roots is expensive; keep the built index and only
+        // restart it when the effective root set actually changes.
+        let roots = search::normalize_roots(roots);
+        if self.search_roots_sent.as_ref() != Some(&roots) {
+            self.worker.send(WorkerMsg::SetRoots(roots.clone()));
+            self.search_roots_sent = Some(roots);
+        }
         self.mode = Mode::Search(SearchOverlay {
             query: String::new(),
             scope: SearchScope::All,
@@ -3851,6 +3880,40 @@ mod tests {
     use super::*;
     use parking_lot::Mutex;
     use std::sync::Arc;
+
+    #[test]
+    fn refresh_visible_caps_results_to_best_ranks() {
+        let mut overlay = SearchOverlay {
+            query: "a".to_owned(),
+            scope: SearchScope::All,
+            generation: 1,
+            results: Vec::new(),
+            visible: Vec::new(),
+            selected: 0,
+            status: SearchStatus::Done,
+        };
+        // Insert worst-first so the cap must keep the best after sorting.
+        for i in (0..search::SEARCH_RESULT_LIMIT + 500).rev() {
+            overlay.results.push(SearchItem::Worker(SearchHit {
+                kind: HitKind::Track,
+                path: PathBuf::from(format!("track-{i}")),
+                title: format!("track {i}"),
+                subtitle: None,
+                rank: (i as i64, String::new(), String::new()),
+                spans: Vec::new(),
+                subtitle_spans: Vec::new(),
+            }));
+        }
+        overlay.refresh_visible();
+        assert_eq!(overlay.results.len(), search::SEARCH_RESULT_LIMIT);
+        assert_eq!(overlay.visible.len(), search::SEARCH_RESULT_LIMIT);
+        assert_eq!(overlay.results[0].rank().0, 0);
+        assert_eq!(
+            overlay.results.last().unwrap().rank().0,
+            search::SEARCH_RESULT_LIMIT as i64 - 1,
+            "only the best ranks survive"
+        );
+    }
 
     struct Harness {
         app: App,
