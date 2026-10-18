@@ -1,6 +1,10 @@
+//! Terminal UI for Sointty. The player engine owns playback and queue truth;
+//! this crate owns only control-plane input, presentation, and UI-only state.
+
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::io;
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crossbeam_channel::{Receiver, Sender};
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
@@ -10,37 +14,50 @@ use crossterm::terminal::{
 };
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
-use ratatui::layout::{Constraint, Direction, Layout, Rect};
+use ratatui::layout::Rect;
 use ratatui::style::{Modifier, Style};
-use ratatui::widgets::{Block, Borders, List, ListItem, ListState, Paragraph};
+use ratatui::text::{Line, Span};
+use ratatui::widgets::{Clear, Paragraph};
 use sointty_core::{
-    BufferConfig, DeviceFormat, DeviceId, OutputSpec, PlayerCommand, PlayerEvent, QueueEntry,
-    QueueItem, TrackId, TrackTags,
+    BufferConfig, DecodedSpec, DeviceFormat, DeviceId, OutputSpec, PlayerCommand, PlayerEvent,
+    QueueEntry, QueueItem, TrackId, TrackTags,
 };
+use sointty_decode::tags::DisplayMetadata;
 
 mod browser;
 pub mod display;
+pub mod keymap;
 pub mod layout;
+pub mod screens;
+pub mod search;
 pub mod theme;
 pub mod widgets;
 
 pub use browser::collect_audio_files;
 use browser::{Browser, BrowserItemKind};
+use keymap::{Action, Focus, ModeKind, Screen};
+use screens::MetadataView;
+use search::{HitKind, SearchHit, SearchScope, SearchStatus, SearchWorker, WorkerEvent, WorkerMsg};
 use theme::Theme;
 
 /// Lists selectable output devices as `(id, display name)` pairs; invoked
-/// each time the device pane opens so hot-plugged endpoints appear.
+/// when Output settings opens so hot-plugged endpoints appear.
 pub type DeviceProvider = Box<dyn FnMut() -> Vec<(DeviceId, String)>>;
-/// Persists a device selection; the error text is shown in the status line.
+/// Persists a device selection; errors stay visible in the status line.
 pub type DeviceSaver = Box<dyn FnMut(&DeviceId) -> Result<(), String>>;
-/// Persists an explicit non-bit-perfect F32-to-integer compatibility choice.
+/// Resolves the platform default, persists `device = None`, and returns its
+/// real ID. The UI selects that ID only after this hook succeeds.
+pub type DeviceReset = Box<dyn FnMut() -> Result<DeviceId, String>>;
+/// Persists an explicit non-bit-perfect compatibility choice.
 pub type FloatCompatibilitySaver = Box<dyn FnMut(bool) -> Result<(), String>>;
 /// Persists the last successfully browsed directory.
 pub type BrowserDirSaver = Box<dyn FnMut(&Path) -> Result<(), String>>;
-/// Persists the whole playlist catalog after any edit.
+/// Atomically persists the whole named-playlist catalog on explicit save.
 pub type PlaylistSaver = Box<dyn FnMut(&PlaylistCatalog) -> Result<(), String>>;
 /// Persists DAC timing overrides; `None` clears a field back to Auto.
 pub type TimingSaver = Box<dyn FnMut(Option<u32>, Option<u32>) -> Result<(), String>>;
+/// Persists a validated `#RRGGBB` accent, or `None` to reset it.
+pub type AccentSaver = Box<dyn FnMut(Option<&str>) -> Result<(), String>>;
 
 /// A browsable mount root.
 #[derive(Debug, Clone)]
@@ -50,28 +67,21 @@ pub struct Location {
     pub mapped_network: bool,
 }
 
-/// Lists available locations; invoked when the Locations pane opens.
 pub type LocationProvider = Box<dyn FnMut() -> Result<Vec<Location>, String>>;
-/// Maps a drive letter to a UNC share; returns the new root (Windows only).
 pub type MapDrive = Box<dyn FnMut(char, &str) -> Result<PathBuf, String>>;
-/// Disconnects a mapped network drive letter (Windows only).
 pub type DisconnectDrive = Box<dyn FnMut(char) -> Result<(), String>>;
-/// Mounts an SMB share through the OS (Unix only).
 pub type MountShare = Box<dyn FnMut(&str) -> Result<(), String>>;
 
-/// Seek step for the Left/Right arrow keys.
 const SEEK_SECONDS: u64 = 10;
 
-/// A named, persisted playlist: entries never leave the list unless the
-/// user edits it; the live playback queue is independent.
+/// A named persisted playlist. Its entries are independent of the live queue.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SavedPlaylist {
     pub name: String,
     pub entries: Vec<QueueEntry>,
 }
 
-/// All saved playlists plus the selected one. There is always at least one
-/// list; the final list cannot be deleted.
+/// All named playlists plus the selected one. At least one list exists.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PlaylistCatalog {
     pub selected: usize,
@@ -103,286 +113,9 @@ impl PlaylistCatalog {
     }
 }
 
-pub struct TuiState {
-    pub status: String,
-    pub frame: u64,
-    /// Source-frame rate for elapsed time: output rate times the DSD
-    /// wire-frame factor.
-    pub rate_hz: u32,
-    /// Length in source frames of the audible track, when known.
-    total_frames: Option<u64>,
-    pub paused: bool,
-    pub tags: TrackTags,
-    current_track: TrackId,
-    /// Active output device; updated from `Playing` events and the picker.
-    device: DeviceId,
-    /// `(id, friendly name)` cache from the device provider; refreshed when
-    /// the picker opens. Lets the UI show names instead of endpoint IDs.
-    device_names: Vec<(DeviceId, String)>,
-    float_to_int: bool,
-    int_to_float: bool,
-    /// Whether the last established output used an opted-in conversion.
-    converted: bool,
-    /// Negotiated output for the current stream, when playing.
-    output_spec: Option<OutputSpec>,
-    /// DAC timing overrides in effect (None = Auto per-field).
-    timing: (Option<u32>, Option<u32>),
-    /// Live queue from the engine: audible track and pending FIFO order.
-    audible: Option<QueueItem>,
-    pending: Vec<QueueItem>,
-    /// Random playback order for future queue entries (not saved playlists).
-    shuffle: bool,
-    /// Saved playlists and the selected one.
-    catalog: PlaylistCatalog,
-    /// When the on-disk catalog is malformed: full path plus parse error.
-    /// Edit actions are disabled until the file is repaired.
-    catalog_error: Option<String>,
-    /// Last successfully browsed directory, kept across pane closes and
-    /// (via the saver) across launches.
-    last_browser_dir: Option<PathBuf>,
-    home_dir: Option<PathBuf>,
-}
-
-impl TuiState {
-    // Grouped settings structs would churn every later redesign slice; the
-    // constructor is replaced as the App state migrates to screens.
-    #[allow(clippy::too_many_arguments)]
-    fn new(
-        device: DeviceId,
-        float_to_int: bool,
-        int_to_float: bool,
-        timing: (Option<u32>, Option<u32>),
-        catalog: PlaylistCatalog,
-        catalog_error: Option<String>,
-        last_browser_dir: Option<PathBuf>,
-        home_dir: Option<PathBuf>,
-    ) -> Self {
-        Self {
-            total_frames: None,
-            status: "idle".to_owned(),
-            frame: 0,
-            rate_hz: 44_100,
-            paused: false,
-            tags: TrackTags::default(),
-            current_track: 0,
-            device,
-            device_names: Vec::new(),
-            float_to_int,
-            int_to_float,
-            converted: false,
-            output_spec: None,
-            timing,
-            audible: None,
-            pending: Vec::new(),
-            shuffle: false,
-            catalog,
-            catalog_error,
-            last_browser_dir,
-            home_dir,
-        }
-    }
-
-    /// True when nothing is playing or paused mid-stream: safe for Play to
-    /// start the queue.
-    fn idle(&self) -> bool {
-        self.audible.is_none() || self.paused
-    }
-
-    /// Friendly name for the active device when the provider knows it;
-    /// otherwise the raw endpoint ID.
-    fn device_display(&self) -> &str {
-        self.device_names
-            .iter()
-            .find(|(id, _)| *id == self.device)
-            .map(|(_, name)| name.as_str())
-            .unwrap_or(&self.device)
-    }
-}
-
-/// Selectable output devices shown by the `d` key.
-struct DevicePane {
-    devices: Vec<(DeviceId, String)>,
-    selected: usize,
-}
-
-impl DevicePane {
-    fn move_selection(&mut self, delta: isize) {
-        if self.devices.is_empty() {
-            self.selected = 0;
-            return;
-        }
-        self.selected = self
-            .selected
-            .saturating_add_signed(delta)
-            .min(self.devices.len() - 1);
-    }
-}
-
-struct LocationsPane {
-    locations: Vec<Location>,
-    selected: usize,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum PlaylistFocus {
-    Names,
-    Entries,
-}
-
-struct PlaylistsPane {
-    focus: PlaylistFocus,
-    name_sel: usize,
-    entry_sel: usize,
-}
-
-/// DAC settings rows.
-struct SettingsPane {
-    selected: usize,
-}
-
-/// What a submitted Input line means.
-enum InputAction {
-    /// Absolute path or UNC share typed into Locations.
-    LocationPath,
-    /// First step of drive mapping: the letter.
-    MapDriveLetter,
-    /// Second step: the \\server\share for a chosen letter.
-    MapDriveShare(char),
-    /// SMB share for the Unix/macOS OS mount action.
-    MountShare,
-    PlaylistCreate,
-    PlaylistRename,
-    PlaylistImportPath,
-    PlaylistImportName(PathBuf),
-    TimingPeriod,
-    TimingBuffer(u32),
-}
-
-struct InputPane {
-    prompt: String,
-    buffer: String,
-    action: InputAction,
-}
-
-/// One menu row.
-struct MenuItem {
-    label: String,
-    action: MenuAction,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-enum MenuAction {
-    OpenBrowser,
-    OpenLocations,
-    OpenPlaylists,
-    OpenQueue,
-    ViewPlaylists,
-    ViewQueue,
-    OpenDevices,
-    OpenSettings,
-    ShowHelp,
-    Quit,
-    LocationsEnterPath,
-    LocationsRefresh,
-    LocationsMapDrive,
-    LocationsMountShare,
-    LocationsDisconnect(char),
-    PlaylistCreate,
-    PlaylistRename,
-    PlaylistDelete,
-    PlaylistDeleteConfirmed,
-    PlaylistImport,
-    PlaylistRemoveEntry,
-    PlaylistMoveUp,
-    PlaylistMoveDown,
-    PlaylistEnqueue,
-    PlaylistEnqueueAll,
-    QueueEnqueueSelectedPlaylist,
-    QueueToggleShuffle,
-    Close,
-}
-
-struct MenuPane {
-    /// Stack of (title, items); the top is shown.
-    stack: Vec<(String, Vec<MenuItem>)>,
-    selected: usize,
-}
-
-impl MenuPane {
-    fn top() -> Self {
-        Self {
-            stack: vec![(
-                "Menu".to_owned(),
-                vec![
-                    MenuItem { label: "Browse".to_owned(), action: MenuAction::OpenBrowser },
-                    MenuItem { label: "Locations".to_owned(), action: MenuAction::OpenLocations },
-                    MenuItem { label: "Playlists".to_owned(), action: MenuAction::OpenPlaylists },
-                    MenuItem { label: "Queue".to_owned(), action: MenuAction::OpenQueue },
-                    MenuItem { label: "Output device".to_owned(), action: MenuAction::OpenDevices },
-                    MenuItem { label: "DAC settings".to_owned(), action: MenuAction::OpenSettings },
-                    MenuItem { label: "Help".to_owned(), action: MenuAction::ShowHelp },
-                    MenuItem { label: "Quit".to_owned(), action: MenuAction::Quit },
-                ],
-            )],
-            selected: 0,
-        }
-    }
-
-    fn push(&mut self, title: String, items: Vec<MenuItem>) {
-        self.stack.push((title, items));
-        self.selected = 0;
-    }
-
-    fn pop(&mut self) -> bool {
-        if self.stack.len() > 1 {
-            self.stack.pop();
-            self.selected = 0;
-            true
-        } else {
-            false
-        }
-    }
-
-    fn current_items(&self) -> &[MenuItem] {
-        &self.stack.last().unwrap().1
-    }
-
-    fn move_selection(&mut self, delta: isize) {
-        let len = self.current_items().len();
-        if len == 0 {
-            self.selected = 0;
-            return;
-        }
-        self.selected = self.selected.saturating_add_signed(delta).min(len - 1);
-    }
-
-    fn selected_action(&self) -> Option<&MenuAction> {
-        self.current_items().get(self.selected).map(|item| &item.action)
-    }
-}
-
-/// At most one pane is open at a time; opening one replaces the other.
-enum Pane {
-    Browser(Browser),
-    Devices(DevicePane),
-    Locations(LocationsPane),
-    Menu(MenuPane),
-    Playlists(PlaylistsPane),
-    Settings(SettingsPane),
-    Input(InputPane),
-}
-
-/// What the right column shows when a list pane is open.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum RightView {
-    SavedList,
-    Queue,
-}
-
 /// Everything `run` needs that is not a callback.
 pub struct RunOptions {
     pub open_browser: bool,
-    /// Saved browsing directory from a previous launch.
     pub initial_browser_dir: Option<PathBuf>,
     pub home_dir: Option<PathBuf>,
     pub current_device: DeviceId,
@@ -393,6 +126,18 @@ pub struct RunOptions {
     pub catalog: PlaylistCatalog,
     /// Full path plus parse error when the catalog file is malformed.
     pub catalog_error: Option<String>,
+    pub catalog_path: Option<PathBuf>,
+    pub config_path: Option<PathBuf>,
+    /// Startup TOML error; strict savers leave the file untouched.
+    pub config_error: Option<String>,
+    /// Optional validated-or-invalid `#RRGGBB` from config; the theme
+    /// falls back on invalid values and reports feedback without saving.
+    pub accent: Option<String>,
+    /// Filesystem search roots supplied by the app's location provider.
+    pub search_roots: Vec<PathBuf>,
+    /// Location-provider failure; fallback roots still work but coverage
+    /// must not be represented as complete.
+    pub search_coverage_error: Option<String>,
 }
 
 /// Callbacks into the app layer; OS-specific actions are `None` where the
@@ -400,569 +145,940 @@ pub struct RunOptions {
 pub struct Hooks {
     pub device_provider: DeviceProvider,
     pub on_device_selected: DeviceSaver,
+    pub on_device_reset: DeviceReset,
     pub on_float_to_int_selected: FloatCompatibilitySaver,
     pub on_int_to_float_selected: FloatCompatibilitySaver,
     pub on_browser_dir: BrowserDirSaver,
     pub on_catalog: PlaylistSaver,
     pub on_timing: TimingSaver,
+    pub on_accent: AccentSaver,
     pub locations: LocationProvider,
     pub map_drive: Option<MapDrive>,
     pub disconnect_drive: Option<DisconnectDrive>,
     pub mount_share: Option<MountShare>,
 }
 
-/// An action that must run with the terminal suspended (OS prompts).
+/// Playback and settings values mirrored from the player and persistent
+/// config. Queue snapshots and `Playing` events remain the only truth for
+/// audible/pending order and the active output verdict.
+pub struct TuiState {
+    pub status: String,
+    pub frame: u64,
+    pub rate_hz: u32,
+    total_frames: Option<u64>,
+    pub paused: bool,
+    pub tags: TrackTags,
+    current_track: TrackId,
+    device: DeviceId,
+    device_names: Vec<(DeviceId, String)>,
+    float_to_int: bool,
+    int_to_float: bool,
+    converted: bool,
+    output_spec: Option<OutputSpec>,
+    source_spec: Option<DecodedSpec>,
+    buffers: Option<BufferConfig>,
+    timing: (Option<u32>, Option<u32>),
+    audible: Option<QueueItem>,
+    pending: Vec<QueueItem>,
+    shuffle: bool,
+    catalog: PlaylistCatalog,
+    catalog_error: Option<String>,
+    catalog_path: Option<PathBuf>,
+    config_path: Option<PathBuf>,
+    config_error: Option<String>,
+    accent: Option<String>,
+    last_browser_dir: Option<PathBuf>,
+    home_dir: Option<PathBuf>,
+    search_roots: Vec<PathBuf>,
+    search_coverage_error: Option<String>,
+}
+
+impl TuiState {
+    fn from_options(options: RunOptions) -> Self {
+        Self {
+            status: "idle".to_owned(),
+            frame: 0,
+            rate_hz: 44_100,
+            total_frames: None,
+            paused: false,
+            tags: TrackTags::default(),
+            current_track: 0,
+            device: options.current_device,
+            device_names: Vec::new(),
+            float_to_int: options.float_to_int,
+            int_to_float: options.int_to_float,
+            converted: false,
+            output_spec: None,
+            source_spec: None,
+            buffers: None,
+            timing: options.timing,
+            audible: None,
+            pending: Vec::new(),
+            shuffle: false,
+            catalog: options.catalog,
+            catalog_error: options.catalog_error,
+            catalog_path: options.catalog_path,
+            config_path: options.config_path,
+            config_error: options.config_error,
+            accent: options.accent,
+            last_browser_dir: options.initial_browser_dir,
+            home_dir: options.home_dir,
+            search_roots: options.search_roots,
+            search_coverage_error: options.search_coverage_error,
+        }
+    }
+
+    fn device_display(&self) -> &str {
+        self.device_names
+            .iter()
+            .find(|(id, _)| *id == self.device)
+            .map(|(_, name)| name.as_str())
+            .unwrap_or(&self.device)
+    }
+}
+
+#[derive(Debug)]
+enum InputAction {
+    LocationPath,
+    MapDriveLetter,
+    MapDriveShare(char),
+    MountShare,
+    PlaylistCreate,
+    PlaylistRename,
+    PlaylistImportPath,
+    PlaylistImportName(PathBuf),
+    TimingPeriod,
+    TimingBuffer(u32),
+    Accent,
+}
+
+struct Prompt {
+    label: String,
+    buffer: String,
+    kind: PromptKind,
+    origin: Box<Mode>,
+}
+
+enum PromptKind {
+    Text(InputAction),
+    QuitConfirm,
+}
+
+struct LocationsOverlay {
+    locations: Vec<Location>,
+    selected: usize,
+}
+
+struct PlaylistPicker {
+    entries: Vec<QueueEntry>,
+    selected: usize,
+}
+
+#[derive(Clone)]
+enum SearchItem {
+    Worker(SearchHit),
+    Catalog {
+        index: usize,
+        rank: (i64, String, String),
+        spans: Vec<usize>,
+    },
+}
+
+impl SearchItem {
+    fn rank(&self) -> &(i64, String, String) {
+        match self {
+            Self::Worker(hit) => &hit.rank,
+            Self::Catalog { rank, .. } => rank,
+        }
+    }
+
+    fn kind(&self) -> HitKind {
+        match self {
+            Self::Worker(hit) => hit.kind.clone(),
+            Self::Catalog { .. } => HitKind::PlaylistFile,
+        }
+    }
+}
+
+struct SearchOverlay {
+    query: String,
+    scope: SearchScope,
+    generation: u64,
+    results: Vec<SearchItem>,
+    visible: Vec<usize>,
+    selected: usize,
+    status: SearchStatus,
+}
+
+impl SearchOverlay {
+    fn refresh_visible(&mut self) {
+        self.results.sort_by(|a, b| a.rank().cmp(b.rank()));
+        self.visible = self
+            .results
+            .iter()
+            .enumerate()
+            .filter_map(|(index, item)| self.scope.admits(&item.kind()).then_some(index))
+            .collect();
+        self.selected = self.selected.min(self.visible.len().saturating_sub(1));
+    }
+
+    fn selected_item(&self) -> Option<&SearchItem> {
+        self.visible
+            .get(self.selected)
+            .and_then(|&index| self.results.get(index))
+    }
+
+    fn display_rows(&self) -> Vec<SearchDisplayRow> {
+        const GROUPS: &[(HitKind, &str)] = &[
+            (HitKind::Album, "Albums"),
+            (HitKind::Track, "Tracks"),
+            (HitKind::Folder, "Folders"),
+            (HitKind::PlaylistFile, "Playlists"),
+        ];
+        let mut rows = Vec::new();
+        for (kind, label) in GROUPS {
+            let members: Vec<usize> = self
+                .visible
+                .iter()
+                .copied()
+                .filter(|&index| self.results[index].kind() == *kind)
+                .collect();
+            if members.is_empty() {
+                continue;
+            }
+            rows.push(SearchDisplayRow::Header(label, members.len()));
+            let selected = self.visible.get(self.selected).copied();
+            let selected_in_tail = members.iter().skip(5).any(|&index| Some(index) == selected);
+            let shown = if members.len() > 5 && !selected_in_tail {
+                5
+            } else {
+                members.len()
+            };
+            for index in members.iter().take(shown) {
+                rows.push(SearchDisplayRow::Item(*index));
+            }
+            if shown < members.len() {
+                rows.push(SearchDisplayRow::More(members.len() - shown));
+            }
+        }
+        rows
+    }
+}
+
+enum SearchDisplayRow {
+    Header(&'static str, usize),
+    Item(usize),
+    More(usize),
+}
+
+enum MoveOverlay {
+    Playlist {
+        indices: Vec<usize>,
+        gap: usize,
+    },
+    Queue {
+        id: TrackId,
+        target: Option<TrackId>,
+    },
+}
+
+#[derive(Clone)]
+enum ActionItem {
+    EnterPath,
+    RefreshLocations,
+    MapDrive,
+    MountShare,
+    Disconnect(char),
+    PlaylistCreate,
+    PlaylistRename,
+    PlaylistDelete,
+    PlaylistImport,
+    QueueCurrentFolder,
+    Quit,
+}
+
+struct ActionsOverlay {
+    items: Vec<(String, ActionItem)>,
+    selected: usize,
+    origin: Box<Mode>,
+}
+
+enum Mode {
+    Normal,
+    Search(SearchOverlay),
+    Move(MoveOverlay),
+    Prompt(Prompt),
+    Help,
+    Locations(LocationsOverlay),
+    PlaylistPicker(PlaylistPicker),
+    Actions(ActionsOverlay),
+}
+
+impl Mode {
+    fn kind(&self) -> ModeKind {
+        match self {
+            Self::Normal => ModeKind::Normal,
+            Self::Search(_) => ModeKind::Search,
+            Self::Move(_) => ModeKind::Move,
+            Self::Prompt(Prompt {
+                kind: PromptKind::QuitConfirm,
+                ..
+            }) => ModeKind::QuitConfirm,
+            Self::Prompt(_) => ModeKind::Prompt,
+            Self::Help => ModeKind::Help,
+            Self::Locations(_) => ModeKind::Locations,
+            Self::PlaylistPicker(_) => ModeKind::PlaylistPicker,
+            Self::Actions(_) => ModeKind::Actions,
+        }
+    }
+}
+
 enum OsAction {
     MapDrive(char, String),
     MountShare(String),
 }
 
+enum CollectTarget {
+    Enqueue { play_first: bool },
+    OpenPicker,
+}
+
+struct CollectOp {
+    generation: u64,
+    target: CollectTarget,
+    rx: Receiver<io::Result<Vec<QueueEntry>>>,
+}
+
 struct App {
     state: TuiState,
     theme: Theme,
-    pane: Option<Pane>,
-    right: RightView,
-    playlist_entry_sel: usize,
-    /// Keyboard focus on the visible saved playlist in the right column.
-    right_focused: bool,
-    /// Browser view restored if a drive/location selection is canceled.
-    browser_before_locations: Option<Browser>,
-    /// Pane to restore after a modal input is canceled or fails.
-    input_origin: Option<Pane>,
+    screen: Screen,
+    focus: Focus,
+    mode: Mode,
+    help_scroll: usize,
+    browser: Option<Browser>,
     commands: Sender<PlayerCommand>,
     hooks: Hooks,
     pending_os: Option<OsAction>,
+    worker: SearchWorker,
+    metadata: HashMap<PathBuf, Option<DisplayMetadata>>,
+    metadata_order: VecDeque<PathBuf>,
+    metadata_requested: HashSet<PathBuf>,
+    search_generation: u64,
+    past: VecDeque<QueueItem>,
+    queue_rows: Vec<screens::queue::QueueRow>,
+    pending_duration_total: Option<Duration>,
+    queue_selected: Option<TrackId>,
+    playlist_name_sel: usize,
+    playlist_track_sel: usize,
+    playlist_names_cache: Vec<screens::playlists::NameRow>,
+    playlist_tracks_cache: Vec<screens::playlists::TrackRow>,
+    playlist_selected: HashSet<usize>,
+    playlist_anchor: usize,
+    dirty_playlists: HashSet<usize>,
+    catalog_dirty: bool,
+    deleted_name: Option<String>,
+    settings_section: usize,
+    settings_row: usize,
+    settings_rows_cache: Vec<screens::settings::SettingsRowView>,
+    device_candidates: Vec<(DeviceId, String)>,
+    device_candidate_sel: usize,
+    collect_generation: u64,
+    collect_op: Option<CollectOp>,
+}
+
+impl MetadataView for App {
+    fn metadata(&self, path: &Path) -> Option<&DisplayMetadata> {
+        self.metadata.get(path).and_then(Option::as_ref)
+    }
 }
 
 impl App {
     fn new(options: RunOptions, hooks: Hooks, commands: Sender<PlayerCommand>) -> Self {
-        let (theme, theme_warning) = Theme::detect(None);
+        let open_browser = options.open_browser;
+        let (theme, warning) = Theme::detect(options.accent.as_deref());
         let mut app = Self {
-            state: TuiState::new(
-                options.current_device,
-                options.float_to_int,
-                options.int_to_float,
-                options.timing,
-                options.catalog,
-                options.catalog_error,
-                options.initial_browser_dir,
-                options.home_dir,
-            ),
+            state: TuiState::from_options(options),
             theme,
-            pane: None,
-            right: RightView::SavedList,
-            playlist_entry_sel: 0,
-            right_focused: false,
-            browser_before_locations: None,
-            input_origin: None,
+            screen: Screen::Library,
+            focus: Focus::Library,
+            mode: Mode::Normal,
+            help_scroll: 0,
+            browser: None,
             commands,
             hooks,
             pending_os: None,
+            worker: SearchWorker::spawn(),
+            metadata: HashMap::new(),
+            metadata_order: VecDeque::new(),
+            metadata_requested: HashSet::new(),
+            search_generation: 0,
+            past: VecDeque::new(),
+            queue_rows: Vec::new(),
+            pending_duration_total: Some(Duration::ZERO),
+            queue_selected: None,
+            playlist_name_sel: 0,
+            playlist_track_sel: 0,
+            playlist_names_cache: Vec::new(),
+            playlist_tracks_cache: Vec::new(),
+            playlist_selected: HashSet::new(),
+            playlist_anchor: 0,
+            dirty_playlists: HashSet::new(),
+            catalog_dirty: false,
+            deleted_name: None,
+            settings_section: 0,
+            settings_row: 0,
+            settings_rows_cache: Vec::new(),
+            device_candidates: Vec::new(),
+            device_candidate_sel: 0,
+            collect_generation: 0,
+            collect_op: None,
         };
-        if let Some(warning) = theme_warning {
+        app.state.device_names = (app.hooks.device_provider)();
+        app.playlist_name_sel = app.state.catalog.selected;
+        app.rebuild_playlist_rows();
+        app.rebuild_settings_rows();
+        if open_browser {
+            app.open_browser_startup();
+        }
+        if let Some(warning) = warning {
             app.state.status = warning;
         }
-        // Prime the device-name cache so the Playback pane shows a friendly
-        // name from the start; a failed enumeration only delays the name
-        // until the picker is opened.
-        app.state.device_names = (app.hooks.device_provider)();
-        if options.open_browser {
-            app.open_browser_startup();
+        if let Some(error) = &app.state.search_coverage_error {
+            app.state.status = format!("search coverage incomplete: {error}");
         }
         app
     }
 
-    /// Startup directory resolution: saved location, then home, then `/` on
-    /// Unix or the first readable drive root on Windows. The process working
-    /// directory is never used.
+    /// Saved directory, then Home, then platform root. Never use cwd as
+    /// the default browser location.
     fn open_browser_startup(&mut self) {
-        if let Some(saved) = self.state.last_browser_dir.clone() {
-            match Browser::open(saved.clone()) {
+        let mut candidates = Vec::new();
+        if let Some(saved) = &self.state.last_browser_dir {
+            candidates.push(saved.clone());
+        }
+        if let Some(home) = &self.state.home_dir {
+            candidates.push(home.clone());
+        }
+        #[cfg(not(windows))]
+        candidates.push(PathBuf::from("/"));
+        #[cfg(windows)]
+        for letter in b'A'..=b'Z' {
+            candidates.push(PathBuf::from(format!("{}:\\", letter as char)));
+        }
+        for path in candidates {
+            match Browser::open(path.clone()) {
                 Ok(browser) => {
-                    self.pane = Some(Pane::Browser(browser));
+                    self.browser = Some(browser);
                     return;
                 }
                 Err(error) => {
-                    self.state.status = format!(
-                        "saved folder {} is unreadable ({error}); falling back",
-                        saved.display()
-                    );
+                    if Some(&path) == self.state.last_browser_dir.as_ref() {
+                        self.state.status = format!(
+                            "saved folder {} is unreadable ({error}); falling back",
+                            path.display()
+                        );
+                    }
                 }
             }
         }
-        if let Some(home) = self.state.home_dir.clone()
-            && let Ok(browser) = Browser::open(home)
-        {
-            self.pane = Some(Pane::Browser(browser));
-            return;
-        }
-        #[cfg(not(windows))]
-        {
-            if let Ok(browser) = Browser::open(PathBuf::from("/")) {
-                self.pane = Some(Pane::Browser(browser));
-                return;
-            }
-        }
-        #[cfg(windows)]
-        for letter in b'A'..=b'Z' {
-            let root = PathBuf::from(format!("{}:\\", letter as char));
-            if let Ok(browser) = Browser::open(root) {
-                self.pane = Some(Pane::Browser(browser));
-                return;
-            }
-        }
-        self.state.status =
-            "no readable folder found; open Locations (l) and enter a path".to_owned();
+        self.state.status = "no readable folder found; press l to enter a location".to_owned();
     }
 
-    /// Reopen the browser at the last successful directory, falling back to
-    /// home. Never uses the process working directory.
-    fn reopen_browser(&mut self) {
-        let saved = self.state.last_browser_dir.clone();
-        let home = self.state.home_dir.clone();
-        for candidate in [saved, home].into_iter().flatten() {
-            match Browser::open(candidate.clone()) {
-                Ok(browser) => {
-                    self.pane = Some(Pane::Browser(browser));
-                    return;
-                }
-                Err(error) => {
-                    self.state.status =
-                        format!("{} is unreadable ({error}); falling back", candidate.display());
-                }
-            }
-        }
-        #[cfg(not(windows))]
-        {
-            if let Ok(browser) = Browser::open(PathBuf::from("/")) {
-                self.pane = Some(Pane::Browser(browser));
-                return;
-            }
-        }
-        #[cfg(windows)]
-        for letter in b'A'..=b'Z' {
-            let root = PathBuf::from(format!("{}:\\", letter as char));
-            if let Ok(browser) = Browser::open(root) {
-                self.pane = Some(Pane::Browser(browser));
-                return;
-            }
-        }
-        self.state.status =
-            "no readable folder found; open Locations (l) and enter a path".to_owned();
-    }
-
-    /// Remember a successfully browsed directory and persist it. A save
-    /// failure keeps the navigation in memory and says the next launch
-    /// might not restore it.
     fn remember_browser_dir(&mut self, dir: &Path) {
-        self.browser_before_locations = None;
         self.state.last_browser_dir = Some(dir.to_path_buf());
         if let Err(error) = (self.hooks.on_browser_dir)(dir) {
-            self.state.status =
-                format!("folder saved for this session only; next launch may not restore it: {error}");
-        }
-    }
-
-    fn toggle_browser(&mut self) {
-        if matches!(self.pane, Some(Pane::Browser(_))) {
-            self.close_pane();
-            return;
-        }
-        self.reopen_browser();
-    }
-
-    fn close_pane(&mut self) {
-        if matches!(self.pane, Some(Pane::Locations(_)))
-            && let Some(browser) = self.browser_before_locations.take()
-        {
-            self.pane = Some(Pane::Browser(browser));
-            return;
-        }
-        self.browser_before_locations = None;
-        if let Some(Pane::Browser(browser)) = &self.pane {
-            self.state.last_browser_dir = Some(browser.current_dir.clone());
-        }
-        self.pane = None;
-    }
-
-    fn toggle_devices(&mut self) {
-        if matches!(self.pane, Some(Pane::Devices(_))) {
-            self.close_pane();
-            return;
-        }
-        let devices = (self.hooks.device_provider)();
-        if devices.is_empty() {
-            self.state.status = "no output devices found".to_owned();
-            return;
-        }
-        let selected = devices
-            .iter()
-            .position(|(id, _)| *id == self.state.device)
-            .unwrap_or(0);
-        self.state.device_names = devices.clone();
-        self.pane = Some(Pane::Devices(DevicePane { devices, selected }));
-    }
-
-    fn open_locations(&mut self) {
-        match (self.hooks.locations)() {
-            Ok(locations) => {
-                match self.pane.take() {
-                    Some(Pane::Browser(browser)) => self.browser_before_locations = Some(browser),
-                    Some(Pane::Locations(_)) => {}
-                    _ if !matches!(self.input_origin, Some(Pane::Locations(_))) => {
-                        self.browser_before_locations = None;
-                    }
-                    _ => {}
-                }
-                self.pane = Some(Pane::Locations(LocationsPane { locations, selected: 0 }));
-            }
-            Err(error) => self.state.status = format!("locations: {error}"),
-        }
-    }
-
-    fn open_playlists(&mut self) {
-        self.pane = Some(Pane::Playlists(PlaylistsPane {
-            focus: PlaylistFocus::Names,
-            name_sel: self.state.catalog.selected,
-            entry_sel: 0,
-        }));
-    }
-
-    fn open_settings(&mut self) {
-        self.pane = Some(Pane::Settings(SettingsPane { selected: 0 }));
-    }
-
-    fn toggle_float_to_int(&mut self) {
-        let enabled = !self.state.float_to_int;
-        let _ = self.commands.send(PlayerCommand::SetFloatToInt(enabled));
-        self.state.float_to_int = enabled;
-        if let Err(error) = (self.hooks.on_float_to_int_selected)(enabled) {
-            self.state.status = format!("F32 compatibility not saved: {error}");
-        }
-    }
-
-    fn toggle_int_to_float(&mut self) {
-        let enabled = !self.state.int_to_float;
-        let _ = self.commands.send(PlayerCommand::SetIntToFloat(enabled));
-        self.state.int_to_float = enabled;
-        if let Err(error) = (self.hooks.on_int_to_float_selected)(enabled) {
-            self.state.status = format!("integer-to-F32 compatibility not saved: {error}");
-        }
-    }
-
-    fn toggle_menu(&mut self) {
-        if matches!(self.pane, Some(Pane::Menu(_))) {
-            self.close_pane();
-            return;
-        }
-        let context = match &self.pane {
-            Some(Pane::Locations(_)) => 1,
-            Some(Pane::Playlists(pane)) => {
-                self.playlist_entry_sel = pane.entry_sel;
-                2
-            }
-            _ => 0,
-        };
-        self.close_pane();
-        self.pane = Some(Pane::Menu(MenuPane::top()));
-        match context {
-            1 => self.open_locations_menu(),
-            2 => self.open_playlist_menu(),
-            _ => {}
-        }
-    }
-
-    fn start_input(&mut self, prompt: &str, action: InputAction) {
-        if self.input_origin.is_none() {
-            self.input_origin = self.pane.take();
-        }
-        self.pane = Some(Pane::Input(InputPane {
-            prompt: prompt.to_owned(),
-            buffer: String::new(),
-            action,
-        }));
-    }
-
-    /// Queue one entry; start playback only when idle.
-    fn enqueue_entry(&mut self, entry: QueueEntry, name: &str) {
-        let _ = self.commands.send(PlayerCommand::Enqueue(entry));
-        if self.state.idle() {
-            let _ = self.commands.send(PlayerCommand::Play);
-            self.state.paused = false;
-        }
-        self.state.status = format!("queued {name}");
-    }
-
-    /// Queue the highlighted saved list without changing the catalog selection.
-    fn enqueue_playlist(&mut self, index: usize) {
-        let Some(playlist) = self.state.catalog.playlists.get(index) else {
-            return;
-        };
-        if playlist.entries.is_empty() {
-            self.state.status = format!("playlist {} is empty", playlist.name);
-            return;
-        }
-        let count = playlist.entries.len();
-        for entry in &playlist.entries {
-            let _ = self.commands.send(PlayerCommand::Enqueue(entry.clone()));
-        }
-        if self.state.idle() {
-            let _ = self.commands.send(PlayerCommand::Play);
-            self.state.paused = false;
-        }
-        self.state.status = format!("queued {count} track(s) from {}", playlist.name);
-    }
-
-    fn toggle_shuffle(&mut self) {
-        let enabled = !self.state.shuffle;
-        if self.commands.send(PlayerCommand::SetShuffle(enabled)).is_err() {
-            self.state.status = "cannot change queue order: player disconnected".to_owned();
-            return;
-        }
-        self.state.shuffle = enabled;
-        self.state.status = if enabled {
-            "random play ON (current and prepared next stay in place)".to_owned()
+            self.state.status = format!(
+                "folder saved for this session only; next launch may not restore it: {error}"
+            );
         } else {
-            "random play OFF (remaining order kept; new tracks append)".to_owned()
-        };
+            self.state.config_error = None;
+        }
     }
 
-    // ---- catalog editing -------------------------------------------------
-
-    /// True when the catalog may be edited; otherwise explains why not.
-    fn catalog_writable(&mut self) -> bool {
-        if let Some(error) = &self.state.catalog_error {
-            self.state.status = format!("playlists read-only: {error}");
-            return false;
-        }
-        true
-    }
-
-    fn edit_catalog(&mut self, edit: impl FnOnce(&mut PlaylistCatalog) -> Result<(), String>) -> bool {
-        if !self.catalog_writable() {
-            return false;
-        }
-        let mut catalog = self.state.catalog.clone();
-        if let Err(error) = edit(&mut catalog) {
-            self.state.status = error;
-            return false;
-        }
-        match (self.hooks.on_catalog)(&catalog) {
-            Ok(()) => {
-                self.state.catalog = catalog;
+    fn open_browser(&mut self, path: PathBuf) -> bool {
+        match Browser::open(path.clone()) {
+            Ok(browser) => {
+                self.browser = Some(browser);
+                self.screen = Screen::Library;
+                self.focus = Focus::Library;
+                self.mode = Mode::Normal;
+                self.invalidate_dir(&path);
+                self.remember_browser_dir(&path);
                 true
             }
             Err(error) => {
-                self.state.status = format!("playlist not saved: {error}");
+                self.state.status = format!("cannot open {}: {error}", path.display());
                 false
             }
         }
     }
 
-    fn catalog_create(&mut self, name: String) {
-        let name = name.trim().to_owned();
-        self.edit_catalog(|catalog| {
-            if name.is_empty() {
-                return Err("playlist name must not be blank".to_owned());
-            }
-            if catalog.name_taken(&name) {
-                return Err(format!("a playlist named \"{name}\" already exists"));
-            }
-            catalog.playlists.push(SavedPlaylist { name, entries: Vec::new() });
-            catalog.selected = catalog.playlists.len() - 1;
-            Ok(())
-        });
+    fn invalidate_dir(&mut self, dir: &Path) {
+        self.worker
+            .send(WorkerMsg::InvalidateDir(dir.to_path_buf()));
+        self.metadata.retain(|path, _| !path.starts_with(dir));
+        self.metadata_order.retain(|path| !path.starts_with(dir));
+        self.metadata_requested
+            .retain(|path| !path.starts_with(dir));
     }
 
-    fn catalog_rename(&mut self, name: String) {
-        let name = name.trim().to_owned();
-        self.edit_catalog(|catalog| {
-            if name.is_empty() {
-                return Err("playlist name must not be blank".to_owned());
+    fn prime_metadata(&mut self, visible_height: usize) {
+        let mut paths = Vec::new();
+        match self.screen {
+            Screen::Library => {
+                if self.focus == Focus::Library
+                    && let Some(browser) = &self.browser
+                {
+                    let (start, end) = screens::visible_window(
+                        browser.items.len(), browser.selected, visible_height,
+                    );
+                    for item in &browser.items[start..end] {
+                        if item.kind == BrowserItemKind::Audio {
+                            paths.push(item.path.clone());
+                        }
+                    }
+                }
+                for item in self
+                    .state
+                    .audible
+                    .iter()
+                    .chain(self.state.pending.iter())
+                    .take(visible_height)
+                {
+                    paths.push(item.entry.path.clone());
+                }
             }
-            let current = catalog.selected;
-            if catalog.playlists[current].name.eq_ignore_ascii_case(&name) {
-                return Ok(());
+            Screen::Playlists => {
+                if let Some(playlist) = self.state.catalog.playlists.get(self.playlist_name_sel) {
+                    let (start, end) = screens::visible_window(
+                        playlist.entries.len(),
+                        self.playlist_track_sel,
+                        visible_height,
+                    );
+                    for entry in &playlist.entries[start..end] {
+                        paths.push(entry.path.clone());
+                    }
+                }
             }
-            if catalog.name_taken(&name) {
-                return Err(format!("a playlist named \"{name}\" already exists"));
-            }
-            catalog.playlists[current].name = name;
-            Ok(())
-        });
-    }
-
-    fn catalog_delete(&mut self) {
-        self.edit_catalog(|catalog| {
-            if catalog.playlists.len() <= 1 {
-                return Err("cannot delete the final playlist".to_owned());
-            }
-            catalog.playlists.remove(catalog.selected);
-            catalog.selected = catalog.selected.min(catalog.playlists.len() - 1);
-            Ok(())
-        });
-    }
-
-    fn catalog_import(&mut self, path: PathBuf, name: String) {
-        let name = name.trim().to_owned();
-        if name.is_empty() {
-            self.state.status = "playlist name must not be blank".to_owned();
-            return;
+            Screen::Settings => {}
         }
-        if self.state.catalog.name_taken(&name) {
-            self.state.status = format!("a playlist named \"{name}\" already exists");
-            return;
+        for path in paths {
+            if !self.metadata.contains_key(&path) && self.metadata_requested.insert(path.clone()) {
+                self.worker.send(WorkerMsg::Metadata(path));
+            }
         }
-        // Resolve a typed relative playlist against the current directory
-        // once; persisted entries must be absolute even when tracks are
-        // missing, so relaunching from another cwd never changes them.
-        let path = match std::path::absolute(&path) {
-            Ok(path) => path,
-            Err(error) => {
-                self.state.status = format!("import path: {error}");
-                return;
+    }
+
+    /// Rebuild presentation rows only when catalog or metadata changes.
+    /// Progress ticks reuse these rows and render only the visible window.
+    fn rebuild_playlist_rows(&mut self) {
+        self.playlist_names_cache = self.state.catalog.playlists.iter().enumerate()
+            .map(|(index, playlist)| {
+                let mut total = Duration::ZERO;
+                let mut known = true;
+                for entry in &playlist.entries {
+                    let duration = match entry.cue_range {
+                        Some(range) => range.end_cd.map(|end| {
+                            Duration::from_millis(end.saturating_sub(range.start_cd) * 1_000 / 75)
+                        }),
+                        None => self.metadata.get(&entry.path)
+                            .and_then(Option::as_ref).and_then(|meta| meta.duration),
+                    };
+                    if let Some(duration) = duration { total += duration; }
+                    else { known = false; }
+                }
+                screens::playlists::NameRow {
+                    name: playlist.name.clone(),
+                    count: playlist.entries.len(),
+                    dirty: self.dirty_playlists.contains(&index),
+                    catalog_selected: index == self.state.catalog.selected,
+                    duration: known.then_some(total),
+                }
+            }).collect();
+        self.playlist_tracks_cache = self.state.catalog.playlists
+            .get(self.playlist_name_sel)
+            .map(|list| list.entries.iter().map(|entry| {
+                let meta = self.metadata.get(&entry.path).and_then(Option::as_ref);
+                let (title, tag) = display::display_entry_title(
+                    entry, meta.map(|meta| &meta.tags),
+                );
+                let title = if let Some(tag) = tag { format!("{title} ({tag})") } else { title };
+                let duration = match entry.cue_range {
+                    Some(range) => range.end_cd.map(|end| {
+                        Duration::from_millis(end.saturating_sub(range.start_cd) * 1_000 / 75)
+                    }),
+                    None => meta.and_then(|meta| meta.duration),
+                };
+                screens::playlists::TrackRow {
+                    number: meta.and_then(|meta| meta.track_number)
+                        .or_else(|| display::fallback_track_number(&entry.path)),
+                    title,
+                    album: meta.and_then(|meta| meta.tags.album.clone()),
+                    duration,
+                }
+            }).collect()).unwrap_or_default();
+    }
+
+    fn poll_worker(&mut self) -> bool {
+        let mut changed = false;
+        while let Some(event) = self.worker.try_recv() {
+            match event {
+                WorkerEvent::Metadata { path, meta } => {
+                    if !self.metadata.contains_key(&path) {
+                        if self.metadata.len() >= search::METADATA_CACHE_LIMIT
+                            && let Some(oldest) = self.metadata_order.pop_front()
+                        {
+                            self.metadata.remove(&oldest);
+                            self.metadata_requested.remove(&oldest);
+                        }
+                        self.metadata_order.push_back(path.clone());
+                    }
+                    self.metadata.insert(path, meta);
+                    self.rebuild_queue_rows();
+                    self.rebuild_playlist_rows();
+                    changed = true;
+                }
+                WorkerEvent::Hits { generation, hits } => {
+                    if let Mode::Search(search) = &mut self.mode
+                        && search.generation == generation
+                    {
+                        search
+                            .results
+                            .extend(hits.into_iter().map(SearchItem::Worker));
+                        search.refresh_visible();
+                        changed = true;
+                    }
+                }
+                WorkerEvent::Status { generation, status } => {
+                    if let Mode::Search(search) = &mut self.mode
+                        && search.generation == generation
+                    {
+                        search.status = status;
+                        changed = true;
+                    }
+                }
             }
+        }
+        changed
+    }
+
+    fn start_collect(&mut self, dir: PathBuf, target: CollectTarget) {
+        self.collect_generation = self.collect_generation.wrapping_add(1);
+        let generation = self.collect_generation;
+        let (tx, rx) = crossbeam_channel::bounded(1);
+        std::thread::spawn(move || {
+            let result = collect_audio_files(&dir)
+                .map(|paths| paths.into_iter().map(QueueEntry::from).collect::<Vec<_>>());
+            let _ = tx.send(result);
+        });
+        self.collect_op = Some(CollectOp {
+            generation,
+            target,
+            rx,
+        });
+        self.state.status = "collecting folder…".to_owned();
+    }
+
+    fn start_album_collect(&mut self, path: PathBuf, target: CollectTarget) {
+        self.collect_generation = self.collect_generation.wrapping_add(1);
+        let generation = self.collect_generation;
+        let (tx, rx) = crossbeam_channel::bounded(1);
+        std::thread::spawn(move || {
+            let result = (|| -> io::Result<Vec<QueueEntry>> {
+                let parent = path
+                    .parent()
+                    .ok_or_else(|| io::Error::other("no parent folder"))?;
+                let selected_album = sointty_decode::tags::read_display_metadata(&path)
+                    .and_then(|meta| meta.tags.album)
+                    .filter(|album| !album.trim().is_empty());
+                let mut entries = Vec::new();
+                for item in browser::list_dir(parent)? {
+                    if item.kind != BrowserItemKind::Audio {
+                        continue;
+                    }
+                    let same_album = match &selected_album {
+                        Some(album) => sointty_decode::tags::read_display_metadata(&item.path)
+                            .and_then(|meta| meta.tags.album)
+                            .is_some_and(|candidate| candidate == *album),
+                        None => true,
+                    };
+                    if same_album {
+                        entries.push(QueueEntry::from(item.path));
+                    }
+                }
+                Ok(entries)
+            })();
+            let _ = tx.send(result);
+        });
+        self.collect_op = Some(CollectOp {
+            generation,
+            target,
+            rx,
+        });
+        self.state.status = "collecting album…".to_owned();
+    }
+
+    fn poll_collect(&mut self) -> bool {
+        let Some(op) = self.collect_op.as_ref() else {
+            return false;
         };
-        let entries = match sointty_playlist::read(&path) {
-            Ok(entries) => entries.into_iter().map(|entry| {
-                std::path::absolute(&entry.path).map(|path| QueueEntry {
-                    path,
-                    cue_range: entry.cue_range,
-                })
-            }).collect::<io::Result<Vec<_>>>(),
-            Err(error) => {
-                self.state.status = format!("import failed: {error}");
-                return;
+        let Ok(result) = op.rx.try_recv() else {
+            return false;
+        };
+        let op = self.collect_op.take().expect("op still exists");
+        if op.generation != self.collect_generation {
+            return false; // stale/canceled operation
+        }
+        match result {
+            Ok(entries) if entries.is_empty() => {
+                self.state.status = "no audio files found".to_owned();
             }
-        };
-        let entries = match entries {
-            Ok(entries) => entries,
-            Err(error) => {
-                self.state.status = format!("import path: {error}");
-                return;
-            }
-        };
+            Ok(entries) => match op.target {
+                CollectTarget::Enqueue { play_first } => {
+                    if play_first {
+                        self.play_entries(entries);
+                    } else {
+                        self.enqueue_entries(entries);
+                    }
+                }
+                CollectTarget::OpenPicker => {
+                    self.mode = Mode::PlaylistPicker(PlaylistPicker {
+                        entries,
+                        selected: 0,
+                    });
+                }
+            },
+            Err(error) => self.state.status = format!("nothing added: {error}"),
+        }
+        true
+    }
+
+    fn enqueue_entries(&mut self, entries: Vec<QueueEntry>) {
         if entries.is_empty() {
-            self.state.status = "import: playlist contains no tracks".to_owned();
+            self.state.status = "no tracks to queue".to_owned();
             return;
         }
         let count = entries.len();
-        if self.edit_catalog(|catalog| {
-            catalog.playlists.push(SavedPlaylist { name: name.clone(), entries });
-            catalog.selected = catalog.playlists.len() - 1;
-            Ok(())
-        }) {
-            self.state.status = format!("imported {count} track(s)");
+        for entry in entries {
+            let _ = self.commands.send(PlayerCommand::Enqueue(entry));
         }
+        self.state.status = format!("queued {count} track(s)");
     }
 
-    fn catalog_remove_entry(&mut self, index: usize) {
-        self.edit_catalog(|catalog| {
-            let entries = &mut catalog.playlists[catalog.selected].entries;
-            if index < entries.len() {
-                entries.remove(index);
-            }
-            Ok(())
-        });
-    }
-
-    fn catalog_move_entry(&mut self, index: usize, delta: isize) {
-        self.edit_catalog(|catalog| {
-            let entries = &mut catalog.playlists[catalog.selected].entries;
-            let Some(target) = index.checked_add_signed(delta) else {
-                return Ok(());
-            };
-            if index < entries.len() && target < entries.len() {
-                entries.swap(index, target);
-            }
-            Ok(())
-        });
-    }
-
-    fn catalog_select(&mut self, index: usize) {
-        self.edit_catalog(|catalog| {
-            if index >= catalog.playlists.len() {
-                return Err("playlist selection is out of range".to_owned());
-            }
-            catalog.selected = index;
-            Ok(())
-        });
-    }
-
-    /// Append paths to the selected saved list. No playback effect.
-    fn catalog_add(&mut self, entries: Vec<QueueEntry>, what: &str) {
+    fn play_entries(&mut self, mut entries: Vec<QueueEntry>) {
         if entries.is_empty() {
-            self.state.status = format!("no audio files found in {what}");
+            self.state.status = "no tracks to play".to_owned();
             return;
         }
         let count = entries.len();
-        if self.edit_catalog(|catalog| {
-            catalog.playlists[catalog.selected].entries.extend(entries);
-            Ok(())
-        }) {
-            let name = &self.state.catalog.selected_playlist().name;
-            self.state.status = format!("added {count} track(s) to {name}");
+        let first = entries.remove(0);
+        let _ = self.commands.send(PlayerCommand::PlayNow(first));
+        for entry in entries {
+            let _ = self.commands.send(PlayerCommand::Enqueue(entry));
+        }
+        self.state.paused = false;
+        self.state.status = format!("playing first of {count} track(s)");
+    }
+
+    fn selected_browser_item(&self) -> Option<browser::BrowserItem> {
+        self.browser.as_ref()?.selected_item().cloned()
+    }
+
+    fn import_entries(&mut self, path: &Path) -> Option<Vec<QueueEntry>> {
+        match sointty_playlist::read(path) {
+            Ok(entries) if entries.is_empty() => {
+                self.state.status = "playlist contains no tracks".to_owned();
+                None
+            }
+            Ok(entries) => Some(
+                entries
+                    .into_iter()
+                    .map(|entry| QueueEntry {
+                        path: entry.path,
+                        cue_range: entry.cue_range,
+                    })
+                    .collect(),
+            ),
+            Err(error) => {
+                self.state.status = format!("playlist import failed: {error}");
+                None
+            }
         }
     }
 
-    // ---- browser add actions ----------------------------------------------
-
-    /// `a`: add the selected browser item to the selected saved list.
-    fn browser_add_selected(&mut self) {
-        let Some(Pane::Browser(browser)) = &self.pane else {
+    fn browser_activate(&mut self) {
+        let Some(item) = self.selected_browser_item() else {
             return;
         };
-        let Some(item) = browser.selected_item() else {
-            return;
-        };
-        let item = item.clone();
         match item.kind {
-            BrowserItemKind::Audio => {
-                self.catalog_add(vec![QueueEntry::from(item.path)], &item.name);
+            BrowserItemKind::Dir => {
+                let result = self
+                    .browser
+                    .as_mut()
+                    .map(|browser| browser.descend(item.path.clone()));
+                match result {
+                    Some(Ok(())) => {
+                        self.invalidate_dir(&item.path);
+                        self.remember_browser_dir(&item.path);
+                    }
+                    Some(Err(error)) => {
+                        self.state.status = format!("cannot open {}: {error}", item.name)
+                    }
+                    None => {
+                        self.open_browser(item.path);
+                    }
+                }
             }
-            BrowserItemKind::Playlist => match sointty_playlist::read(&item.path) {
-                Ok(entries) => {
-                    let entries = entries
-                        .into_iter()
-                        .map(|entry| QueueEntry {
-                            path: entry.path,
-                            cue_range: entry.cue_range,
-                        })
-                        .collect::<Vec<_>>();
-                    self.catalog_add(entries, &item.name);
+            BrowserItemKind::Audio => self.play_entries(vec![QueueEntry::from(item.path)]),
+            BrowserItemKind::Playlist => {
+                if let Some(entries) = self.import_entries(&item.path) {
+                    self.play_entries(entries);
                 }
-                Err(error) => self.state.status = format!("sointty: {error}"),
-            },
-            BrowserItemKind::Dir => match collect_audio_files(&item.path) {
-                Ok(paths) => {
-                    let entries = paths.into_iter().map(QueueEntry::from).collect();
-                    self.catalog_add(entries, &item.name);
-                }
-                Err(error) => {
-                    self.state.status = format!("nothing added: {}: {error}", item.name)
-                }
-            },
+            }
         }
     }
 
-    /// `A`: add the current browser folder recursively.
-    fn browser_add_current_folder(&mut self) {
-        let Some(Pane::Browser(browser)) = &self.pane else {
+    fn browser_enqueue(&mut self, whole_album: bool) {
+        let Some(item) = self.selected_browser_item() else {
+            self.state.status = "select a library item first".to_owned();
             return;
         };
-        let dir = browser.current_dir.clone();
-        match collect_audio_files(&dir) {
-            Ok(paths) => {
-                let entries = paths.into_iter().map(QueueEntry::from).collect();
-                self.catalog_add(entries, &dir.display().to_string());
+        match item.kind {
+            BrowserItemKind::Audio if whole_album => {
+                self.start_album_collect(item.path, CollectTarget::Enqueue { play_first: false })
             }
-            Err(error) => {
-                self.state.status = format!("nothing added: {}: {error}", dir.display())
+            BrowserItemKind::Audio => self.enqueue_entries(vec![QueueEntry::from(item.path)]),
+            BrowserItemKind::Playlist => {
+                if let Some(entries) = self.import_entries(&item.path) {
+                    self.enqueue_entries(entries);
+                }
+            }
+            BrowserItemKind::Dir => {
+                self.start_collect(item.path, CollectTarget::Enqueue { play_first: false })
             }
         }
     }
 
-    // ---- timing ------------------------------------------------------------
+    fn browser_up(&mut self) {
+        let Some(browser) = &mut self.browser else {
+            self.open_locations();
+            return;
+        };
+        let at_root = browser
+            .current_dir
+            .parent()
+            .is_none_or(|parent| parent == browser.current_dir);
+        if at_root {
+            self.open_locations();
+            return;
+        }
+        match browser.ascend() {
+            Ok(()) => {
+                let dir = browser.current_dir.clone();
+                self.invalidate_dir(&dir);
+                self.remember_browser_dir(&dir);
+            }
+            Err(error) => self.state.status = format!("cannot go up: {error}"),
+        }
+    }
+
+    fn open_locations(&mut self) {
+        match (self.hooks.locations)() {
+            Ok(locations) => {
+                self.mode = Mode::Locations(LocationsOverlay {
+                    locations,
+                    selected: 0,
+                })
+            }
+            Err(error) => self.state.status = format!("locations: {error}"),
+        }
+    }
+
+    fn open_output_settings(&mut self) {
+        self.screen = Screen::Settings;
+        self.focus = Focus::SettingsRows;
+        self.settings_section = 0;
+        self.settings_row = 0;
+        self.refresh_devices();
+    }
+
+    fn refresh_devices(&mut self) {
+        self.device_candidates = (self.hooks.device_provider)();
+        if self.device_candidates.is_empty() {
+            self.state.status = "no output devices found".to_owned();
+            self.device_candidate_sel = 0;
+            self.rebuild_settings_rows();
+            return;
+        }
+        self.state.device_names = self.device_candidates.clone();
+        self.device_candidate_sel = self
+            .device_candidates
+            .iter()
+            .position(|(id, _)| *id == self.state.device)
+            .unwrap_or(0);
+        self.rebuild_settings_rows();
+    }
+
+    fn apply_device_candidate(&mut self) {
+        let Some((id, name)) = self
+            .device_candidates
+            .get(self.device_candidate_sel)
+            .cloned()
+        else {
+            self.state.status = "no output devices found".to_owned();
+            return;
+        };
+        match (self.hooks.on_device_selected)(&id) {
+            Ok(()) => {
+                self.state.device = id.clone();
+                self.state.config_error = None;
+                let _ = self.commands.send(PlayerCommand::SelectDevice(id));
+                self.state.status = format!("output device: {name}");
+                self.rebuild_settings_rows();
+            }
+            Err(error) => self.state.status = format!("device not saved: {error}"),
+        }
+    }
+
+    fn reset_device(&mut self) {
+        match (self.hooks.on_device_reset)() {
+            Ok(id) => {
+                self.state.device = id.clone();
+                self.state.config_error = None;
+                let _ = self.commands.send(PlayerCommand::SelectDevice(id.clone()));
+                self.state.status = format!("output device: platform default ({id})");
+                self.refresh_devices();
+            }
+            Err(error) => self.state.status = format!("default device not saved: {error}"),
+        }
+    }
+
+    fn toggle_float_to_int(&mut self) {
+        let enabled = !self.state.float_to_int;
+        if let Err(error) = (self.hooks.on_float_to_int_selected)(enabled) {
+            self.state.status = format!("F32 compatibility not saved: {error}");
+            return;
+        }
+        self.state.config_error = None;
+        self.state.float_to_int = enabled;
+        let _ = self.commands.send(PlayerCommand::SetFloatToInt(enabled));
+        self.state.status = "F32→integer compatibility applies on next configure".to_owned();
+        self.rebuild_settings_rows();
+    }
+
+    fn toggle_int_to_float(&mut self) {
+        let enabled = !self.state.int_to_float;
+        if let Err(error) = (self.hooks.on_int_to_float_selected)(enabled) {
+            self.state.status = format!("integer-to-F32 compatibility not saved: {error}");
+            return;
+        }
+        self.state.config_error = None;
+        self.state.int_to_float = enabled;
+        let _ = self.commands.send(PlayerCommand::SetIntToFloat(enabled));
+        self.state.status = "integer→F32 compatibility applies on next configure".to_owned();
+        self.rebuild_settings_rows();
+    }
 
     fn set_timing(&mut self, period: Option<u32>, buffer: Option<u32>) {
         if period == Some(0) || buffer == Some(0) {
@@ -984,68 +1100,829 @@ impl App {
             self.state.status = format!("timing not saved: {error}");
             return;
         }
+        self.state.config_error = None;
         self.state.timing = (period, buffer);
-        let _ = self
-            .commands
-            .send(PlayerCommand::SetTiming { period_frames: period, buffer_frames: buffer });
-        self.state.status = match (period, buffer) {
-            (None, None) => "DAC timing: Auto (per-track rate)".to_owned(),
-            _ => "DAC timing: Custom (applies on next track/seek)".to_owned(),
+        let _ = self.commands.send(PlayerCommand::SetTiming {
+            period_frames: period,
+            buffer_frames: buffer,
+        });
+        self.state.status = if period.is_none() && buffer.is_none() {
+            "DAC timing: Auto (applies on next configure)".to_owned()
+        } else {
+            "DAC timing: Custom (applies on next configure)".to_owned()
         };
+        self.rebuild_settings_rows();
     }
 
-    // ---- input submission ---------------------------------------------------
+    fn set_accent(&mut self, accent: Option<&str>) {
+        if let Some(text) = accent
+            && theme::parse_hex_color(text).is_none()
+        {
+            self.state.status = "accent must be exactly #RRGGBB".to_owned();
+            return;
+        }
+        if let Err(error) = (self.hooks.on_accent)(accent) {
+            self.state.status = format!("accent not saved: {error}");
+            return;
+        }
+        self.state.config_error = None;
+        self.state.accent = accent.map(str::to_owned);
+        self.theme = Theme::detect(accent).0;
+        self.state.status = match accent {
+            Some(text) => format!("accent: {text}"),
+            None => format!("accent reset to {}", theme::DEFAULT_ACCENT),
+        };
+        self.rebuild_settings_rows();
+    }
 
-    fn submit_input(&mut self, input: InputPane) {
-        let text = input.buffer.trim().to_owned();
-        match input.action {
-            InputAction::LocationPath => {
-                if text.is_empty() {
-                    return;
+    fn toggle_shuffle(&mut self) {
+        let enabled = !self.state.shuffle;
+        if self
+            .commands
+            .send(PlayerCommand::SetShuffle(enabled))
+            .is_err()
+        {
+            self.state.status = "cannot change queue order: player disconnected".to_owned();
+            return;
+        }
+        self.state.shuffle = enabled;
+        self.state.status = if enabled {
+            "random play ON"
+        } else {
+            "random play OFF"
+        }
+        .to_owned();
+        self.rebuild_settings_rows();
+    }
+
+    fn toggle_pause(&mut self) {
+        let command = if self.state.paused {
+            PlayerCommand::Play
+        } else {
+            PlayerCommand::Pause
+        };
+        self.state.paused = !self.state.paused;
+        let _ = self.commands.send(command);
+    }
+
+    fn seek_by(&self, seconds: i64) {
+        let target = self.state.frame as i64 + seconds * i64::from(self.state.rate_hz);
+        let _ = self
+            .commands
+            .send(PlayerCommand::SeekFrame(target.max(0) as u64));
+    }
+
+    fn catalog_writable(&mut self) -> bool {
+        if let Some(error) = &self.state.catalog_error {
+            self.state.status = format!("playlists read-only: {error}");
+            return false;
+        }
+        true
+    }
+
+    /// Validate then mutate in-memory only. Compare old/new so no-op edits
+    /// never mark dirty; the whole catalog is saved on Ctrl+S, not here.
+    fn edit_catalog(
+        &mut self,
+        edit: impl FnOnce(&mut PlaylistCatalog) -> Result<(), String>,
+    ) -> bool {
+        if !self.catalog_writable() {
+            return false;
+        }
+        let before = self.state.catalog.clone();
+        let mut after = before.clone();
+        if let Err(error) = edit(&mut after) {
+            self.state.status = error;
+            return false;
+        }
+        if after == before {
+            return true;
+        }
+        if after.selected != before.selected || after.playlists.len() != before.playlists.len() {
+            self.catalog_dirty = true;
+        }
+        for (index, (old, new)) in before
+            .playlists
+            .iter()
+            .zip(after.playlists.iter())
+            .enumerate()
+        {
+            if old.name != new.name {
+                self.catalog_dirty = true;
+                self.dirty_playlists.insert(index);
+            }
+            if old.entries != new.entries {
+                self.dirty_playlists.insert(index);
+            }
+        }
+        self.state.catalog = after;
+        self.playlist_name_sel = self
+            .playlist_name_sel
+            .min(self.state.catalog.playlists.len() - 1);
+        self.playlist_track_sel = self.playlist_track_sel.min(
+            self.state.catalog.playlists[self.playlist_name_sel]
+                .entries
+                .len()
+                .saturating_sub(1),
+        );
+        self.rebuild_playlist_rows();
+        true
+    }
+
+    fn catalog_create(&mut self, name: String) -> bool {
+        let name = name.trim().to_owned();
+        let changed = self.edit_catalog(|catalog| {
+            if name.is_empty() {
+                return Err("playlist name must not be blank".to_owned());
+            }
+            if catalog.name_taken(&name) {
+                return Err(format!("a playlist named \"{name}\" already exists"));
+            }
+            catalog.playlists.push(SavedPlaylist {
+                name,
+                entries: Vec::new(),
+            });
+            catalog.selected = catalog.playlists.len() - 1;
+            Ok(())
+        });
+        if changed {
+            self.dirty_playlists.insert(self.state.catalog.selected);
+            self.playlist_name_sel = self.state.catalog.selected;
+            self.playlist_track_sel = 0;
+            self.playlist_selected.clear();
+            self.rebuild_playlist_rows();
+        }
+        changed
+    }
+
+    fn catalog_rename(&mut self, name: String) {
+        let name = name.trim().to_owned();
+        let index = self.playlist_name_sel;
+        self.edit_catalog(|catalog| {
+            if name.is_empty() {
+                return Err("playlist name must not be blank".to_owned());
+            }
+            if index >= catalog.playlists.len() {
+                return Err("playlist selection is out of range".to_owned());
+            }
+            if catalog.playlists[index].name == name {
+                return Ok(());
+            }
+            if catalog
+                .playlists
+                .iter()
+                .enumerate()
+                .any(|(other, playlist)| {
+                    other != index && playlist.name.eq_ignore_ascii_case(&name)
+                })
+            {
+                return Err(format!("a playlist named \"{name}\" already exists"));
+            }
+            catalog.playlists[index].name = name;
+            Ok(())
+        });
+    }
+
+    fn catalog_delete(&mut self) {
+        let index = self.playlist_name_sel;
+        let name = self
+            .state
+            .catalog
+            .playlists
+            .get(index)
+            .map(|list| list.name.clone());
+        let prior_dirty = self.dirty_playlists.clone();
+        if self.edit_catalog(|catalog| {
+            if catalog.playlists.len() <= 1 {
+                return Err("cannot delete the final playlist".to_owned());
+            }
+            catalog.playlists.remove(index);
+            catalog.selected = catalog.selected.min(catalog.playlists.len() - 1);
+            Ok(())
+        }) {
+            self.deleted_name = name;
+            self.dirty_playlists = prior_dirty
+                .into_iter()
+                .filter_map(|dirty| {
+                    if dirty == index {
+                        None
+                    } else if dirty > index {
+                        Some(dirty - 1)
+                    } else {
+                        Some(dirty)
+                    }
+                })
+                .collect();
+            self.playlist_name_sel = self
+                .playlist_name_sel
+                .min(self.state.catalog.playlists.len() - 1);
+            self.playlist_track_sel = 0;
+            self.playlist_selected.clear();
+            self.rebuild_playlist_rows();
+        }
+    }
+
+    fn catalog_select(&mut self, index: usize) {
+        self.edit_catalog(|catalog| {
+            if index >= catalog.playlists.len() {
+                return Err("playlist selection is out of range".to_owned());
+            }
+            catalog.selected = index;
+            Ok(())
+        });
+        self.playlist_name_sel = index.min(self.state.catalog.playlists.len() - 1);
+        self.playlist_track_sel = 0;
+        self.playlist_anchor = 0;
+        self.playlist_selected.clear();
+        self.rebuild_playlist_rows();
+    }
+
+    fn catalog_add_to(&mut self, index: usize, entries: Vec<QueueEntry>) {
+        if entries.is_empty() {
+            self.state.status = "no tracks to add".to_owned();
+            return;
+        }
+        let count = entries.len();
+        if self.edit_catalog(|catalog| {
+            let Some(playlist) = catalog.playlists.get_mut(index) else {
+                return Err("playlist no longer exists".to_owned());
+            };
+            playlist.entries.extend(entries);
+            Ok(())
+        }) {
+            self.dirty_playlists.insert(index);
+            let name = &self.state.catalog.playlists[index].name;
+            self.state.status = format!("added {count} track(s) to {name}; Ctrl+S to save");
+        }
+    }
+
+    fn catalog_import(&mut self, path: PathBuf, name: String) {
+        let name = name.trim().to_owned();
+        if name.is_empty() {
+            self.state.status = "playlist name must not be blank".to_owned();
+            return;
+        }
+        if self.state.catalog.name_taken(&name) {
+            self.state.status = format!("a playlist named \"{name}\" already exists");
+            return;
+        }
+        let path = match std::path::absolute(&path) {
+            Ok(path) => path,
+            Err(error) => {
+                self.state.status = format!("import path: {error}");
+                return;
+            }
+        };
+        let Some(entries) = self.import_entries(&path) else {
+            return;
+        };
+        let count = entries.len();
+        if self.edit_catalog(|catalog| {
+            catalog.playlists.push(SavedPlaylist { name, entries });
+            catalog.selected = catalog.playlists.len() - 1;
+            Ok(())
+        }) {
+            self.playlist_name_sel = self.state.catalog.selected;
+            self.dirty_playlists.insert(self.state.catalog.selected);
+            self.rebuild_playlist_rows();
+            self.state.status = format!("imported {count} track(s); Ctrl+S to save");
+        }
+    }
+
+    fn catalog_remove_rows(&mut self) {
+        let index = self.playlist_name_sel;
+        let cursor = self.playlist_track_sel;
+        let selected = self.playlist_selected.clone();
+        let indices: HashSet<usize> = if selected.is_empty() {
+            [cursor].into()
+        } else {
+            selected
+        };
+        if self.edit_catalog(|catalog| {
+            let entries = &mut catalog.playlists[index].entries;
+            *entries = entries
+                .drain(..)
+                .enumerate()
+                .filter_map(|(row, entry)| (!indices.contains(&row)).then_some(entry))
+                .collect();
+            Ok(())
+        }) {
+            self.playlist_selected.clear();
+            self.playlist_track_sel = self.playlist_track_sel.min(
+                self.state.catalog.playlists[index]
+                    .entries
+                    .len()
+                    .saturating_sub(1),
+            );
+        }
+    }
+
+    fn catalog_move_rows(&mut self, indices: Vec<usize>, gap: usize) {
+        let index = self.playlist_name_sel;
+        let first = gap;
+        if self.edit_catalog(|catalog| {
+            let entries = &mut catalog.playlists[index].entries;
+            if indices.iter().any(|&row| row >= entries.len()) {
+                return Err("playlist changed during move".to_owned());
+            }
+            let picked: HashSet<usize> = indices.iter().copied().collect();
+            let mut lifted = Vec::with_capacity(indices.len());
+            let mut remaining = Vec::with_capacity(entries.len() - indices.len());
+            for (row, entry) in entries.drain(..).enumerate() {
+                if picked.contains(&row) {
+                    lifted.push(entry);
+                } else {
+                    remaining.push(entry);
                 }
-                match Browser::open(PathBuf::from(&text)) {
-                    Ok(browser) => {
-                        let dir = browser.current_dir.clone();
-                        self.pane = Some(Pane::Browser(browser));
-                        self.remember_browser_dir(&dir);
+            }
+            let gap = gap.min(remaining.len());
+            remaining.splice(gap..gap, lifted);
+            *entries = remaining;
+            Ok(())
+        }) {
+            self.playlist_selected.clear();
+            self.playlist_track_sel = first.min(
+                self.state.catalog.playlists[index]
+                    .entries
+                    .len()
+                    .saturating_sub(1),
+            );
+        }
+    }
+
+    fn save_catalog(&mut self) -> bool {
+        if !self.has_unsaved_catalog() {
+            self.state.status = "no playlist changes to save".to_owned();
+            return true;
+        }
+        if !self.catalog_writable() {
+            return false;
+        }
+        match (self.hooks.on_catalog)(&self.state.catalog) {
+            Ok(()) => {
+                self.dirty_playlists.clear();
+                self.catalog_dirty = false;
+                self.deleted_name = None;
+                self.rebuild_playlist_rows();
+                self.state.status = "playlists saved".to_owned();
+                true
+            }
+            Err(error) => {
+                self.state.status = format!("playlist not saved: {error}");
+                false
+            }
+        }
+    }
+
+    fn has_unsaved_catalog(&self) -> bool {
+        self.catalog_dirty || !self.dirty_playlists.is_empty() || self.deleted_name.is_some()
+    }
+
+    fn request_quit(&mut self) -> bool {
+        if !self.has_unsaved_catalog() {
+            return true;
+        }
+        if matches!(
+            self.mode,
+            Mode::Prompt(Prompt {
+                kind: PromptKind::QuitConfirm,
+                ..
+            })
+        ) {
+            return false;
+        }
+        let first_dirty = self.dirty_playlists.iter().copied().min();
+        let name = first_dirty
+            .and_then(|index| {
+                self.state
+                    .catalog
+                    .playlists
+                    .get(index)
+                    .map(|list| list.name.clone())
+            })
+            .or_else(|| self.deleted_name.clone())
+            .unwrap_or_else(|| self.state.catalog.selected_playlist().name.clone());
+        let count = self.dirty_playlists.len()
+            + usize::from(self.deleted_name.is_some())
+            + usize::from(
+                self.catalog_dirty
+                    && self.dirty_playlists.is_empty()
+                    && self.deleted_name.is_none(),
+            );
+        let suffix = if count > 1 {
+            format!(" ({count} changes)")
+        } else {
+            String::new()
+        };
+        let label = format!("Save changes to \"{name}\"{suffix}? (y)es / (n)o / (esc) cancel");
+        let origin = std::mem::replace(&mut self.mode, Mode::Normal);
+        self.mode = Mode::Prompt(Prompt {
+            label,
+            buffer: String::new(),
+            kind: PromptKind::QuitConfirm,
+            origin: Box::new(origin),
+        });
+        false
+    }
+
+    fn rebuild_queue_rows(&mut self) {
+        let past: Vec<QueueItem> = self.past.iter().cloned().collect();
+        self.queue_rows = screens::queue::build_rows(
+            self.state.audible.as_ref(),
+            &self.state.pending,
+            &past,
+            self,
+            self.queue_selected,
+        );
+        let mut pending_total = Duration::ZERO;
+        let mut known = true;
+        for item in &self.state.pending {
+            if let Some(duration) = screens::queue::entry_duration(item, self) {
+                pending_total += duration;
+            } else {
+                known = false;
+                break;
+            }
+        }
+        self.pending_duration_total = known.then_some(pending_total);
+        if self
+            .queue_selected
+            .is_some_and(|id| screens::queue::row_of(&self.queue_rows, id).is_none())
+        {
+            self.queue_selected = self.state.pending.first().map(|item| item.id);
+        }
+        if self.queue_selected.is_none() {
+            self.queue_selected = self
+                .state
+                .pending
+                .first()
+                .map(|item| item.id)
+                .or_else(|| self.state.audible.as_ref().map(|item| item.id));
+        }
+    }
+
+    fn queue_selected_pending(&self) -> Option<TrackId> {
+        let id = self.queue_selected?;
+        self.state
+            .pending
+            .iter()
+            .any(|item| item.id == id)
+            .then_some(id)
+    }
+
+    fn apply_event(&mut self, event: PlayerEvent) -> bool {
+        match event {
+            PlayerEvent::QueueChanged { audible, pending } => {
+                // History advances only when a different track becomes
+                // audible, never on Pause/Stop/Error (those use separate
+                // events and may clear the queue snapshot).
+                if let (Some(previous), Some(next)) = (&self.state.audible, &audible)
+                    && previous.id != next.id
+                {
+                    self.past.push_back(previous.clone());
+                    while self.past.len() > screens::queue::PAST_LIMIT {
+                        self.past.pop_front();
                     }
-                    Err(error) => {
-                        self.state.status = format!("cannot open {text}: {error}");
+                }
+                self.state.audible = audible;
+                self.state.pending = pending;
+                self.rebuild_queue_rows();
+                true
+            }
+            PlayerEvent::QueueEditRejected { id, reason } => {
+                self.state.status = format!("queue edit rejected for #{id}: {reason}");
+                true
+            }
+            PlayerEvent::Playing {
+                track,
+                output,
+                source,
+                buffers,
+                converted,
+            } => {
+                let same_track = track == self.state.current_track;
+                self.state.status = if converted {
+                    let direction = if output.format == DeviceFormat::F32Le {
+                        "integer→F32"
+                    } else {
+                        "F32→integer"
+                    };
+                    format!("playing ({direction} converted; not bit-perfect)")
+                } else {
+                    "playing (bit-perfect)".to_owned()
+                };
+                self.state.paused = false;
+                if !same_track {
+                    self.state.tags = TrackTags::default();
+                    self.state.frame = 0;
+                }
+                self.state.current_track = track;
+                self.state.total_frames = None;
+                self.state.rate_hz =
+                    output.rate_hz * output.format.source_frames_per_wire_frame() as u32;
+                self.state.converted = converted;
+                self.state.device = output.device.clone();
+                self.state.output_spec = Some(output);
+                self.state.source_spec = Some(source);
+                self.state.buffers = Some(buffers);
+                self.rebuild_settings_rows();
+                true
+            }
+            PlayerEvent::Tags { track, tags } => {
+                if track == self.state.current_track {
+                    self.state.tags = tags;
+                }
+                true
+            }
+            PlayerEvent::Duration {
+                track,
+                total_frames,
+            } => {
+                if track == self.state.current_track {
+                    self.state.total_frames = total_frames;
+                }
+                true
+            }
+            PlayerEvent::Position { track, frame } => {
+                if track == self.state.current_track {
+                    self.state.frame = frame;
+                }
+                false // coalesce progress redraw to <=4 Hz
+            }
+            PlayerEvent::Paused => {
+                self.state.status = "paused".to_owned();
+                self.state.paused = true;
+                true
+            }
+            PlayerEvent::Reconfiguring => {
+                self.state.status = "reconfiguring device".to_owned();
+                self.state.output_spec = None;
+                self.state.source_spec = None;
+                self.state.buffers = None;
+                self.state.converted = false;
+                self.state.total_frames = None;
+                true
+            }
+            PlayerEvent::Underrun { .. } => {
+                self.state.status = "underrun".to_owned();
+                true
+            }
+            PlayerEvent::Stalled { .. } => {
+                self.state.status = "stalled".to_owned();
+                true
+            }
+            PlayerEvent::Error { kind, .. } => {
+                self.state.status = format!("error: {kind}");
+                self.state.paused = true;
+                self.state.total_frames = None;
+                self.state.output_spec = None;
+                self.state.source_spec = None;
+                self.state.buffers = None;
+                true
+            }
+            PlayerEvent::EndOfQueue => {
+                if let Some(previous) = self.state.audible.take() {
+                    self.past.push_back(previous);
+                    while self.past.len() > screens::queue::PAST_LIMIT {
+                        self.past.pop_front();
                     }
+                }
+                self.state.status = "end of queue".to_owned();
+                self.state.paused = false;
+                self.state.total_frames = None;
+                self.state.frame = 0;
+                self.state.output_spec = None;
+                self.state.source_spec = None;
+                self.state.buffers = None;
+                self.rebuild_queue_rows();
+                true
+            }
+        }
+    }
+
+    fn open_search(&mut self) {
+        self.search_generation = self.search_generation.wrapping_add(1);
+        let generation = self.search_generation;
+        let mut roots = self.state.search_roots.clone();
+        if let Some(browser) = &self.browser {
+            roots.push(browser.current_dir.clone());
+        }
+        self.worker.send(WorkerMsg::SetRoots(roots));
+        self.mode = Mode::Search(SearchOverlay {
+            query: String::new(),
+            scope: SearchScope::All,
+            generation,
+            results: Vec::new(),
+            visible: Vec::new(),
+            selected: 0,
+            status: SearchStatus::Indexing,
+        });
+    }
+
+    fn update_search_query(&mut self, search: &mut SearchOverlay) {
+        self.search_generation = self.search_generation.wrapping_add(1);
+        search.generation = self.search_generation;
+        search.results.clear();
+        search.visible.clear();
+        search.selected = 0;
+        search.status = SearchStatus::Indexing;
+        if !search.query.trim().is_empty() {
+            for (index, playlist) in self.state.catalog.playlists.iter().enumerate() {
+                if let Some((score, spans)) = search::match_spans(&search.query, &playlist.name) {
+                    search.results.push(SearchItem::Catalog {
+                        index,
+                        rank: (
+                            -score,
+                            playlist.name.to_lowercase(),
+                            format!("catalog:{index}"),
+                        ),
+                        spans,
+                    });
+                }
+            }
+            search.refresh_visible();
+            self.worker.send(WorkerMsg::Query {
+                generation: search.generation,
+                text: search.query.clone(),
+            });
+        } else {
+            self.worker.send(WorkerMsg::Cancel);
+        }
+    }
+
+    fn search_selected_action(&mut self, item: SearchItem, action: Action) {
+        match item {
+            SearchItem::Catalog { index, .. } => {
+                let entries = self
+                    .state
+                    .catalog
+                    .playlists
+                    .get(index)
+                    .map(|list| list.entries.clone())
+                    .unwrap_or_default();
+                match action {
+                    Action::Activate => self.play_entries(entries),
+                    Action::EnqueueSelected => self.enqueue_entries(entries),
+                    Action::AddToPlaylist => {
+                        self.mode = Mode::PlaylistPicker(PlaylistPicker {
+                            entries,
+                            selected: 0,
+                        })
+                    }
+                    Action::OpenFolder => {
+                        self.screen = Screen::Playlists;
+                        self.focus = Focus::PlaylistTracks;
+                        self.playlist_name_sel = index;
+                        self.mode = Mode::Normal;
+                    }
+                    _ => {}
+                }
+            }
+            SearchItem::Worker(hit) => {
+                let path = hit.path;
+                match action {
+                    Action::OpenFolder => {
+                        let folder = if matches!(
+                            hit.kind,
+                            HitKind::Track | HitKind::Album | HitKind::PlaylistFile
+                        ) {
+                            path.parent().map(Path::to_path_buf).unwrap_or(path)
+                        } else {
+                            path
+                        };
+                        self.open_browser(folder);
+                    }
+                    Action::Activate | Action::EnqueueSelected | Action::AddToPlaylist => {
+                        let target = match action {
+                            Action::Activate => CollectTarget::Enqueue { play_first: true },
+                            Action::EnqueueSelected => CollectTarget::Enqueue { play_first: false },
+                            _ => CollectTarget::OpenPicker,
+                        };
+                        match hit.kind {
+                            HitKind::Track => {
+                                let entries = vec![QueueEntry::from(path)];
+                                match target {
+                                    CollectTarget::Enqueue { play_first: true } => {
+                                        self.play_entries(entries)
+                                    }
+                                    CollectTarget::Enqueue { .. } => self.enqueue_entries(entries),
+                                    CollectTarget::OpenPicker => {
+                                        self.mode = Mode::PlaylistPicker(PlaylistPicker {
+                                            entries,
+                                            selected: 0,
+                                        })
+                                    }
+                                }
+                            }
+                            HitKind::PlaylistFile => {
+                                if let Some(entries) = self.import_entries(&path) {
+                                    match target {
+                                        CollectTarget::Enqueue { play_first: true } => {
+                                            self.play_entries(entries)
+                                        }
+                                        CollectTarget::Enqueue { .. } => {
+                                            self.enqueue_entries(entries)
+                                        }
+                                        CollectTarget::OpenPicker => {
+                                            self.mode = Mode::PlaylistPicker(PlaylistPicker {
+                                                entries,
+                                                selected: 0,
+                                            })
+                                        }
+                                    }
+                                }
+                            }
+                            HitKind::Album => self.start_album_collect(path, target),
+                            HitKind::Folder => self.start_collect(path, target),
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+
+    fn start_picker_for_browser(&mut self) {
+        let Some(item) = self.selected_browser_item() else {
+            return;
+        };
+        match item.kind {
+            BrowserItemKind::Audio => {
+                self.mode = Mode::PlaylistPicker(PlaylistPicker {
+                    entries: vec![QueueEntry::from(item.path)],
+                    selected: 0,
+                })
+            }
+            BrowserItemKind::Playlist => {
+                if let Some(entries) = self.import_entries(&item.path) {
+                    self.mode = Mode::PlaylistPicker(PlaylistPicker {
+                        entries,
+                        selected: 0,
+                    });
+                }
+            }
+            BrowserItemKind::Dir => self.start_collect(item.path, CollectTarget::OpenPicker),
+        }
+    }
+
+    fn start_prompt(&mut self, label: &str, kind: InputAction) {
+        let origin = std::mem::replace(&mut self.mode, Mode::Normal);
+        self.mode = Mode::Prompt(Prompt {
+            label: label.to_owned(),
+            buffer: String::new(),
+            kind: PromptKind::Text(kind),
+            origin: Box::new(origin),
+        });
+    }
+
+    fn submit_input(&mut self, action: InputAction, text: String) {
+        let text = text.trim().to_owned();
+        match action {
+            InputAction::LocationPath => {
+                if !text.is_empty() {
+                    self.open_browser(PathBuf::from(text));
                 }
             }
             InputAction::MapDriveLetter => {
-                let letter = match text.chars().next() {
-                    Some(letter) if text.len() == 1 => letter,
-                    _ => {
-                        self.state.status = "enter a single drive letter".to_owned();
-                        return;
-                    }
+                let Some(letter) = text.chars().next().filter(|_| text.len() == 1) else {
+                    self.state.status = "enter a single drive letter".to_owned();
+                    return;
                 };
-                self.start_input("Share (\\\\server\\share):", InputAction::MapDriveShare(letter));
+                self.start_prompt(
+                    "Share (\\\\server\\share):",
+                    InputAction::MapDriveShare(letter),
+                );
             }
             InputAction::MapDriveShare(letter) => {
-                if text.is_empty() {
-                    return;
+                if !text.is_empty() {
+                    self.pending_os = Some(OsAction::MapDrive(letter, text));
                 }
-                self.pending_os = Some(OsAction::MapDrive(letter, text));
             }
             InputAction::MountShare => {
-                if text.is_empty() {
-                    return;
+                if !text.is_empty() {
+                    self.pending_os = Some(OsAction::MountShare(text));
                 }
-                self.pending_os = Some(OsAction::MountShare(text));
             }
-            InputAction::PlaylistCreate => self.catalog_create(text),
+            InputAction::PlaylistCreate => {
+                let pending = match &self.mode {
+                    Mode::PlaylistPicker(picker) => Some(picker.entries.clone()),
+                    _ => None,
+                };
+                if self.catalog_create(text)
+                    && let Some(entries) = pending
+                {
+                    self.catalog_add_to(self.state.catalog.selected, entries);
+                    self.mode = Mode::Normal;
+                }
+            }
             InputAction::PlaylistRename => self.catalog_rename(text),
             InputAction::PlaylistImportPath => {
-                if text.is_empty() {
-                    return;
+                if !text.is_empty() {
+                    self.start_prompt(
+                        "Import as (playlist name):",
+                        InputAction::PlaylistImportName(PathBuf::from(text)),
+                    );
                 }
-                self.start_input(
-                    "Import as (playlist name):",
-                    InputAction::PlaylistImportName(PathBuf::from(text)),
-                );
             }
             InputAction::PlaylistImportName(path) => self.catalog_import(path, text),
             InputAction::TimingPeriod => {
@@ -1057,275 +1934,121 @@ impl App {
                     self.state.status = "period must be positive".to_owned();
                     return;
                 }
-                self.start_input("Buffer frames:", InputAction::TimingBuffer(period));
+                self.start_prompt("Buffer frames:", InputAction::TimingBuffer(period));
             }
             InputAction::TimingBuffer(period) => {
                 let Ok(buffer) = text.parse::<u32>() else {
                     self.state.status = "buffer must be a positive decimal".to_owned();
                     return;
                 };
-                if buffer == 0 {
-                    self.state.status = "buffer must be positive".to_owned();
-                    return;
-                }
                 self.set_timing(Some(period), Some(buffer));
             }
+            InputAction::Accent => self.set_accent(Some(&text)),
         }
     }
 
-    // ---- menu dispatch -------------------------------------------------------
-
-    fn open_locations_menu(&mut self) {
-        let mut items = vec![
-            MenuItem { label: "Open locations".to_owned(), action: MenuAction::LocationsRefresh },
-            MenuItem { label: "Enter path...".to_owned(), action: MenuAction::LocationsEnterPath },
-            MenuItem { label: "Refresh".to_owned(), action: MenuAction::LocationsRefresh },
-        ];
-        if self.hooks.map_drive.is_some() {
-            items.push(MenuItem { label: "Map drive...".to_owned(), action: MenuAction::LocationsMapDrive });
-            let mapped: Vec<char> = match (self.hooks.locations)() {
-                Ok(locations) => locations
-                    .iter()
-                    .filter(|location| location.mapped_network)
-                    .filter_map(|location| location.path.to_string_lossy().chars().next())
-                    .collect(),
-                Err(_) => Vec::new(),
-            };
-            for letter in mapped {
-                items.push(MenuItem {
-                    label: format!("Disconnect {letter}:"),
-                    action: MenuAction::LocationsDisconnect(letter),
-                });
+    fn open_actions(&mut self) {
+        let mut items = Vec::new();
+        if matches!(self.mode, Mode::Locations(_)) {
+            items.push(("Enter path…".to_owned(), ActionItem::EnterPath));
+            items.push(("Refresh".to_owned(), ActionItem::RefreshLocations));
+            if self.hooks.map_drive.is_some() {
+                items.push(("Map drive…".to_owned(), ActionItem::MapDrive));
+                if let Mode::Locations(locations) = &self.mode {
+                    for location in &locations.locations {
+                        if location.mapped_network
+                            && let Some(letter) = location.path.to_string_lossy().chars().next()
+                        {
+                            items.push((
+                                format!("Disconnect {letter}:"),
+                                ActionItem::Disconnect(letter),
+                            ));
+                        }
+                    }
+                }
             }
-        }
-        if self.hooks.mount_share.is_some() {
-            items.push(MenuItem { label: "Mount share...".to_owned(), action: MenuAction::LocationsMountShare });
-        }
-        let title = "Locations".to_owned();
-        match &mut self.pane {
-            Some(Pane::Menu(menu)) => menu.push(title, items),
-            _ => {
-                let mut menu = MenuPane::top();
-                menu.push(title, items);
-                self.pane = Some(Pane::Menu(menu));
+            if self.hooks.mount_share.is_some() {
+                items.push(("Mount share…".to_owned(), ActionItem::MountShare));
             }
+        } else if self.screen == Screen::Playlists {
+            items.push(("Create playlist…".to_owned(), ActionItem::PlaylistCreate));
+            items.push(("Rename playlist…".to_owned(), ActionItem::PlaylistRename));
+            items.push(("Delete playlist".to_owned(), ActionItem::PlaylistDelete));
+            items.push(("Import file…".to_owned(), ActionItem::PlaylistImport));
+        } else {
+            items.push((
+                "Queue current folder".to_owned(),
+                ActionItem::QueueCurrentFolder,
+            ));
         }
+        items.push(("Quit".to_owned(), ActionItem::Quit));
+        let origin = std::mem::replace(&mut self.mode, Mode::Normal);
+        self.mode = Mode::Actions(ActionsOverlay {
+            items,
+            selected: 0,
+            origin: Box::new(origin),
+        });
     }
 
-    fn open_playlist_menu(&mut self) {
-        let items = vec![
-            MenuItem { label: "View playlists".to_owned(), action: MenuAction::ViewPlaylists },
-            MenuItem { label: "Create...".to_owned(), action: MenuAction::PlaylistCreate },
-            MenuItem { label: "Rename...".to_owned(), action: MenuAction::PlaylistRename },
-            MenuItem { label: "Delete".to_owned(), action: MenuAction::PlaylistDelete },
-            MenuItem { label: "Import file...".to_owned(), action: MenuAction::PlaylistImport },
-            MenuItem { label: "Remove entry".to_owned(), action: MenuAction::PlaylistRemoveEntry },
-            MenuItem { label: "Move entry up".to_owned(), action: MenuAction::PlaylistMoveUp },
-            MenuItem { label: "Move entry down".to_owned(), action: MenuAction::PlaylistMoveDown },
-            MenuItem { label: "Enqueue selected".to_owned(), action: MenuAction::PlaylistEnqueue },
-            MenuItem { label: "Enqueue all".to_owned(), action: MenuAction::PlaylistEnqueueAll },
-        ];
-        let title = "Playlists".to_owned();
-        match &mut self.pane {
-            Some(Pane::Menu(menu)) => menu.push(title, items),
-            _ => {
-                let mut menu = MenuPane::top();
-                menu.push(title, items);
-                self.pane = Some(Pane::Menu(menu));
-            }
-        }
-    }
-
-    fn open_queue_menu(&mut self) {
-        let items = vec![
-            MenuItem {
-                label: "Enqueue selected playlist".to_owned(),
-                action: MenuAction::QueueEnqueueSelectedPlaylist,
-            },
-            MenuItem { label: "View queue".to_owned(), action: MenuAction::ViewQueue },
-            MenuItem {
-                label: format!("Random play: {} (toggle)", if self.state.shuffle { "ON" } else { "OFF" }),
-                action: MenuAction::QueueToggleShuffle,
-            },
-        ];
-        let title = "Queue".to_owned();
-        match &mut self.pane {
-            Some(Pane::Menu(menu)) => menu.push(title, items),
-            _ => {
-                let mut menu = MenuPane::top();
-                menu.push(title, items);
-                self.pane = Some(Pane::Menu(menu));
-            }
-        }
-    }
-
-    fn show_help(&mut self) {
-        let lines = [
-            "space play/pause | s stop | n next | <-/-> seek 10 s",
-            "b browser | l drives/locations | p playlists | m menu",
-            "p lists: Enter select list, Tab entries, a queue list/song",
-            "f focus visible playlist | a/Enter song | A whole list",
-            "r random queue ON/OFF | Tab queue/playlist | d device",
-            "browser: a add item | A add folder | Backspace up/drives",
-            "c F32->int | i int->F32 (NOT bit-perfect) | ? help | Esc back",
-            "Ctrl+Q quits even while typing in an input prompt.",
-            "",
-            "Fidelity: playback is always the exact native format; nothing is",
-            "resampled, remixed or converted unless F32->integer (c) or",
-            "integer->F32 (i) compatibility is explicitly enabled (both are",
-            "OFF by default and clearly labeled when active).",
-        ];
-        let items = lines
-            .iter()
-            .map(|line| MenuItem { label: line.to_string(), action: MenuAction::Close })
-            .collect();
-        let title = "Help".to_owned();
-        match &mut self.pane {
-            Some(Pane::Menu(menu)) => menu.push(title, items),
-            _ => {
-                let mut menu = MenuPane::top();
-                menu.push(title, items);
-                self.pane = Some(Pane::Menu(menu));
-            }
-        }
-    }
-
-    fn dispatch(&mut self, action: MenuAction) -> bool {
+    fn run_action(&mut self, action: ActionItem) -> bool {
         match action {
-            MenuAction::OpenBrowser => self.toggle_browser(),
-            MenuAction::OpenLocations => self.open_locations_menu(),
-            MenuAction::OpenPlaylists => self.open_playlist_menu(),
-            MenuAction::OpenQueue => self.open_queue_menu(),
-            MenuAction::ViewPlaylists => self.open_playlists(),
-            MenuAction::ViewQueue => {
-                self.right = RightView::Queue;
-                self.close_pane();
+            ActionItem::EnterPath => {
+                self.start_prompt("Path or \\\\server\\share:", InputAction::LocationPath)
             }
-            MenuAction::QueueToggleShuffle => {
-                self.toggle_shuffle();
-                self.close_pane();
+            ActionItem::RefreshLocations => self.open_locations(),
+            ActionItem::MapDrive => {
+                self.start_prompt("Drive letter (free, e.g. Z):", InputAction::MapDriveLetter)
             }
-            MenuAction::OpenDevices => self.toggle_devices(),
-            MenuAction::OpenSettings => self.open_settings(),
-            MenuAction::ShowHelp => self.show_help(),
-            MenuAction::Quit => return true,
-            MenuAction::LocationsEnterPath => {
-                self.start_input("Path or \\\\server\\share:", InputAction::LocationPath);
+            ActionItem::MountShare => {
+                self.start_prompt("SMB share (server/share):", InputAction::MountShare)
             }
-            MenuAction::LocationsRefresh => self.open_locations(),
-            MenuAction::LocationsMapDrive => {
-                self.start_input("Drive letter (free, e.g. Z):", InputAction::MapDriveLetter);
-            }
-            MenuAction::LocationsMountShare => {
-                self.start_input("SMB share (server/share):", InputAction::MountShare);
-            }
-            MenuAction::LocationsDisconnect(letter) => {
+            ActionItem::Disconnect(letter) => {
                 if let Some(disconnect) = &mut self.hooks.disconnect_drive {
                     match disconnect(letter) {
                         Ok(()) => {
                             self.state.status = format!("disconnected {letter}:");
-                            // If the browser root was on that drive, reset to home.
-                            let on_drive = matches!(
-                                &self.pane,
-                                Some(Pane::Browser(browser))
-                                    if browser
-                                        .current_dir
-                                        .to_string_lossy()
-                                        .to_uppercase()
-                                        .starts_with(&format!("{letter}:"))
-                            );
-                            let last_on_drive = self
-                                .state
-                                .last_browser_dir
-                                .as_ref()
-                                .is_some_and(|dir| {
-                                    dir.to_string_lossy()
-                                        .to_uppercase()
-                                        .starts_with(&format!("{letter}:"))
-                                });
-                            if on_drive || last_on_drive {
+                            let on_drive = self.browser.as_ref().is_some_and(|browser| {
+                                browser
+                                    .current_dir
+                                    .to_string_lossy()
+                                    .to_uppercase()
+                                    .starts_with(&format!("{letter}:"))
+                            });
+                            if on_drive {
                                 self.state.last_browser_dir = self.state.home_dir.clone();
-                                if on_drive {
-                                    self.pane = None;
-                                    self.reopen_browser();
-                                }
+                                self.open_browser_startup();
                             }
-                            self.close_pane();
+                            self.refresh_search_roots();
+                            self.open_locations();
                         }
                         Err(error) => self.state.status = error,
                     }
                 }
             }
-            MenuAction::PlaylistCreate => {
-                self.start_input("New playlist name:", InputAction::PlaylistCreate);
+            ActionItem::PlaylistCreate => {
+                self.start_prompt("New playlist name:", InputAction::PlaylistCreate)
             }
-            MenuAction::PlaylistRename => {
-                self.start_input("Rename playlist to:", InputAction::PlaylistRename);
+            ActionItem::PlaylistRename => {
+                self.start_prompt("Rename playlist to:", InputAction::PlaylistRename)
             }
-            MenuAction::PlaylistDelete => {
-                let name = self.state.catalog.selected_playlist().name.clone();
-                let title = format!("Delete \"{name}\"?");
-                let items = vec![
-                    MenuItem { label: "Cancel".to_owned(), action: MenuAction::Close },
-                    MenuItem {
-                        label: format!("Delete \"{name}\""),
-                        action: MenuAction::PlaylistDeleteConfirmed,
-                    },
-                ];
-                if let Some(Pane::Menu(menu)) = &mut self.pane {
-                    menu.push(title, items);
-                }
-            }
-            MenuAction::PlaylistDeleteConfirmed => self.catalog_delete(),
-            MenuAction::PlaylistImport => {
-                self.start_input("Playlist file (.m3u/.m3u8/.pls/.xspf/.cue):", InputAction::PlaylistImportPath);
-            }
-            MenuAction::PlaylistRemoveEntry => {
-                let index = self.playlist_entry_sel;
-                if index < self.state.catalog.selected_playlist().entries.len() {
-                    self.catalog_remove_entry(index);
-                    self.playlist_entry_sel = index.min(
-                        self.state.catalog.selected_playlist().entries.len().saturating_sub(1),
+            ActionItem::PlaylistDelete => self.catalog_delete(),
+            ActionItem::PlaylistImport => self.start_prompt(
+                "Playlist file (.m3u/.m3u8/.pls/.xspf/.cue):",
+                InputAction::PlaylistImportPath,
+            ),
+            ActionItem::QueueCurrentFolder => {
+                if let Some(browser) = &self.browser {
+                    self.start_collect(
+                        browser.current_dir.clone(),
+                        CollectTarget::Enqueue { play_first: false },
                     );
-                } else {
-                    self.state.status = "select a playlist entry first".to_owned();
                 }
             }
-            MenuAction::PlaylistMoveUp | MenuAction::PlaylistMoveDown => {
-                let delta = if action == MenuAction::PlaylistMoveUp { -1 } else { 1 };
-                let index = self.playlist_entry_sel;
-                let count = self.state.catalog.selected_playlist().entries.len();
-                if let Some(target) = index.checked_add_signed(delta)
-                    && index < count && target < count
-                {
-                    self.catalog_move_entry(index, delta);
-                    self.playlist_entry_sel = target;
-                }
-            }
-            MenuAction::PlaylistEnqueue => {
-                let playlist = self.state.catalog.selected_playlist();
-                if let Some(entry) = playlist.entries.get(self.playlist_entry_sel).cloned() {
-                    self.enqueue_entry(entry, "track");
-                } else {
-                    self.state.status = "select a playlist entry first".to_owned();
-                }
-            }
-            MenuAction::PlaylistEnqueueAll | MenuAction::QueueEnqueueSelectedPlaylist => {
-                self.enqueue_playlist(self.state.catalog.selected);
-            }
-            MenuAction::Close => {
-                if let Some(Pane::Menu(menu)) = &mut self.pane
-                    && !menu.pop()
-                {
-                    self.close_pane();
-                }
-            }
+            ActionItem::Quit => return self.request_quit(),
         }
         false
     }
 
-    /// Run a queued OS action. In the real event loop the terminal is
-    /// suspended around it; tests call this directly.
     fn run_os_action(&mut self, action: OsAction) {
         match action {
             OsAction::MapDrive(letter, share) => {
@@ -1333,21 +2056,13 @@ impl App {
                     match map_drive(letter, &share) {
                         Ok(root) => {
                             self.state.status = format!("mapped {letter}: to {share}");
-                            match Browser::open(root) {
-                                Ok(browser) => {
-                                    let dir = browser.current_dir.clone();
-                                    self.pane = Some(Pane::Browser(browser));
-                                    self.remember_browser_dir(&dir);
-                                }
-                                Err(error) => {
-                                    self.state.status = format!("mapped but cannot browse: {error}");
-                                }
-                            }
+                            self.open_browser(root);
+                            self.refresh_search_roots();
                         }
                         Err(error) => self.state.status = error,
                     }
                 } else {
-                    self.state.status = "drive mapping is unavailable on this OS".to_owned();
+                    self.state.status = "drive mapping unavailable on this OS".to_owned();
                 }
             }
             OsAction::MountShare(share) => {
@@ -1355,534 +2070,880 @@ impl App {
                     match mount_share(&share) {
                         Ok(()) => {
                             self.state.status =
-                                "mount requested; refresh Locations to browse the new mount".to_owned();
+                                "mount requested; refresh Locations to browse it".to_owned();
+                            self.refresh_search_roots();
                             self.open_locations();
                         }
                         Err(error) => self.state.status = error,
                     }
                 } else {
-                    self.state.status = "share mounting is unavailable on this OS".to_owned();
+                    self.state.status = "share mounting unavailable on this OS".to_owned();
                 }
             }
         }
-        if self.pane.is_none() {
-            self.pane = self.input_origin.take();
-        } else {
-            self.input_origin = None;
+    }
+
+    fn refresh_search_roots(&mut self) {
+        if let Ok(locations) = (self.hooks.locations)() {
+            self.state.search_roots = locations
+                .into_iter()
+                .map(|location| location.path)
+                .collect();
+        }
+        let mut roots = self.state.search_roots.clone();
+        if let Some(browser) = &self.browser {
+            roots.push(browser.current_dir.clone());
+        }
+        self.worker.send(WorkerMsg::SetRoots(roots));
+    }
+
+    fn settings_row_count(&self) -> usize {
+        match self.settings_section {
+            0 => 7, // Output
+            1 => 4, // Playback
+            2 => 2, // Library & locations
+            3 => 1, // Appearance
+            4 => keymap::help_groups()
+                .iter()
+                .map(|(_, rows)| rows.len())
+                .sum(),
+            _ => 0,
         }
     }
 
-    // ---- input ---------------------------------------------------------------
+    fn settings_rows(&self) -> Vec<screens::settings::SettingsRowView> {
+        use screens::settings::SettingsRowView as Row;
+        match self.settings_section {
+            0 => {
+                let device_name = self
+                    .device_candidates
+                    .get(self.device_candidate_sel)
+                    .map(|(_, name)| name.as_str())
+                    .unwrap_or(self.state.device_display());
+                let (period, buffer) = self.state.timing;
+                vec![
+                    Row { label: "Output device".to_owned(), value: device_name.to_owned(), note: Some("←→ preview · Enter apply · r platform default".to_owned()), warning: None },
+                    Row { label: "Access".to_owned(), value: "direct / exclusive".to_owned(), note: Some("fixed: shared mode is not supported".to_owned()), warning: None },
+                    Row { label: "Fidelity".to_owned(), value: "strict first".to_owned(), note: Some("exact native format; conversion only with explicit compatibility opt-in".to_owned()), warning: None },
+                    Row { label: "Period".to_owned(), value: period.map(|n| format!("{n} frames")).unwrap_or_else(|| "Auto".to_owned()), note: Some("← Auto · → custom period then buffer".to_owned()), warning: None },
+                    Row { label: "Buffer".to_owned(), value: buffer.map(|n| format!("{n} frames")).unwrap_or_else(|| "Auto".to_owned()), note: Some("applies on next configure (next track or seek)".to_owned()), warning: None },
+                    Row { label: "F32→integer".to_owned(), value: if self.state.float_to_int { "ON" } else { "OFF" }.to_owned(), note: Some("OFF keeps strict bit-perfect; ON permits non-bit-perfect conversion".to_owned()), warning: self.state.float_to_int.then(|| "converted output is not bit-perfect".to_owned()) },
+                    Row { label: "integer→F32".to_owned(), value: if self.state.int_to_float { "ON" } else { "OFF" }.to_owned(), note: Some("S16/S24 exact in F32; S32 loses low bits".to_owned()), warning: self.state.int_to_float.then(|| "converted output is not bit-perfect".to_owned()) },
+                ]
+            }
+            1 => vec![
+                Row {
+                    label: "Shuffle".to_owned(),
+                    value: if self.state.shuffle { "ON" } else { "OFF" }.to_owned(),
+                    note: Some("space / Enter toggles future queue order".to_owned()),
+                    warning: None,
+                },
+                Row {
+                    label: "Play/pause".to_owned(),
+                    value: "space (Ctrl+Space in editable lists)".to_owned(),
+                    note: None,
+                    warning: None,
+                },
+                Row {
+                    label: "Stop / next".to_owned(),
+                    value: "s / n".to_owned(),
+                    note: None,
+                    warning: None,
+                },
+                Row {
+                    label: "Seek".to_owned(),
+                    value: "← / → 10 seconds".to_owned(),
+                    note: None,
+                    warning: None,
+                },
+            ],
+            2 => vec![
+                Row {
+                    label: "Locations".to_owned(),
+                    value: "Enter to open".to_owned(),
+                    note: Some("browse, type path, refresh, map/mount/disconnect".to_owned()),
+                    warning: None,
+                },
+                Row {
+                    label: "Current folder".to_owned(),
+                    value: self
+                        .browser
+                        .as_ref()
+                        .map(|b| b.current_dir.display().to_string())
+                        .unwrap_or_else(|| "none".to_owned()),
+                    note: None,
+                    warning: None,
+                },
+            ],
+            3 => vec![Row {
+                label: "Accent".to_owned(),
+                value: self
+                    .state
+                    .accent
+                    .clone()
+                    .unwrap_or_else(|| theme::DEFAULT_ACCENT.to_owned()),
+                note: Some("Enter: #RRGGBB · r: reset".to_owned()),
+                warning: None,
+            }],
+            4 => keymap::help_groups()
+                .into_iter()
+                .flat_map(|(group, rows)| {
+                    rows.into_iter().map(move |(key, label)| Row {
+                        label: key.to_owned(),
+                        value: label.to_owned(),
+                        note: Some(group.to_owned()),
+                        warning: None,
+                    })
+                })
+                .collect(),
+            _ => Vec::new(),
+        }
+    }
+
+    fn rebuild_settings_rows(&mut self) {
+        self.settings_rows_cache = self.settings_rows();
+    }
+
+    fn settings_activate(&mut self, key: KeyCode) {
+        match (self.settings_section, self.settings_row) {
+            (0, 0) if key == KeyCode::Enter => self.apply_device_candidate(),
+            (0, 0) if key == KeyCode::Char('r') => self.reset_device(),
+            (0, 0) if matches!(key, KeyCode::Left | KeyCode::Right) => {
+                if self.device_candidates.is_empty() {
+                    self.refresh_devices();
+                }
+                let len = self.device_candidates.len();
+                if len > 0 {
+                    self.device_candidate_sel = if key == KeyCode::Left {
+                        (self.device_candidate_sel + len - 1) % len
+                    } else {
+                        (self.device_candidate_sel + 1) % len
+                    };
+                }
+                self.rebuild_settings_rows();
+            }
+            (0, 3 | 4) if key == KeyCode::Left || key == KeyCode::Char('r') => {
+                self.set_timing(None, None)
+            }
+            (0, 3 | 4) if key == KeyCode::Right || key == KeyCode::Enter => {
+                self.start_prompt("Period frames:", InputAction::TimingPeriod)
+            }
+            (0, 5)
+                if matches!(
+                    key,
+                    KeyCode::Enter | KeyCode::Char(' ') | KeyCode::Char('r')
+                ) =>
+            {
+                if key == KeyCode::Char('r') && !self.state.float_to_int {
+                    return;
+                }
+                self.toggle_float_to_int();
+            }
+            (0, 6)
+                if matches!(
+                    key,
+                    KeyCode::Enter | KeyCode::Char(' ') | KeyCode::Char('r')
+                ) =>
+            {
+                if key == KeyCode::Char('r') && !self.state.int_to_float {
+                    return;
+                }
+                self.toggle_int_to_float();
+            }
+            (1, 0)
+                if matches!(
+                    key,
+                    KeyCode::Enter | KeyCode::Char(' ') | KeyCode::Char('r')
+                ) =>
+            {
+                if key == KeyCode::Char('r') && !self.state.shuffle {
+                    return;
+                }
+                self.toggle_shuffle();
+            }
+            (2, 0) if key == KeyCode::Enter => self.open_locations(),
+            (3, 0) if key == KeyCode::Enter => {
+                self.start_prompt("Accent (#RRGGBB):", InputAction::Accent)
+            }
+            (3, 0) if key == KeyCode::Char('r') => self.set_accent(None),
+            _ => {}
+        }
+    }
+
+    fn playlist_entries_for_cursor(&self) -> Vec<QueueEntry> {
+        let Some(list) = self.state.catalog.playlists.get(self.playlist_name_sel) else {
+            return Vec::new();
+        };
+        let mut indices: Vec<usize> = if self.playlist_selected.is_empty() {
+            vec![self.playlist_track_sel]
+        } else {
+            self.playlist_selected.iter().copied().collect()
+        };
+        indices.sort_unstable();
+        indices
+            .into_iter()
+            .filter_map(|index| list.entries.get(index).cloned())
+            .collect()
+    }
+
+    fn playlist_move_start(&mut self) {
+        if !self.catalog_writable() {
+            return;
+        }
+        let count = self.state.catalog.playlists[self.playlist_name_sel]
+            .entries
+            .len();
+        if count == 0 {
+            self.state.status = "playlist is empty".to_owned();
+            return;
+        }
+        let mut indices: Vec<usize> = if self.playlist_selected.is_empty() {
+            vec![self.playlist_track_sel.min(count - 1)]
+        } else {
+            self.playlist_selected
+                .iter()
+                .copied()
+                .filter(|&index| index < count)
+                .collect()
+        };
+        indices.sort_unstable();
+        let remaining = count - indices.len();
+        let gap = indices[0].min(remaining);
+        self.mode = Mode::Move(MoveOverlay::Playlist { indices, gap });
+    }
 
     fn handle_key_event(&mut self, key: KeyEvent) -> bool {
         if key.modifiers.contains(KeyModifiers::CONTROL)
             && matches!(key.code, KeyCode::Char('q' | 'Q'))
         {
-            return true;
+            return self.request_quit();
         }
-        self.handle_key(key.code)
+        let mode = std::mem::replace(&mut self.mode, Mode::Normal);
+        match mode {
+            Mode::Normal => self.handle_normal_key(key),
+            Mode::Search(search) => self.handle_search_key(search, key),
+            Mode::Move(moving) => self.handle_move_key(moving, key),
+            Mode::Prompt(prompt) => self.handle_prompt_key(prompt, key),
+            Mode::Help => match keymap::lookup_mode(ModeKind::Help, key) {
+                Some(Action::CloseOverlay) => false,
+                Some(Action::Quit) => self.request_quit(),
+                Some(Action::CursorUp) => {
+                    let step = if key.code == KeyCode::PageUp { 10 } else { 1 };
+                    self.help_scroll = self.help_scroll.saturating_sub(step);
+                    self.mode = Mode::Help;
+                    false
+                }
+                Some(Action::CursorDown) => {
+                    let step = if key.code == KeyCode::PageDown { 10 } else { 1 };
+                    self.help_scroll = self.help_scroll.saturating_add(step);
+                    self.mode = Mode::Help;
+                    false
+                }
+                _ => {
+                    self.mode = Mode::Help;
+                    false
+                }
+            },
+            Mode::Locations(locations) => self.handle_locations_key(locations, key),
+            Mode::PlaylistPicker(picker) => self.handle_picker_key(picker, key),
+            Mode::Actions(actions) => self.handle_actions_key(actions, key),
+        }
     }
 
-    fn handle_key(&mut self, key: KeyCode) -> bool {
-        // Input owns the keyboard: letters like q/s/n/space are text there.
-        if matches!(self.pane, Some(Pane::Input(_))) {
-            self.handle_input_key(key);
-            return false;
-        }
-        if self.right_focused {
-            match key {
-                KeyCode::Esc | KeyCode::Char('f') => {
-                    self.right_focused = false;
-                    return false;
+    fn handle_normal_key(&mut self, key: KeyEvent) -> bool {
+        keymap::lookup(self.focus, key).is_some_and(|action| self.dispatch(action))
+    }
+
+    fn dispatch(&mut self, action: Action) -> bool {
+        match action {
+            Action::CursorUp => self.move_cursor(-1),
+            Action::CursorDown => self.move_cursor(1),
+            Action::Activate => self.activate(),
+            Action::BrowserUp => {
+                if self.screen == Screen::Library && self.focus == Focus::Library {
+                    self.browser_up();
                 }
-                KeyCode::Up | KeyCode::Char('k') => {
-                    self.playlist_entry_sel = self.playlist_entry_sel.saturating_sub(1);
-                    return false;
-                }
-                KeyCode::Down | KeyCode::Char('j') => {
-                    let count = self.state.catalog.selected_playlist().entries.len();
-                    if count > 0 {
-                        self.playlist_entry_sel = (self.playlist_entry_sel + 1).min(count - 1);
-                    }
-                    return false;
-                }
-                KeyCode::Enter => {
-                    let entries = &self.state.catalog.selected_playlist().entries;
-                    self.playlist_entry_sel = self.playlist_entry_sel.min(entries.len().saturating_sub(1));
-                    if let Some(entry) = entries.get(self.playlist_entry_sel).cloned() {
-                        self.enqueue_entry(entry, "track");
-                    }
-                    return false;
-                }
-                KeyCode::Char('a') => {
-                    let entry = self.state.catalog.selected_playlist().entries
-                        .get(self.playlist_entry_sel).cloned();
-                    if let Some(entry) = entry {
-                        self.enqueue_entry(entry, "track");
-                    } else {
-                        self.state.status = "select a playlist entry first".to_owned();
-                    }
-                    return false;
-                }
-                KeyCode::Char('A') => {
-                    self.enqueue_playlist(self.state.catalog.selected);
-                    return false;
-                }
-                _ => {}
             }
-        }
-        if matches!(key, KeyCode::Char('b' | 'd' | 'l' | 'm' | 'p')) {
-            self.right_focused = false;
-        }
-        match key {
-            KeyCode::Char('q') => return true,
-            KeyCode::Char('?') => {
-                self.show_help();
-                return false;
-            }
-            KeyCode::Esc => {
-                // Esc closes an open pane first; with no pane it quits.
-                if self.pane.is_none() {
-                    return true;
+            Action::FocusNext => self.cycle_focus(),
+            Action::ShowLibrary => {
+                self.screen = Screen::Library;
+                self.focus = Focus::Library;
+                if self.browser.is_none() {
+                    self.open_browser_startup();
                 }
-                if let Some(Pane::Menu(menu)) = &mut self.pane
-                    && menu.pop()
-                {
-                    return false;
-                }
-                self.close_pane();
-                return false;
             }
-            KeyCode::Char(' ') => {
-                let command = if self.state.paused {
-                    PlayerCommand::Play
-                } else {
-                    PlayerCommand::Pause
-                };
-                self.state.paused = !self.state.paused;
-                let _ = self.commands.send(command);
-                return false;
+            Action::ShowPlaylists => {
+                self.screen = Screen::Playlists;
+                self.focus = Focus::PlaylistNames;
+                self.playlist_anchor = self.playlist_track_sel;
             }
-            KeyCode::Char('s') => {
-                self.state.paused = true;
+            Action::ShowSettings => {
+                self.screen = Screen::Settings;
+                self.focus = Focus::SettingsSections;
+            }
+            Action::OpenSearch => self.open_search(),
+            Action::TogglePause => self.toggle_pause(),
+            Action::Stop => {
                 let _ = self.commands.send(PlayerCommand::Stop);
-                return false;
+                self.state.paused = true;
             }
-            KeyCode::Char('r') => {
-                self.toggle_shuffle();
-                return false;
-            }
-            KeyCode::Char('n') => {
+            Action::NextTrack => {
                 let _ = self.commands.send(PlayerCommand::Next);
-                return false;
             }
-            KeyCode::Left => {
-                self.seek_by(-(SEEK_SECONDS as i64));
-                return false;
-            }
-            KeyCode::Right => {
-                self.seek_by(SEEK_SECONDS as i64);
-                return false;
-            }
-            KeyCode::Char('b') => {
-                self.toggle_browser();
-                return false;
-            }
-            KeyCode::Char('d') => {
-                self.toggle_devices();
-                return false;
-            }
-            KeyCode::Char('l') => {
-                if matches!(self.pane, Some(Pane::Locations(_))) {
-                    self.close_pane();
+            Action::SeekBack => {
+                if self.screen == Screen::Settings && self.focus == Focus::SettingsRows {
+                    self.settings_activate(KeyCode::Left);
                 } else {
-                    self.open_locations();
+                    self.seek_by(-(SEEK_SECONDS as i64));
                 }
-                return false;
             }
-            KeyCode::Char('m') => {
-                self.toggle_menu();
-                return false;
-            }
-            KeyCode::Char('p') => {
-                if matches!(self.pane, Some(Pane::Playlists(_))) {
-                    self.close_pane();
+            Action::SeekForward => {
+                if self.screen == Screen::Settings && self.focus == Focus::SettingsRows {
+                    self.settings_activate(KeyCode::Right);
                 } else {
-                    self.open_playlists();
+                    self.seek_by(SEEK_SECONDS as i64);
                 }
-                return false;
             }
-            KeyCode::Char('f') => {
-                if let Some(Pane::Playlists(pane)) = &mut self.pane {
-                    pane.focus = PlaylistFocus::Entries;
-                    return false;
+            Action::ToggleShuffle => self.toggle_shuffle(),
+            Action::Quit => return self.request_quit(),
+            Action::BackOrQuit => {
+                if self.screen == Screen::Library {
+                    return self.request_quit();
                 }
-                self.right = RightView::SavedList;
-                self.right_focused = true;
-                let count = self.state.catalog.selected_playlist().entries.len();
-                self.playlist_entry_sel = self.playlist_entry_sel.min(count.saturating_sub(1));
-                return false;
+                self.screen = Screen::Library;
+                self.focus = Focus::Library;
             }
-            KeyCode::Tab => {
-                if let Some(Pane::Playlists(pane)) = &mut self.pane {
-                    pane.focus = match pane.focus {
-                        PlaylistFocus::Names => PlaylistFocus::Entries,
-                        PlaylistFocus::Entries => PlaylistFocus::Names,
-                    };
-                } else {
-                    self.right = match self.right {
-                        RightView::SavedList => RightView::Queue,
-                        RightView::Queue => RightView::SavedList,
-                    };
-                }
-                self.right_focused = false;
-                return false;
+            Action::ToggleHelp => {
+                self.help_scroll = 0;
+                self.mode = Mode::Help;
             }
-            KeyCode::Char('a' | 'A') if matches!(self.pane, Some(Pane::Playlists(_))) => {
-                let (name, entry, focus) = match &self.pane {
-                    Some(Pane::Playlists(pane)) => (pane.name_sel, pane.entry_sel, pane.focus),
-                    _ => unreachable!(),
-                };
-                if key == KeyCode::Char('A') || focus == PlaylistFocus::Names {
-                    self.enqueue_playlist(name);
-                } else if let Some(track) = self.state.catalog.playlists
-                    .get(name).and_then(|list| list.entries.get(entry)).cloned()
-                {
-                    self.enqueue_entry(track, "track");
-                } else {
-                    self.state.status = "select a playlist entry first".to_owned();
-                }
-                return false;
+            Action::OpenLocations => self.open_locations(),
+            Action::OpenActions => self.open_actions(),
+            Action::OpenOutputSettings => self.open_output_settings(),
+            Action::FocusPlaylist => {
+                self.screen = Screen::Playlists;
+                self.focus = Focus::PlaylistTracks;
+                self.playlist_anchor = self.playlist_track_sel;
             }
-            KeyCode::Char('a') if matches!(self.pane, Some(Pane::Browser(_))) => {
-                self.browser_add_selected();
-                return false;
-            }
-            KeyCode::Char('A') if matches!(self.pane, Some(Pane::Browser(_))) => {
-                self.browser_add_current_folder();
-                return false;
-            }
-            KeyCode::Char('c') => {
-                self.toggle_float_to_int();
-                return false;
-            }
-            KeyCode::Char('i') => {
-                self.toggle_int_to_float();
-                return false;
-            }
-            _ => {}
-        }
-        // Selecting a saved list is persisted before committing, and never
-        // changes the independent live queue.
-        if key == KeyCode::Enter {
-            let selection = match &self.pane {
-                Some(Pane::Playlists(pane)) => Some((pane.name_sel, pane.entry_sel, pane.focus)),
-                _ => None,
-            };
-            if let Some((name, entry, focus)) = selection {
-                match focus {
-                    PlaylistFocus::Names => {
-                        self.catalog_select(name);
-                        if let Some(Pane::Playlists(pane)) = &mut self.pane {
-                            pane.entry_sel = 0;
-                        }
-                        self.playlist_entry_sel = 0;
-                    }
-                    PlaylistFocus::Entries => {
-                        if let Some(track) = self.state.catalog.playlists
-                            .get(name).and_then(|list| list.entries.get(entry)).cloned()
-                        {
-                            self.enqueue_entry(track, "track");
-                        }
+            Action::EnqueueSelected => match self.focus {
+                Focus::Library => self.browser_enqueue(false),
+                Focus::PlaylistNames => {
+                    if let Some(list) = self.state.catalog.playlists.get(self.playlist_name_sel) {
+                        self.enqueue_entries(list.entries.clone());
                     }
                 }
-                return false;
+                Focus::PlaylistTracks => self.enqueue_entries(self.playlist_entries_for_cursor()),
+                _ => {}
+            },
+            Action::EnqueueAlbum => match self.focus {
+                Focus::Library => self.browser_enqueue(true),
+                Focus::PlaylistNames | Focus::PlaylistTracks => {
+                    if let Some(list) = self.state.catalog.playlists.get(self.playlist_name_sel) {
+                        self.enqueue_entries(list.entries.clone());
+                    }
+                }
+                _ => {}
+            },
+            Action::AddToPlaylist => {
+                if self.screen == Screen::Library && self.focus == Focus::Library {
+                    self.start_picker_for_browser();
+                } else {
+                    self.screen = Screen::Playlists;
+                    self.focus = Focus::PlaylistNames;
+                }
             }
-        }
-        let Some(pane) = &mut self.pane else {
-            return false;
-        };
-        match pane {
-            Pane::Browser(browser) => match key {
-                KeyCode::Up | KeyCode::Char('k') => browser.move_selection(-1),
-                KeyCode::Down | KeyCode::Char('j') => browser.move_selection(1),
-                KeyCode::Backspace => {
-                    let at_root = browser.current_dir.parent()
-                        .is_none_or(|parent| parent == browser.current_dir);
-                    if at_root {
-                        self.open_locations();
-                    } else if browser.ascend().is_ok() {
-                        let dir = browser.current_dir.clone();
-                        self.remember_browser_dir(&dir);
+            Action::NewPlaylist => {
+                self.start_prompt("New playlist name:", InputAction::PlaylistCreate)
+            }
+            Action::RenamePlaylist => {
+                self.start_prompt("Rename playlist to:", InputAction::PlaylistRename)
+            }
+            Action::ToggleSelect => {
+                let cursor = self.playlist_track_sel;
+                if !self.playlist_selected.insert(cursor) {
+                    self.playlist_selected.remove(&cursor);
+                }
+            }
+            Action::RangeSelect => {
+                let lo = self.playlist_anchor.min(self.playlist_track_sel);
+                let hi = self.playlist_anchor.max(self.playlist_track_sel);
+                self.playlist_selected = (lo..=hi).collect();
+            }
+            Action::RemoveRows => self.catalog_remove_rows(),
+            Action::EnqueueSelection => self.enqueue_entries(self.playlist_entries_for_cursor()),
+            Action::MoveStart => match self.focus {
+                Focus::PlaylistTracks => self.playlist_move_start(),
+                Focus::Queue => {
+                    if let Some(id) = self.queue_selected_pending() {
+                        self.mode = Mode::Move(MoveOverlay::Queue {
+                            id,
+                            target: Some(id),
+                        });
                     } else {
-                        self.state.status = "cannot go up".to_owned();
-                    }
-                }
-                KeyCode::Enter => {
-                    if let Some(item) = browser.selected_item() {
-                        let item = item.clone();
-                        match item.kind {
-                            BrowserItemKind::Dir => {
-                                if browser.descend(item.path.clone()).is_ok() {
-                                    let dir = browser.current_dir.clone();
-                                    self.remember_browser_dir(&dir);
-                                } else {
-                                    self.state.status =
-                                        format!("cannot open {}", item.name);
-                                }
-                            }
-                            BrowserItemKind::Audio => {
-                                self.enqueue_entry(QueueEntry::from(item.path), &item.name);
-                            }
-                            BrowserItemKind::Playlist => {
-                                match sointty_playlist::read(&item.path) {
-                                    Ok(entries) => {
-                                        let count = entries.len();
-                                        for entry in entries {
-                                            let _ = self.commands.send(PlayerCommand::Enqueue(
-                                                QueueEntry {
-                                                    path: entry.path,
-                                                    cue_range: entry.cue_range,
-                                                },
-                                            ));
-                                        }
-                                        let _ = self.commands.send(PlayerCommand::Play);
-                                        self.state.paused = false;
-                                        self.state.status = format!("queued {count} track(s)");
-                                    }
-                                    Err(error) => {
-                                        self.state.status = format!("sointty: {error}");
-                                    }
-                                }
-                            }
-                        }
+                        self.state.status = "only upcoming queue rows can move".to_owned();
                     }
                 }
                 _ => {}
             },
-            Pane::Devices(devices) => match key {
-                KeyCode::Up | KeyCode::Char('k') => devices.move_selection(-1),
-                KeyCode::Down | KeyCode::Char('j') => devices.move_selection(1),
-                KeyCode::Enter => {
-                    if let Some((id, name)) = devices.devices.get(devices.selected).cloned() {
-                        let _ = self.commands.send(PlayerCommand::SelectDevice(id.clone()));
-                        match (self.hooks.on_device_selected)(&id) {
-                            Ok(()) => self.state.status = format!("output device: {name}"),
-                            Err(error) => {
-                                self.state.status =
-                                    format!("device selected but not saved: {error}");
-                            }
-                        }
-                        self.state.device = id;
-                        self.pane = None;
-                    }
+            Action::ResetRow => self.settings_activate(KeyCode::Char('r')),
+            Action::ToggleSetting => self.settings_activate(KeyCode::Char(' ')),
+            Action::QueueRemove => {
+                if let Some(id) = self.queue_selected_pending() {
+                    let _ = self.commands.send(PlayerCommand::RemoveQueueEntry(id));
+                } else {
+                    self.state.status = "audible and past rows are read-only".to_owned();
                 }
-                _ => {}
-            },
-            Pane::Locations(locations) => match key {
-                KeyCode::Up | KeyCode::Char('k') => {
-                    locations.selected = locations.selected.saturating_sub(1)
-                }
-                KeyCode::Down | KeyCode::Char('j') => {
-                    if !locations.locations.is_empty() {
-                        locations.selected =
-                            (locations.selected + 1).min(locations.locations.len() - 1);
-                    }
-                }
-                KeyCode::Enter => {
-                    if let Some(location) = locations.locations.get(locations.selected) {
-                        let path = location.path.clone();
-                        match Browser::open(path) {
-                            Ok(browser) => {
-                                let dir = browser.current_dir.clone();
-                                self.pane = Some(Pane::Browser(browser));
-                                self.remember_browser_dir(&dir);
-                            }
-                            Err(error) => {
-                                self.state.status = format!("cannot open: {error}");
-                            }
-                        }
-                    }
-                }
-                _ => {}
-            },
-            Pane::Menu(menu) => match key {
-                KeyCode::Up | KeyCode::Char('k') => menu.move_selection(-1),
-                KeyCode::Down | KeyCode::Char('j') => menu.move_selection(1),
-                KeyCode::Enter => {
-                    if let Some(action) = menu.selected_action().cloned() {
-                        return self.dispatch(action);
-                    }
-                }
-                _ => {}
-            },
-            Pane::Playlists(pane) => {
-                let name_count = self.state.catalog.playlists.len();
-                let entry_count = self
-                    .state
-                    .catalog
-                    .playlists
-                    .get(pane.name_sel)
-                    .map(|playlist| playlist.entries.len())
-                    .unwrap_or(0);
-                match key {
-                    KeyCode::Up | KeyCode::Char('k') => match pane.focus {
-                        PlaylistFocus::Names => pane.name_sel = pane.name_sel.saturating_sub(1),
-                        PlaylistFocus::Entries => {
-                            pane.entry_sel = pane.entry_sel.saturating_sub(1)
-                        }
-                    },
-                    KeyCode::Down | KeyCode::Char('j') => match pane.focus {
-                        PlaylistFocus::Names => {
-                            if name_count > 0 {
-                                pane.name_sel = (pane.name_sel + 1).min(name_count - 1);
-                            }
-                        }
-                        PlaylistFocus::Entries => {
-                            if entry_count > 0 {
-                                pane.entry_sel = (pane.entry_sel + 1).min(entry_count - 1);
-                            }
-                        }
-                    },
-                    KeyCode::Enter => {}
-                    _ => {}
-                }
-                self.playlist_entry_sel = pane.entry_sel;
             }
-            Pane::Settings(settings) => match key {
-                KeyCode::Up | KeyCode::Char('k') => {
-                    settings.selected = settings.selected.saturating_sub(1)
-                }
-                KeyCode::Down | KeyCode::Char('j') => {
-                    settings.selected = (settings.selected + 1).min(4);
-                }
-                KeyCode::Enter => match settings.selected {
-                    0 => self.toggle_devices(),
-                    1 => self.set_timing(None, None),
-                    2 => self.start_input("Period frames:", InputAction::TimingPeriod),
-                    3 => self.toggle_float_to_int(),
-                    4 => self.toggle_int_to_float(),
-                    _ => {}
-                },
-                _ => {}
-            },
-            Pane::Input(_) => {}
+            Action::QueueClearHistory => {
+                self.past.clear();
+                self.rebuild_queue_rows();
+            }
+            Action::SaveCatalog => {
+                self.save_catalog();
+            }
+            Action::ToggleFloatToInt => self.toggle_float_to_int(),
+            Action::ToggleIntToFloat => self.toggle_int_to_float(),
+            Action::CloseOverlay
+            | Action::DeleteChar
+            | Action::OpenFolder
+            | Action::ConfirmYes
+            | Action::ConfirmNo => {
+                // Modal-only actions are consumed by the overlay handlers.
+            }
         }
         false
     }
 
-    fn handle_input_key(&mut self, key: KeyCode) {
-        let Some(Pane::Input(input)) = &mut self.pane else {
-            return;
-        };
-        match key {
-            KeyCode::Esc => {
-                self.pane = self.input_origin.take();
-            }
-            KeyCode::Enter => {
-                let Some(Pane::Input(input)) = self.pane.take() else {
-                    return;
-                };
-                self.submit_input(input);
-                if self.pending_os.is_none() {
-                    if self.pane.is_none() {
-                        self.pane = self.input_origin.take();
-                    } else if !matches!(self.pane, Some(Pane::Input(_))) {
-                        self.input_origin = None;
-                    }
+    fn move_cursor(&mut self, delta: isize) {
+        match self.focus {
+            Focus::Library => {
+                if let Some(browser) = &mut self.browser {
+                    browser.move_selection(delta);
                 }
             }
-            KeyCode::Backspace => {
-                input.buffer.pop();
+            Focus::Queue => {
+                let selected_row = self
+                    .queue_selected
+                    .and_then(|id| screens::queue::row_of(&self.queue_rows, id))
+                    .unwrap_or(0);
+                let mut next = selected_row.saturating_add_signed(delta);
+                loop {
+                    if next >= self.queue_rows.len() {
+                        break;
+                    }
+                    if let screens::queue::QueueRow::Track { id, .. } = self.queue_rows[next] {
+                        self.queue_selected = Some(id);
+                        break;
+                    }
+                    let candidate = next.saturating_add_signed(delta);
+                    if candidate == next || candidate >= self.queue_rows.len() {
+                        break;
+                    }
+                    next = candidate;
+                }
             }
-            KeyCode::Char(ch) => input.buffer.push(ch),
-            _ => {}
+            Focus::PlaylistNames => {
+                let len = self.state.catalog.playlists.len();
+                if len > 0 {
+                    self.playlist_name_sel = self
+                        .playlist_name_sel
+                        .saturating_add_signed(delta)
+                        .min(len - 1);
+                }
+                self.rebuild_playlist_rows();
+            }
+            Focus::PlaylistTracks => {
+                let len = self
+                    .state
+                    .catalog
+                    .playlists
+                    .get(self.playlist_name_sel)
+                    .map(|list| list.entries.len())
+                    .unwrap_or(0);
+                if len > 0 {
+                    self.playlist_track_sel = self
+                        .playlist_track_sel
+                        .saturating_add_signed(delta)
+                        .min(len - 1);
+                }
+            }
+            Focus::SettingsSections => {
+                self.settings_section = self.settings_section.saturating_add_signed(delta).min(4);
+                self.settings_row = 0;
+                if self.settings_section == 0 {
+                    self.refresh_devices();
+                }
+                self.rebuild_settings_rows();
+            }
+            Focus::SettingsRows => {
+                let len = self.settings_row_count();
+                if len > 0 {
+                    self.settings_row = self.settings_row.saturating_add_signed(delta).min(len - 1);
+                }
+            }
         }
     }
 
-    fn seek_by(&self, seconds: i64) {
-        let target = self.state.frame as i64 + seconds * i64::from(self.state.rate_hz);
-        let _ = self.commands.send(PlayerCommand::SeekFrame(target.max(0) as u64));
+    fn cycle_focus(&mut self) {
+        self.focus = match self.screen {
+            Screen::Library => {
+                if self.focus == Focus::Queue {
+                    Focus::Library
+                } else {
+                    Focus::Queue
+                }
+            }
+            Screen::Playlists => {
+                if self.focus == Focus::PlaylistNames {
+                    Focus::PlaylistTracks
+                } else {
+                    Focus::PlaylistNames
+                }
+            }
+            Screen::Settings => {
+                if self.focus == Focus::SettingsSections {
+                    Focus::SettingsRows
+                } else {
+                    Focus::SettingsSections
+                }
+            }
+        };
+        if self.focus == Focus::PlaylistTracks {
+            self.playlist_anchor = self.playlist_track_sel;
+        }
     }
 
-    fn apply_event(&mut self, event: PlayerEvent) {
-        let state = &mut self.state;
-        match event {
-            PlayerEvent::QueueChanged { audible, pending } => {
-                state.audible = audible;
-                state.pending = pending;
-            }
-            PlayerEvent::Playing { track, output, converted } => {
-                state.status = if converted {
-                    let direction = if output.format == DeviceFormat::F32Le {
-                        "integer->F32 converted"
-                    } else {
-                        "F32->integer converted"
-                    };
-                    format!("playing ({direction}; not bit-perfect)")
+    fn activate(&mut self) {
+        match self.focus {
+            Focus::Library => self.browser_activate(),
+            Focus::Queue => {
+                if let Some(id) = self.queue_selected_pending() {
+                    let _ = self.commands.send(PlayerCommand::JumpToQueueEntry(id));
                 } else {
-                    "playing (bit-perfect)".to_owned()
+                    self.state.status = "only upcoming queue rows can jump".to_owned();
+                }
+            }
+            Focus::PlaylistNames => self.catalog_select(self.playlist_name_sel),
+            Focus::PlaylistTracks => {
+                let index = self.playlist_name_sel;
+                let cursor = self.playlist_track_sel;
+                if let Some(list) = self.state.catalog.playlists.get(index) {
+                    if cursor < list.entries.len() {
+                        self.play_entries(list.entries[cursor..].to_vec());
+                    } else {
+                        self.state.status = "select a playlist track first".to_owned();
+                    }
+                }
+            }
+            Focus::SettingsSections => {
+                self.focus = Focus::SettingsRows;
+                self.settings_row = 0;
+                if self.settings_section == 0 {
+                    self.refresh_devices();
+                }
+            }
+            Focus::SettingsRows => self.settings_activate(KeyCode::Enter),
+        }
+    }
+
+    fn handle_search_key(&mut self, mut search: SearchOverlay, key: KeyEvent) -> bool {
+        match keymap::lookup_mode(ModeKind::Search, key) {
+            Some(Action::CloseOverlay) => {
+                self.worker.send(WorkerMsg::Cancel);
+                false
+            }
+            Some(Action::FocusNext) => {
+                search.scope = search.scope.next();
+                search.refresh_visible();
+                self.mode = Mode::Search(search);
+                false
+            }
+            Some(Action::CursorUp) => {
+                search.selected = search.selected.saturating_sub(1);
+                self.mode = Mode::Search(search);
+                false
+            }
+            Some(Action::CursorDown) => {
+                search.selected = (search.selected + 1).min(search.visible.len().saturating_sub(1));
+                self.mode = Mode::Search(search);
+                false
+            }
+            Some(Action::DeleteChar) => {
+                search.query.pop();
+                self.update_search_query(&mut search);
+                self.mode = Mode::Search(search);
+                false
+            }
+            Some(
+                action @ (Action::Activate
+                | Action::EnqueueSelected
+                | Action::AddToPlaylist
+                | Action::OpenFolder),
+            ) => {
+                let item = search.selected_item().cloned();
+                self.mode = Mode::Search(search);
+                if let Some(item) = item {
+                    self.search_selected_action(item, action);
+                }
+                false
+            }
+            _ => {
+                if let KeyCode::Char(ch) = key.code
+                    && !key.modifiers.contains(KeyModifiers::CONTROL)
+                {
+                    search.query.push(ch);
+                    self.update_search_query(&mut search);
+                }
+                self.mode = Mode::Search(search);
+                false
+            }
+        }
+    }
+
+    fn handle_move_key(&mut self, mut moving: MoveOverlay, key: KeyEvent) -> bool {
+        let action = keymap::lookup_mode(ModeKind::Move, key);
+        match (&mut moving, action) {
+            (_, Some(Action::CloseOverlay)) => false,
+            (MoveOverlay::Playlist { gap, .. }, Some(Action::CursorUp)) => {
+                *gap = gap.saturating_sub(1);
+                self.mode = Mode::Move(moving);
+                false
+            }
+            (MoveOverlay::Playlist { indices, gap }, Some(Action::CursorDown)) => {
+                let count = self.state.catalog.playlists[self.playlist_name_sel]
+                    .entries
+                    .len();
+                *gap = (*gap + 1).min(count.saturating_sub(indices.len()));
+                self.mode = Mode::Move(moving);
+                false
+            }
+            (MoveOverlay::Playlist { indices, gap }, Some(Action::Activate)) => {
+                let indices = indices.clone();
+                let gap = *gap;
+                self.catalog_move_rows(indices, gap);
+                false
+            }
+            (MoveOverlay::Queue { target, .. }, Some(Action::CursorUp | Action::CursorDown)) => {
+                let direction = if action == Some(Action::CursorUp) {
+                    -1
+                } else {
+                    1
                 };
-                state.paused = false;
-                state.tags = TrackTags::default();
-                state.current_track = track;
-                state.frame = 0;
-                state.total_frames = None;
-                // Elapsed time counts source frames; DSD wire frames pack
-                // several source frames, so scale the rate accordingly.
-                state.rate_hz =
-                    output.rate_hz * output.format.source_frames_per_wire_frame() as u32;
-                state.converted = converted;
-                state.device = output.device.clone();
-                state.output_spec = Some(output);
+                let pending = &self.state.pending;
+                let position = target
+                    .and_then(|id| pending.iter().position(|item| item.id == id))
+                    .unwrap_or(pending.len());
+                let next = position.saturating_add_signed(direction).min(pending.len());
+                *target = pending.get(next).map(|item| item.id); // None is the end gap
+                self.queue_selected = *target;
+                self.mode = Mode::Move(moving);
+                false
             }
-            PlayerEvent::Tags { track, tags } => {
-                if track == state.current_track {
-                    state.tags = tags;
+            (MoveOverlay::Queue { id, target }, Some(Action::Activate)) => {
+                self.queue_selected = Some(*id);
+                // Some(id) is an engine no-op; None means append.
+                let _ = self.commands.send(PlayerCommand::MoveQueueEntry {
+                    id: *id,
+                    before: *target,
+                });
+                false
+            }
+            (_, Some(Action::Quit)) => {
+                self.mode = Mode::Move(moving);
+                self.request_quit()
+            }
+            _ => {
+                self.mode = Mode::Move(moving);
+                false
+            }
+        }
+    }
+
+    fn handle_prompt_key(&mut self, mut prompt: Prompt, key: KeyEvent) -> bool {
+        let mode = if matches!(prompt.kind, PromptKind::QuitConfirm) {
+            ModeKind::QuitConfirm
+        } else {
+            ModeKind::Prompt
+        };
+        let action = keymap::lookup_mode(mode, key);
+        match prompt.kind {
+            PromptKind::QuitConfirm => match action {
+                Some(Action::ConfirmYes) => {
+                    if self.save_catalog() {
+                        true
+                    } else {
+                        self.mode = Mode::Prompt(prompt);
+                        false
+                    }
                 }
-            }
-            PlayerEvent::Duration { track, total_frames } => {
-                if track == state.current_track {
-                    state.total_frames = total_frames;
+                Some(Action::ConfirmNo) => true,
+                Some(Action::CloseOverlay) => {
+                    self.mode = *prompt.origin;
+                    false
                 }
-            }
-            PlayerEvent::Position { track, frame } => {
-                if track == state.current_track {
-                    state.frame = frame;
+                _ => {
+                    self.mode = Mode::Prompt(prompt);
+                    false
                 }
+            },
+            PromptKind::Text(_) => match action {
+                Some(Action::CloseOverlay) => {
+                    self.mode = *prompt.origin;
+                    false
+                }
+                Some(Action::Activate) => {
+                    let origin = *prompt.origin;
+                    let kind = prompt.kind;
+                    self.mode = origin;
+                    if let PromptKind::Text(action) = kind {
+                        self.submit_input(action, prompt.buffer);
+                    }
+                    false
+                }
+                Some(Action::DeleteChar) => {
+                    prompt.buffer.pop();
+                    self.mode = Mode::Prompt(prompt);
+                    false
+                }
+                _ => {
+                    if let KeyCode::Char(ch) = key.code
+                        && !key.modifiers.contains(KeyModifiers::CONTROL)
+                    {
+                        prompt.buffer.push(ch);
+                    }
+                    self.mode = Mode::Prompt(prompt);
+                    false
+                }
+            },
+        }
+    }
+
+    fn handle_locations_key(&mut self, mut locations: LocationsOverlay, key: KeyEvent) -> bool {
+        match keymap::lookup_mode(ModeKind::Locations, key) {
+            Some(Action::CloseOverlay) => false,
+            Some(Action::CursorUp) => {
+                locations.selected = locations.selected.saturating_sub(1);
+                self.mode = Mode::Locations(locations);
+                false
             }
-            PlayerEvent::Paused => {
-                state.status = "paused".to_owned();
-                state.paused = true;
+            Some(Action::CursorDown) => {
+                locations.selected =
+                    (locations.selected + 1).min(locations.locations.len().saturating_sub(1));
+                self.mode = Mode::Locations(locations);
+                false
             }
-            PlayerEvent::Reconfiguring => {
-                state.status = "reconfiguring device".to_owned();
-                state.tags = TrackTags::default();
-                state.output_spec = None;
-                state.converted = false;
+            Some(Action::Activate) => {
+                let path = locations
+                    .locations
+                    .get(locations.selected)
+                    .map(|location| location.path.clone());
+                self.mode = Mode::Locations(locations);
+                if let Some(path) = path {
+                    self.open_browser(path);
+                }
+                false
             }
-            PlayerEvent::Underrun { .. } => state.status = "underrun".to_owned(),
-            PlayerEvent::Stalled { .. } => state.status = "stalled".to_owned(),
-            PlayerEvent::Error { kind, .. } => {
-                state.status = format!("error: {kind}");
-                // No stream is playing after a command-path failure. Space
-                // must start the next queued track, not send another Pause.
-                state.total_frames = None;
-                state.paused = true;
+            Some(Action::OpenActions) => {
+                self.mode = Mode::Locations(locations);
+                self.open_actions();
+                false
             }
-            PlayerEvent::EndOfQueue => {
-                state.status = "end of queue".to_owned();
-                state.paused = false;
-                state.total_frames = None;
-                state.frame = 0;
+            Some(Action::Quit) => {
+                self.mode = Mode::Locations(locations);
+                self.request_quit()
             }
-            PlayerEvent::QueueEditRejected { reason, .. } => {
-                state.status = format!("queue edit rejected: {reason}");
+            _ => {
+                self.mode = Mode::Locations(locations);
+                false
+            }
+        }
+    }
+
+    fn handle_picker_key(&mut self, mut picker: PlaylistPicker, key: KeyEvent) -> bool {
+        match keymap::lookup_mode(ModeKind::PlaylistPicker, key) {
+            Some(Action::CloseOverlay) => false,
+            Some(Action::CursorUp) => {
+                picker.selected = picker.selected.saturating_sub(1);
+                self.mode = Mode::PlaylistPicker(picker);
+                false
+            }
+            Some(Action::CursorDown) => {
+                picker.selected = (picker.selected + 1).min(self.state.catalog.playlists.len());
+                self.mode = Mode::PlaylistPicker(picker);
+                false
+            }
+            Some(Action::NewPlaylist) => {
+                self.mode = Mode::PlaylistPicker(picker);
+                self.start_prompt("New playlist name:", InputAction::PlaylistCreate);
+                false
+            }
+            Some(Action::Activate) => {
+                let index = picker.selected;
+                let entries = picker.entries;
+                if index == self.state.catalog.playlists.len() {
+                    self.mode = Mode::PlaylistPicker(PlaylistPicker {
+                        entries,
+                        selected: index,
+                    });
+                    self.start_prompt("New playlist name:", InputAction::PlaylistCreate);
+                } else {
+                    self.catalog_add_to(index, entries);
+                }
+                false
+            }
+            Some(Action::Quit) => {
+                self.mode = Mode::PlaylistPicker(picker);
+                self.request_quit()
+            }
+            _ => {
+                self.mode = Mode::PlaylistPicker(picker);
+                false
+            }
+        }
+    }
+
+    fn handle_actions_key(&mut self, mut actions: ActionsOverlay, key: KeyEvent) -> bool {
+        match keymap::lookup_mode(ModeKind::Actions, key) {
+            Some(Action::CloseOverlay) => {
+                self.mode = *actions.origin;
+                false
+            }
+            Some(Action::CursorUp) => {
+                actions.selected = actions.selected.saturating_sub(1);
+                self.mode = Mode::Actions(actions);
+                false
+            }
+            Some(Action::CursorDown) => {
+                actions.selected =
+                    (actions.selected + 1).min(actions.items.len().saturating_sub(1));
+                self.mode = Mode::Actions(actions);
+                false
+            }
+            Some(Action::Activate) => {
+                let action = actions
+                    .items
+                    .get(actions.selected)
+                    .map(|(_, action)| action.clone());
+                self.mode = *actions.origin;
+                if let Some(action) = action {
+                    return self.run_action(action);
+                }
+                false
+            }
+            Some(Action::Quit) => {
+                self.mode = Mode::Actions(actions);
+                self.request_quit()
+            }
+            _ => {
+                self.mode = Mode::Actions(actions);
+                false
             }
         }
     }
 }
 
+/// Start the TUI in raw/alternate-screen mode and always restore the
+/// terminal on return.
 pub fn run(
     commands: Sender<PlayerCommand>,
     events: Receiver<PlayerEvent>,
@@ -1901,8 +2962,6 @@ pub fn run(
     result
 }
 
-/// Suspend the alternate screen and raw mode for an interactive OS prompt;
-/// `resume_terminal` must run afterwards even on error.
 fn suspend_terminal(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::Result<()> {
     disable_raw_mode()?;
     execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
@@ -1925,34 +2984,42 @@ fn event_loop(
 ) -> io::Result<()> {
     let mut app = App::new(options, hooks, commands);
     let mut dirty = true;
+    let mut progress_dirty = false;
+    let mut last_draw = Instant::now() - Duration::from_secs(1);
     loop {
         while let Ok(event) = events.try_recv() {
-            app.apply_event(event);
+            if app.apply_event(event) {
+                dirty = true;
+            } else {
+                progress_dirty = true;
+            }
+        }
+        if app.poll_worker() || app.poll_collect() {
             dirty = true;
         }
-        if dirty {
+        if dirty || (progress_dirty && last_draw.elapsed() >= Duration::from_millis(250)) {
+            let size = terminal.size()?;
+            let main_height = layout::home(Rect::new(0, 0, size.width, size.height))
+                .library.height.saturating_sub(5) as usize;
+            app.prime_metadata(main_height);
             terminal.draw(|frame| draw(frame, &app))?;
+            last_draw = Instant::now();
             dirty = false;
+            progress_dirty = false;
         }
         if event::poll(Duration::from_millis(100))? {
             match event::read()? {
-                Event::Key(key) => {
-                    if key.kind != KeyEventKind::Press {
-                        continue;
-                    }
+                Event::Key(key) if key.kind == KeyEventKind::Press => {
                     if app.handle_key_event(key) {
                         return Ok(());
                     }
                     if let Some(action) = app.pending_os.take() {
-                        // The OS credential/mount prompt needs a normal terminal.
-                        // Always restore, even when the action fails.
                         suspend_terminal(terminal)?;
                         app.run_os_action(action);
                         resume_terminal(terminal)?;
                     }
                     dirty = true;
                 }
-                // Ratatui resizes the viewport during the next draw.
                 Event::Resize(_, _) => dirty = true,
                 _ => {}
             }
@@ -1960,473 +3027,691 @@ fn event_loop(
     }
 }
 
-fn metadata_line(tags: &TrackTags) -> String {
-    let mut line = match (&tags.artist, &tags.title) {
-        (Some(artist), Some(title)) => format!("{artist} - {title}"),
-        (None, Some(title)) => title.clone(),
-        (Some(artist), None) => artist.clone(),
-        (None, None) => String::new(),
-    };
-    if let Some(album) = &tags.album {
-        if !line.is_empty() {
-            line.push(' ');
-        }
-        line.push_str(&format!("({album})"));
-    }
-    line
-}
-
-fn queue_entry_name(entry: &QueueEntry) -> String {
-    let mut name = entry
-        .path
-        .file_name()
-        .map(|name| name.to_string_lossy().into_owned())
-        .unwrap_or_else(|| entry.path.display().to_string());
-    if let Some(range) = entry.cue_range {
-        name.push_str(&match range.end_cd {
-            Some(end) => format!(" [cue {}:{}]", range.start_cd, end),
-            None => format!(" [cue {}:end]", range.start_cd),
-        });
-    }
-    name
-}
-
-fn clock(seconds: u64) -> String {
-    if seconds >= 3_600 {
-        format!("{}:{:02}:{:02}", seconds / 3_600, (seconds / 60) % 60, seconds % 60)
-    } else {
-        format!("{:02}:{:02}", seconds / 60, seconds % 60)
-    }
-}
-
-fn progress_bar(frame: u64, total: Option<u64>, width: usize) -> String {
-    let filled = total.filter(|&length| length > 0)
-        .map(|length| (u128::from(frame.min(length)) * width as u128 / u128::from(length)) as usize)
-        .unwrap_or(0);
-    format!("progress: [{}{}]", "#".repeat(filled), "-".repeat(width - filled))
-}
-
-/// Keep the available keys on screen for the active pane. Input is modal:
-/// printable shortcuts are text, and Ctrl+Q is its explicit exit chord.
-fn key_hints(app: &App) -> [&'static str; 3] {
-    if matches!(app.pane, Some(Pane::Input(_))) {
-        return [
-            "Input: type text (q, s, n, space and ? are characters here)",
-            "Enter Submit | Backspace Delete | Esc Cancel",
-            "Ctrl+Q Quit immediately from input",
-        ];
-    }
-    let context = if app.right_focused {
-        "Playlist: Up/Down Select | Enter/a Queue song | A Queue all | f/Esc Back"
-    } else {
-        match &app.pane {
-            Some(Pane::Browser(_)) =>
-                "Files: ↑/↓ Select | Enter Open/Play | Bksp Up | a Add | A Add folder | f Focus",
-            Some(Pane::Devices(_)) =>
-                "Output: Up/Down Select | Enter Choose | d/Esc Close",
-            Some(Pane::Locations(_)) =>
-                "Locations: Up/Down Select | Enter Browse | m Map/Mount | l/Esc Close",
-            Some(Pane::Menu(_)) =>
-                "Menu: Up/Down Select | Enter Open | Esc Back",
-            Some(Pane::Playlists(pane)) if pane.focus == PlaylistFocus::Names =>
-                "Lists: Up/Down Select | Enter Choose | a/A Queue list | Tab Songs | m Edit",
-            Some(Pane::Playlists(_)) =>
-                "Songs: Up/Down Select | Enter/a Queue song | A Queue list | Tab Lists | m Edit",
-            Some(Pane::Settings(_)) =>
-                "DAC: Up/Down Select | Enter Change | Esc Close",
-            Some(Pane::Input(_)) => unreachable!(),
-            None if app.right == RightView::Queue =>
-                "Queue: r Random play | Tab Saved list | p Manage playlists",
-            None =>
-                "Saved list: f Focus songs | Tab Queue | p Manage playlists",
-        }
-    };
-    [
-        "q Quit | ? Help | Space Play/Pause | s Stop | n Next | ←/→ Seek | r Random",
-        "b Browse | p Lists | l Locations | d DAC | m Menu | c F32->int | i int->F32",
-        context,
-    ]
-}
-
-fn draw_key_hints(frame: &mut ratatui::Frame<'_>, app: &App, area: Rect) {
-    let block = widgets::panel("Keys", None, &app.theme, false);
-    let inside = block.inner(area);
-    frame.render_widget(block, area);
-    for (row, hint) in key_hints(app).into_iter().enumerate() {
-        if row as u16 >= inside.height {
-            break;
-        }
-        frame.render_widget(
-            Paragraph::new(hint),
-            Rect::new(inside.x, inside.y + row as u16, inside.width, 1),
-        );
-    }
-}
-
 fn draw(frame: &mut ratatui::Frame<'_>, app: &App) {
-    let state = &app.state;
-    let track = metadata_line(&state.tags);
-    let bottom = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Length(3),
-            Constraint::Length(if track.is_empty() { 12 } else { 13 }),
-            Constraint::Min(3),
-            Constraint::Length(5),
-        ])
-        .split(frame.area());
-    let title = Paragraph::new("sointty — direct/exclusive music player")
-        .style(app.theme.strong().add_modifier(Modifier::BOLD))
-        .block(widgets::panel("", None, &app.theme, false));
-    frame.render_widget(title, bottom[0]);
-    draw_key_hints(frame, app, bottom[3]);
-
-    let (output_line, fidelity) = match &state.output_spec {
-        None => ("not configured".to_owned(), "not configured".to_owned()),
-        Some(output) => (
-            format!(
-                "{} Hz / {} ch / {:?} ({} valid bits)",
-                output.rate_hz, output.layout.channels, output.format, output.valid_bits
-            ),
-            if state.converted {
-                if output.format == DeviceFormat::F32Le {
-                    "converted integer→F32 (NOT bit-perfect)".to_owned()
+    let area = frame.area();
+    if area.width == 0 || area.height == 0 {
+        return;
+    }
+    let regions = layout::home(area);
+    draw_header(frame, app, regions.header);
+    let player_data = player_view(app);
+    let player_view = player_data.as_view();
+    let main = Rect {
+        x: area.x,
+        y: regions.library.y,
+        width: area.width,
+        height: regions.library.height,
+    };
+    match app.screen {
+        Screen::Library => {
+            let queued: HashSet<(PathBuf, Option<sointty_core::CueRange>)> = app
+                .state
+                .audible
+                .iter()
+                .chain(app.state.pending.iter())
+                .map(|item| screens::library::queue_key(&item.entry))
+                .collect();
+            if regions.queue_visible {
+                if let Some(browser) = &app.browser {
+                    screens::library::render(
+                        frame,
+                        regions.library,
+                        browser,
+                        app.focus == Focus::Library,
+                        &queued,
+                        app,
+                        &app.theme,
+                    );
                 } else {
-                    "converted F32→integer (NOT bit-perfect)".to_owned()
+                    draw_empty_library(frame, regions.library, app);
                 }
+                draw_queue(frame, regions.queue, app);
+            } else if app.focus == Focus::Queue {
+                draw_queue(frame, main, app);
+            } else if let Some(browser) = &app.browser {
+                screens::library::render(frame, main, browser, true, &queued, app, &app.theme);
             } else {
-                "decoder PCM preserved (bit-perfect)".to_owned()
+                draw_empty_library(frame, main, app);
+            }
+            if regions.tier == layout::Tier::Wide {
+                screens::player::render_panel(frame, regions.player, &player_view, &app.theme);
+            } else {
+                screens::player::render_mini(frame, regions.player, &player_view, &app.theme);
+            }
+        }
+        Screen::Playlists => {
+            draw_playlists(frame, main, app, regions.tier != layout::Tier::Wide);
+            screens::player::render_mini(frame, regions.player, &player_view, &app.theme);
+        }
+        Screen::Settings => {
+            draw_settings(frame, main, app, regions.tier != layout::Tier::Wide);
+            screens::player::render_mini(frame, regions.player, &player_view, &app.theme);
+        }
+    }
+    let mut footer = keymap::footer_pairs(app.focus, app.mode.kind());
+    if app.mode.kind() == ModeKind::Normal && !footer.iter().any(|(key, _)| *key == "?") {
+        footer.push(("?", "all keys"));
+    }
+    widgets::render_footer(frame, regions.footer, &footer, &app.theme);
+    draw_overlay(frame, app);
+}
+
+fn draw_header(frame: &mut ratatui::Frame<'_>, app: &App, area: Rect) {
+    if area.height == 0 {
+        return;
+    }
+    let theme = &app.theme;
+    if layout::tier(frame.area()) == layout::Tier::Narrow {
+        frame.render_widget(
+            Paragraph::new(widgets::truncate_cells(
+                "sointty · small terminal · Tab switches pane",
+                area.width as usize,
+            )).style(theme.dimmed()),
+            area,
+        );
+        return;
+    }
+    let tabs = [
+        (Screen::Library, "1 Library"),
+        (Screen::Playlists, "2 Playlists"),
+        (Screen::Settings, "3 Settings"),
+    ];
+    let mut spans = vec![Span::styled(
+        " sointty  ",
+        theme.strong().add_modifier(Modifier::BOLD),
+    )];
+    for (screen, label) in tabs {
+        spans.push(Span::styled(
+            format!(" {label} "),
+            if app.screen == screen {
+                theme.accent_style().add_modifier(Modifier::BOLD)
+            } else {
+                theme.dimmed()
             },
-        ),
+        ));
+    }
+    let badge = match (&app.state.audible, &app.state.output_spec) {
+        (Some(_), Some(_)) if app.state.converted => "● converted",
+        (Some(_), Some(_)) => "● bit-perfect",
+        _ => "○ idle",
     };
-    let seconds = state.frame / u64::from(state.rate_hz.max(1));
-    let default_timing = BufferConfig::default_for_rate(state.rate_hz);
-    let timing_line = match state.timing {
-        (None, None) => format!(
-            "timing: Auto (DSD uses fixed safe timing; PCM now ~{}/{} frames)",
-            default_timing.period_frames, default_timing.buffer_frames
-        ),
-        (period, buffer) => format!(
-            "timing: Custom period {} / buffer {} frames",
-            period
-                .map(|value| value.to_string())
-                .unwrap_or_else(|| format!("auto {}", default_timing.period_frames)),
-            buffer
-                .map(|value| value.to_string())
-                .unwrap_or_else(|| format!("auto {}", default_timing.buffer_frames)),
-        ),
+    spans.push(Span::styled(
+        format!("  {badge}  "),
+        if badge.contains("bit-perfect") {
+            theme.ok_style()
+        } else if badge.contains("converted") {
+            theme.accent_style()
+        } else {
+            theme.faint_style()
+        },
+    ));
+    spans.push(Span::styled(
+        widgets::truncate_cells(&app.state.status, area.width.saturating_sub(80) as usize),
+        theme.dimmed(),
+    ));
+    frame.render_widget(Paragraph::new(Line::from(spans)).style(theme.base()), area);
+}
+
+fn draw_empty_library(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
+    let block = widgets::panel("Library", None, &app.theme, app.focus == Focus::Library);
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    frame.render_widget(
+        Paragraph::new("No readable folder. Press l for Locations."),
+        inner,
+    );
+}
+
+fn draw_queue(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
+    let current_remaining = if app.state.audible.is_some() {
+        app.state.total_frames.map(|total| {
+            Duration::from_secs(
+                total.saturating_sub(app.state.frame) / u64::from(app.state.rate_hz.max(1)),
+            )
+        })
+    } else {
+        None
     };
-    let full_time = state.total_frames
-        .map(|total| clock(total / u64::from(state.rate_hz.max(1))))
-        .unwrap_or_else(|| "--:--".to_owned());
-    let bar_width = usize::from(bottom[1].width.saturating_sub(2)).saturating_sub(12);
-    let bar = progress_bar(state.frame, state.total_frames, bar_width);
-    let playback = Paragraph::new(format!(
-        "status: {}{}\nposition: {} frames\ndevice: {}\noutput: {}\nfidelity: {}\n{}\nF32→integer compatibility: {}\ninteger→F32 compatibility: {}\ntime: {} / {}\n{}",
-        state.status,
-        if track.is_empty() {
-            String::new()
-        } else {
-            format!("\ntrack: {track}")
+    let track_count = app.state.pending.len() + usize::from(app.state.audible.is_some());
+    let time_left = match (app.pending_duration_total, current_remaining, app.state.audible.is_some()) {
+        (Some(pending), Some(current), true) => format!("{} left", screens::clock(pending + current)),
+        (Some(pending), _, false) => format!("{} left", screens::clock(pending)),
+        _ => "time unknown".to_owned(),
+    };
+    let selected_row = app
+        .queue_selected
+        .and_then(|id| screens::queue::row_of(&app.queue_rows, id));
+    screens::queue::render(
+        frame,
+        area,
+        &screens::queue::QueueView {
+            rows: &app.queue_rows,
+            selected_row,
+            focused: app.focus == Focus::Queue,
+            shuffle: app.state.shuffle,
+            track_count,
+            time_left: &time_left,
         },
-        state.frame,
-        state.device_display(),
-        output_line,
-        fidelity,
-        timing_line,
-        if state.float_to_int {
-            "ON (non-bit-perfect when used)"
-        } else {
-            "OFF (strict)"
-        },
-        if state.int_to_float {
-            "ON (non-bit-perfect when used)"
-        } else {
-            "OFF (strict)"
-        },
-        clock(seconds),
-        full_time,
-        bar,
-    ))
-    .block(Block::default().title("Playback").borders(Borders::ALL));
-    frame.render_widget(playback, bottom[1]);
+        &app.theme,
+    );
+}
 
-    let highlight = app.theme.selected();
+fn draw_playlists(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App, narrow: bool) {
+    let list = app.state.catalog.playlists.get(app.playlist_name_sel)
+        .unwrap_or_else(|| app.state.catalog.selected_playlist());
+    let lifted: HashSet<usize> = match &app.mode {
+        Mode::Move(MoveOverlay::Playlist { indices, .. }) => indices.iter().copied().collect(),
+        _ => HashSet::new(),
+    };
+    let move_gap = match &app.mode {
+        Mode::Move(MoveOverlay::Playlist { gap, .. }) => Some(*gap),
+        _ => None,
+    };
+    let path = app
+        .state
+        .catalog_path
+        .as_ref()
+        .map(|path| path.display().to_string());
+    screens::playlists::render(
+        frame,
+        area,
+        &screens::playlists::PlaylistsView {
+            names: &app.playlist_names_cache,
+            name_sel: app.playlist_name_sel,
+            tracks: &app.playlist_tracks_cache,
+            track_cursor: app.playlist_track_sel,
+            checked: &app.playlist_selected,
+            lifted: &lifted,
+            tracks_title: &list.name,
+            tracks_dirty: app.dirty_playlists.contains(&app.playlist_name_sel),
+            focus: app.focus,
+            catalog_path: path.as_deref(),
+            catalog_error: app.state.catalog_error.as_deref(),
+            move_gap,
+        },
+        &app.theme,
+        narrow,
+    );
+}
 
-    // Right column: selected saved playlist or the live queue.
-    let render_right = |frame: &mut ratatui::Frame<'_>, area| match app.right {
-        RightView::SavedList => {
-            let playlist = state.catalog.selected_playlist();
-            let items: Vec<ListItem> = if playlist.entries.is_empty() {
-                vec![ListItem::new("(empty — browser: a adds item, A adds folder)")]
-            } else {
-                playlist
-                    .entries
-                    .iter()
-                    .map(|entry| ListItem::new(queue_entry_name(entry)))
-                    .collect()
-            };
-            let title = if app.right_focused {
-                format!("Playlist [Enter/a song, A all, Esc back]: {}", playlist.name)
-            } else {
-                format!("Playlist [f focus, Tab queue]: {}", playlist.name)
-            };
-            let list = List::new(items)
-                .block(Block::default().title(title).borders(Borders::ALL))
-                .highlight_style(highlight)
-                .highlight_symbol("> ");
-            let mut list_state = ListState::default();
-            if app.right_focused && !playlist.entries.is_empty() {
-                list_state.select(Some(app.playlist_entry_sel.min(playlist.entries.len() - 1)));
-            }
-            frame.render_stateful_widget(list, area, &mut list_state);
+fn draw_settings(frame: &mut ratatui::Frame<'_>, area: Rect, app: &App, narrow: bool) {
+    const SECTIONS: &[&str] = &[
+        "Output",
+        "Playback",
+        "Library & locations",
+        "Appearance",
+        "Keys",
+    ];
+    let rows = &app.settings_rows_cache;
+    let path = app
+        .state
+        .config_path
+        .as_ref()
+        .map(|path| path.display().to_string());
+    let signal = match (app.state.source_spec, app.state.output_spec.as_ref()) {
+        (Some(DecodedSpec::Pcm(source)), Some(output)) => Some(format!(
+            "{:?} {} Hz · {} ch → {:?} {} Hz · {} ch → {}",
+            source.encoding,
+            source.rate_hz,
+            source.layout.channels,
+            output.format,
+            output.rate_hz,
+            output.layout.channels,
+            output.device,
+        )),
+        (Some(DecodedSpec::Dsd(source)), Some(output)) => Some(format!(
+            "DSD {} Hz · {} ch → {:?} {} Hz · {} ch → {}",
+            source.dsd_rate_hz,
+            source.layout.channels,
+            output.format,
+            output.rate_hz,
+            output.layout.channels,
+            output.device,
+        )),
+        _ => None,
+    };
+    screens::settings::render(
+        frame,
+        area,
+        &screens::settings::SettingsView {
+            sections: SECTIONS,
+            section_sel: app.settings_section,
+            rows,
+            row_sel: app.settings_row,
+            focus: app.focus,
+            config_path: path.as_deref(),
+            config_error: app.state.config_error.as_deref(),
+            signal_path: signal.as_deref(),
+        },
+        &app.theme,
+        narrow,
+    );
+}
+
+fn player_view(app: &App) -> OwnedPlayerView {
+    let badge = match (&app.state.audible, &app.state.output_spec) {
+        (Some(_), Some(_)) if app.state.converted => screens::player::PlaybackBadge::Converted,
+        (Some(_), Some(_)) => screens::player::PlaybackBadge::BitPerfect,
+        _ => screens::player::PlaybackBadge::Idle,
+    };
+    let entry = app.state.audible.as_ref().map(|item| &item.entry);
+    let (title, _tag) = entry
+        .map(|entry| display::display_entry_title(entry, Some(&app.state.tags)))
+        .unwrap_or_default();
+    let subtitle = match (&app.state.tags.artist, &app.state.tags.album) {
+        (Some(artist), Some(album)) => Some(format!("{artist} · {album}")),
+        (Some(artist), None) => Some(artist.clone()),
+        (None, Some(album)) => Some(album.clone()),
+        (None, None) => None,
+    };
+    let rate = u64::from(app.state.rate_hz.max(1));
+    let elapsed = Duration::from_secs(app.state.frame / rate);
+    let total = app
+        .state
+        .total_frames
+        .map(|frames| Duration::from_secs(frames / rate));
+    let source = app.state.source_spec.map(|spec| match spec {
+        DecodedSpec::Pcm(pcm) => format!(
+            "{:?} {} Hz · {} ch",
+            pcm.encoding, pcm.rate_hz, pcm.layout.channels
+        ),
+        DecodedSpec::Dsd(dsd) => format!("DSD {} Hz · {} ch", dsd.dsd_rate_hz, dsd.layout.channels),
+    });
+    let output = app.state.output_spec.as_ref().map(|spec| {
+        let name = app
+            .state
+            .device_names
+            .iter()
+            .find(|(id, _)| *id == spec.device)
+            .map(|(_, name)| name.as_str())
+            .unwrap_or(&spec.device);
+        format!(
+            "{:?} {} Hz · {} ch · {} valid bits · {name}",
+            spec.format, spec.rate_hz, spec.layout.channels, spec.valid_bits
+        )
+    });
+    let buffers = app.state.buffers.map(|b| {
+        format!(
+            "period {} / buffer {} / ring {} frames",
+            b.period_frames, b.buffer_frames, b.ring_frames,
+        )
+    });
+    let path = entry.map(|entry| entry.path.display().to_string());
+    OwnedPlayerView::new(
+        badge,
+        title,
+        subtitle,
+        elapsed,
+        total,
+        app.state.paused,
+        app.state.status.clone(),
+        source,
+        output,
+        buffers,
+        path,
+    )
+}
+
+/// Draw-local owned strings backing the borrowed `PlayerView`.
+struct OwnedPlayerView {
+    badge: screens::player::PlaybackBadge,
+    title: String,
+    subtitle: Option<String>,
+    elapsed: Duration,
+    total: Option<Duration>,
+    paused: bool,
+    status: String,
+    source: Option<String>,
+    output: Option<String>,
+    buffers: Option<String>,
+    path: Option<String>,
+}
+
+impl OwnedPlayerView {
+    #[allow(clippy::too_many_arguments)]
+    fn new(
+        badge: screens::player::PlaybackBadge,
+        title: String,
+        subtitle: Option<String>,
+        elapsed: Duration,
+        total: Option<Duration>,
+        paused: bool,
+        status: String,
+        source: Option<String>,
+        output: Option<String>,
+        buffers: Option<String>,
+        path: Option<String>,
+    ) -> Self {
+        Self {
+            badge,
+            title,
+            subtitle,
+            elapsed,
+            total,
+            paused,
+            status,
+            source,
+            output,
+            buffers,
+            path,
         }
-        RightView::Queue => {
-            let mut items: Vec<ListItem> = Vec::new();
-            if let Some(audible) = &state.audible {
-                items.push(ListItem::new(format!(
-                    "> #{} {}",
-                    audible.id,
-                    queue_entry_name(&audible.entry)
-                )));
-            }
-            for item in &state.pending {
-                items.push(ListItem::new(format!(
-                    "  #{} {}",
-                    item.id,
-                    queue_entry_name(&item.entry)
-                )));
-            }
-            if items.is_empty() {
-                items.push(ListItem::new("(queue empty)"));
-            }
-            let list = List::new(items).block(
-                Block::default()
-                    .title(format!("Queue [r random: {}, Tab playlist]", if state.shuffle { "ON" } else { "OFF" }))
-                    .borders(Borders::ALL),
-            );
-            frame.render_widget(list, area);
-        }
-    };
+    }
 
-    match &app.pane {
-        None => render_right(frame, bottom[2]),
-        Some(pane) => {
-            let columns = Layout::default()
-                .direction(Direction::Horizontal)
-                .constraints([Constraint::Percentage(60), Constraint::Percentage(40)])
-                .split(bottom[2]);
-            match pane {
-                Pane::Browser(browser) => {
-                    let items: Vec<ListItem> = browser
-                        .items
-                        .iter()
-                        .map(|item| {
-                            let marker = match item.kind {
-                                BrowserItemKind::Dir => "[d] ",
-                                BrowserItemKind::Audio => "    ",
-                                BrowserItemKind::Playlist => "[p] ",
+    fn as_view(&self) -> screens::player::PlayerView<'_> {
+        screens::player::PlayerView {
+            badge: self.badge,
+            title: &self.title,
+            subtitle: self.subtitle.as_deref(),
+            elapsed: self.elapsed,
+            total: self.total,
+            paused: self.paused,
+            status: &self.status,
+            source: self.source.as_deref(),
+            output: self.output.as_deref(),
+            buffers: self.buffers.as_deref(),
+            path: self.path.as_deref(),
+        }
+    }
+}
+
+fn draw_overlay(frame: &mut ratatui::Frame<'_>, app: &App) {
+    let area = frame.area();
+    let theme = &app.theme;
+    match &app.mode {
+        Mode::Normal => {}
+        Mode::Search(search) => {
+            let overlay = layout::centered_overlay(area, area.height.saturating_sub(4).min(30));
+            frame.render_widget(Clear, overlay);
+            let block = widgets::panel("Search", None, theme, true);
+            let inner = block.inner(overlay);
+            frame.render_widget(block, overlay);
+            if inner.height == 0 {
+                return;
+            }
+            let mut lines = vec![
+                Line::from(vec![
+                    Span::styled(" / ", theme.accent_style()),
+                    Span::styled(format!("{}▏", search.query), theme.strong()),
+                ]),
+                Line::from(Span::styled(
+                    format!(
+                        "All / Albums / Tracks / Folders / Playlists     scope: {}",
+                        search.scope.label()
+                    ),
+                    theme.dimmed(),
+                )),
+                Line::from(Span::styled(
+                    match &search.status {
+                        SearchStatus::Indexing => {
+                            format!("{} results · indexing…", search.visible.len())
+                        }
+                        SearchStatus::Done => format!("{} results", search.visible.len()),
+                        SearchStatus::Incomplete { skipped_roots } => format!(
+                            "{} results · incomplete ({skipped_roots} skipped roots)",
+                            search.visible.len()
+                        ),
+                    },
+                    theme.faint_style(),
+                )),
+            ];
+            if search.query.is_empty() {
+                lines.push(Line::from(Span::styled(
+                    "Type to search locations. Tab changes scope; Esc closes.",
+                    theme.faint_style(),
+                )));
+            } else {
+                let display_rows = search.display_rows();
+                let selected_result = search.visible.get(search.selected).copied();
+                let selected_display = display_rows.iter().position(|row| {
+                    matches!(row, SearchDisplayRow::Item(index) if Some(*index) == selected_result)
+                }).unwrap_or(0);
+                let rows_height = inner.height.saturating_sub(lines.len() as u16) as usize;
+                let (start, end) =
+                    screens::visible_window(display_rows.len(), selected_display, rows_height);
+                for row in &display_rows[start..end] {
+                    match row {
+                        SearchDisplayRow::Header(label, count) => lines.push(Line::from(
+                            Span::styled(format!("  {label} ({count})"), theme.accent_style()),
+                        )),
+                        SearchDisplayRow::More(count) => lines.push(Line::from(Span::styled(
+                            format!("    … {count} more"),
+                            theme.faint_style(),
+                        ))),
+                        SearchDisplayRow::Item(result_index) => {
+                            let item = &search.results[*result_index];
+                            let (kind, title, subtitle, title_spans, subtitle_spans): (
+                                &str,
+                                &str,
+                                Option<&str>,
+                                &[usize],
+                                &[usize],
+                            ) = match item {
+                                SearchItem::Worker(hit) => (
+                                    match hit.kind {
+                                        HitKind::Track => "♪",
+                                        HitKind::Album => "▤",
+                                        HitKind::Folder => "▸",
+                                        HitKind::PlaylistFile => "≡",
+                                    },
+                                    &hit.title,
+                                    hit.subtitle.as_deref(),
+                                    &hit.spans,
+                                    &hit.subtitle_spans,
+                                ),
+                                SearchItem::Catalog { index, spans, .. } => (
+                                    "≡",
+                                    &app.state.catalog.playlists[*index].name,
+                                    Some("saved playlist"),
+                                    spans,
+                                    &[],
+                                ),
                             };
-                            ListItem::new(format!("{marker}{}", item.name))
-                        })
-                        .collect();
-                    let list = List::new(items)
-                        .block(
-                            Block::default()
-                                .title(format!(
-                                    "Browser [l drives, f playlist] — {}",
-                                    browser.current_dir.display()
-                                ))
-                                .borders(Borders::ALL),
-                        )
-                        .highlight_style(highlight)
-                        .highlight_symbol("> ");
-                    let mut list_state = ListState::default();
-                    if !app.right_focused && !browser.items.is_empty() {
-                        list_state.select(Some(browser.selected));
-                    }
-                    frame.render_stateful_widget(list, columns[0], &mut list_state);
-                }
-                Pane::Devices(devices) => {
-                    let items: Vec<ListItem> = devices
-                        .devices
-                        .iter()
-                        .map(|(id, name)| {
-                            let marker = if *id == state.device { "* " } else { "  " };
-                            ListItem::new(format!("{marker}{name}"))
-                        })
-                        .collect();
-                    let list = List::new(items)
-                        .block(
-                            Block::default()
-                                .title("Output device — Enter: select, d/Esc: close")
-                                .borders(Borders::ALL),
-                        )
-                        .highlight_style(highlight)
-                        .highlight_symbol("> ");
-                    let mut list_state = ListState::default();
-                    if !devices.devices.is_empty() {
-                        list_state.select(Some(devices.selected));
-                    }
-                    frame.render_stateful_widget(list, columns[0], &mut list_state);
-                }
-                Pane::Locations(locations) => {
-                    let items: Vec<ListItem> = if locations.locations.is_empty() {
-                        vec![ListItem::new("(no locations; menu: Enter path...)")]
-                    } else {
-                        locations
-                            .locations
-                            .iter()
-                            .map(|location| ListItem::new(location.label.clone()))
-                            .collect()
-                    };
-                    let list = List::new(items)
-                        .block(
-                            Block::default()
-                                .title("Locations — Enter: browse, m: map/mount, l/Esc: close")
-                                .borders(Borders::ALL),
-                        )
-                        .highlight_style(highlight)
-                        .highlight_symbol("> ");
-                    let mut list_state = ListState::default();
-                    if !locations.locations.is_empty() {
-                        list_state.select(Some(locations.selected));
-                    }
-                    frame.render_stateful_widget(list, columns[0], &mut list_state);
-                }
-                Pane::Menu(menu) => {
-                    let (title, items) = menu.stack.last().unwrap();
-                    let items: Vec<ListItem> = items
-                        .iter()
-                        .map(|item| ListItem::new(item.label.clone()))
-                        .collect();
-                    let list = List::new(items)
-                        .block(
-                            Block::default()
-                                .title(format!("{title} — Enter: select, Esc: back"))
-                                .borders(Borders::ALL),
-                        )
-                        .highlight_style(highlight)
-                        .highlight_symbol("> ");
-                    let mut list_state = ListState::default();
-                    if !menu.current_items().is_empty() {
-                        list_state.select(Some(menu.selected));
-                    }
-                    frame.render_stateful_widget(list, columns[0], &mut list_state);
-                }
-                Pane::Playlists(pane) => {
-                    let names: Vec<ListItem> = state
-                        .catalog
-                        .playlists
-                        .iter()
-                        .enumerate()
-                        .map(|(index, playlist)| {
-                            let marker = if index == state.catalog.selected {
-                                "* "
+                            let selected = Some(*result_index) == selected_result;
+                            let mut spans = vec![
+                                Span::styled(
+                                    if selected { "› " } else { "  " },
+                                    theme.accent_style(),
+                                ),
+                                Span::styled(format!("{kind} "), theme.dimmed()),
+                            ];
+                            let title = widgets::truncate_cells(
+                                title,
+                                inner.width.saturating_sub(12) as usize,
+                            );
+                            for (index, ch) in title.chars().enumerate() {
+                                let style = if title_spans.contains(&index) {
+                                    theme.accent_style().add_modifier(Modifier::BOLD)
+                                } else {
+                                    theme.base()
+                                };
+                                spans.push(Span::styled(ch.to_string(), style));
+                            }
+                            if let Some(subtitle) = subtitle {
+                                spans.push(Span::raw("  "));
+                                let subtitle = widgets::truncate_cells(
+                                    subtitle,
+                                    inner
+                                        .width
+                                        .saturating_sub(widgets::text_cells(&title) as u16 + 6)
+                                        as usize,
+                                );
+                                for (index, ch) in subtitle.chars().enumerate() {
+                                    let style = if subtitle_spans.contains(&index) {
+                                        theme.accent_style().add_modifier(Modifier::BOLD)
+                                    } else {
+                                        theme.faint_style()
+                                    };
+                                    spans.push(Span::styled(ch.to_string(), style));
+                                }
+                            }
+                            lines.push(Line::from(spans).style(if selected {
+                                theme.selected()
                             } else {
-                                "  "
-                            };
-                            ListItem::new(format!("{marker}{} ({})", playlist.name, playlist.entries.len()))
-                        })
-                        .collect();
-                    let title = if state.catalog_error.is_some() {
-                        "Playlists (READ-ONLY: catalog file malformed)".to_owned()
-                    } else {
-                        "Playlists: Enter select, Tab focus, a queue list/song, A whole list".to_owned()
-                    };
-                    let list = List::new(names)
-                        .block(Block::default().title(title).borders(Borders::ALL))
-                        .highlight_style(if pane.focus == PlaylistFocus::Names {
-                            highlight
-                        } else {
-                            Style::default()
-                        })
-                        .highlight_symbol("> ");
-                    let mut list_state = ListState::default();
-                    if !state.catalog.playlists.is_empty() {
-                        list_state.select(Some(pane.name_sel));
+                                Style::default()
+                            }));
+                        }
                     }
-                    frame.render_stateful_widget(list, columns[0], &mut list_state);
-
-                    let playlist = &state.catalog.playlists[pane
-                        .name_sel
-                        .min(state.catalog.playlists.len().saturating_sub(1))];
-                    let entries: Vec<ListItem> = if playlist.entries.is_empty() {
-                        vec![ListItem::new("(empty)")]
-                    } else {
-                        playlist
-                            .entries
-                            .iter()
-                            .map(|entry| ListItem::new(queue_entry_name(entry)))
-                            .collect()
-                    };
-                    let list = List::new(entries)
-                        .block(
-                            Block::default()
-                                .title(format!("{} entries: Enter/a song, A whole list", playlist.name))
-                                .borders(Borders::ALL),
-                        )
-                        .highlight_style(if pane.focus == PlaylistFocus::Entries {
-                            highlight
-                        } else {
-                            Style::default()
-                        })
-                        .highlight_symbol("> ");
-                    let mut list_state = ListState::default();
-                    if !playlist.entries.is_empty() {
-                        list_state.select(Some(pane.entry_sel));
-                    }
-                    frame.render_stateful_widget(list, columns[1], &mut list_state);
-                    return;
-                }
-                Pane::Settings(settings) => {
-                    let default_timing = BufferConfig::default_for_rate(state.rate_hz);
-                    let rows = vec![
-                        format!("Output device: {}", state.device_display()),
-                        "DAC timing: Auto (per-track rate)".to_owned(),
-                        format!(
-                            "DAC timing: Custom... (now period {} / buffer {})",
-                            state
-                                .timing
-                                .0
-                                .map(|value| value.to_string())
-                                .unwrap_or_else(|| format!("auto {}", default_timing.period_frames)),
-                            state
-                                .timing
-                                .1
-                                .map(|value| value.to_string())
-                                .unwrap_or_else(|| format!("auto {}", default_timing.buffer_frames)),
-                        ),
-                        format!(
-                            "F32→integer compatibility: {} (OFF = strict bit-perfect)",
-                            if state.float_to_int { "ON" } else { "OFF" }
-                        ),
-                        format!(
-                            "Integer→F32 compatibility: {} (OFF = strict bit-perfect)",
-                            if state.int_to_float { "ON" } else { "OFF" }
-                        ),
-                    ];
-                    let items: Vec<ListItem> = rows.into_iter().map(ListItem::new).collect();
-                    let list = List::new(items)
-                        .block(
-                            Block::default()
-                                .title("DAC settings — Enter: change, Esc: close")
-                                .borders(Borders::ALL),
-                        )
-                        .highlight_style(highlight)
-                        .highlight_symbol("> ");
-                    let mut list_state = ListState::default();
-                    list_state.select(Some(settings.selected));
-                    frame.render_stateful_widget(list, columns[0], &mut list_state);
-                }
-                Pane::Input(input) => {
-                    let text = Paragraph::new(format!("{}\n{}_", input.prompt, input.buffer))
-                        .block(Block::default().title("Input — Enter: ok, Esc: cancel").borders(Borders::ALL));
-                    frame.render_widget(text, columns[0]);
                 }
             }
-            render_right(frame, columns[1]);
+            frame.render_widget(Paragraph::new(lines), inner);
         }
+        Mode::Help => {
+            let overlay = layout::centered_overlay(area, area.height.saturating_sub(2).min(36));
+            frame.render_widget(Clear, overlay);
+            let block = widgets::panel("All keys · ?/Esc closes", None, theme, true);
+            let inner = block.inner(overlay);
+            frame.render_widget(block, overlay);
+            let mut lines = Vec::new();
+            for (group, rows) in keymap::help_groups() {
+                lines.push(Line::from(Span::styled(
+                    group.to_owned(),
+                    theme.accent_style(),
+                )));
+                for (key, label) in rows {
+                    lines.push(Line::from(vec![
+                        Span::styled(format!("  {key:<12}"), theme.keycap()),
+                        Span::styled(label, theme.base()),
+                    ]));
+                }
+            }
+            let start = app
+                .help_scroll
+                .min(lines.len().saturating_sub(inner.height as usize));
+            let end = (start + inner.height as usize).min(lines.len());
+            frame.render_widget(Paragraph::new(lines[start..end].to_vec()), inner);
+        }
+        Mode::Locations(locations) => {
+            let overlay = layout::centered_overlay(area, area.height.saturating_sub(6).min(22));
+            frame.render_widget(Clear, overlay);
+            let block = widgets::panel(
+                "Locations · Enter browse · x actions",
+                Some(locations.locations.len()),
+                theme,
+                true,
+            );
+            let inner = block.inner(overlay);
+            frame.render_widget(block, overlay);
+            let mut lines = Vec::new();
+            for (index, location) in locations
+                .locations
+                .iter()
+                .enumerate()
+                .take(inner.height as usize)
+            {
+                let selected = index == locations.selected;
+                lines.push(
+                    Line::from(vec![
+                        Span::styled(if selected { "› " } else { "  " }, theme.accent_style()),
+                        Span::styled(
+                            widgets::truncate_cells(
+                                &location.label,
+                                inner.width.saturating_sub(2) as usize,
+                            ),
+                            theme.base(),
+                        ),
+                    ])
+                    .style(if selected {
+                        theme.selected()
+                    } else {
+                        Style::default()
+                    }),
+                );
+            }
+            if lines.is_empty() {
+                lines.push(Line::from("No locations; x → Enter path"));
+            }
+            frame.render_widget(Paragraph::new(lines), inner);
+        }
+        Mode::PlaylistPicker(picker) => {
+            let overlay = layout::centered_overlay(area, area.height.saturating_sub(6).min(22));
+            frame.render_widget(Clear, overlay);
+            let block = widgets::panel("Add to playlist", None, theme, true);
+            let inner = block.inner(overlay);
+            frame.render_widget(block, overlay);
+            let mut lines = Vec::new();
+            for (index, list) in app
+                .state
+                .catalog
+                .playlists
+                .iter()
+                .enumerate()
+                .take(inner.height as usize)
+            {
+                let selected = index == picker.selected;
+                lines.push(
+                    Line::from(vec![
+                        Span::styled(if selected { "› " } else { "  " }, theme.accent_style()),
+                        Span::styled(
+                            format!("{} ({})", list.name, list.entries.len()),
+                            theme.base(),
+                        ),
+                    ])
+                    .style(if selected {
+                        theme.selected()
+                    } else {
+                        Style::default()
+                    }),
+                );
+            }
+            lines.push(Line::from(Span::styled(
+                "+ New playlist",
+                theme.accent_style(),
+            )));
+            frame.render_widget(Paragraph::new(lines), inner);
+        }
+        Mode::Actions(actions) => {
+            let overlay =
+                layout::centered_overlay(area, (actions.items.len() as u16 + 2).min(area.height));
+            frame.render_widget(Clear, overlay);
+            let block = widgets::panel("Actions", None, theme, true);
+            let inner = block.inner(overlay);
+            frame.render_widget(block, overlay);
+            let lines: Vec<Line<'static>> = actions
+                .items
+                .iter()
+                .enumerate()
+                .map(|(index, (label, _))| {
+                    let selected = index == actions.selected;
+                    Line::from(vec![
+                        Span::styled(if selected { "› " } else { "  " }, theme.accent_style()),
+                        Span::styled(label.clone(), theme.base()),
+                    ])
+                    .style(if selected {
+                        theme.selected()
+                    } else {
+                        Style::default()
+                    })
+                })
+                .collect();
+            frame.render_widget(Paragraph::new(lines), inner);
+        }
+        Mode::Prompt(prompt) => {
+            let overlay = layout::centered_overlay(area, 5);
+            frame.render_widget(Clear, overlay);
+            let block = widgets::panel("Input", None, theme, true);
+            let inner = block.inner(overlay);
+            frame.render_widget(block, overlay);
+            let text = match prompt.kind {
+                PromptKind::QuitConfirm => prompt.label.clone(),
+                PromptKind::Text(_) => format!("{}\n{}▏", prompt.label, prompt.buffer),
+            };
+            frame.render_widget(Paragraph::new(text).style(theme.base()), inner);
+        }
+        Mode::Move(MoveOverlay::Queue { id, target }) => {
+            let overlay = layout::centered_overlay(area, 3);
+            frame.render_widget(Clear, overlay);
+            let block = widgets::panel("Move queue entry", None, theme, true);
+            let inner = block.inner(overlay);
+            frame.render_widget(block, overlay);
+            frame.render_widget(
+                Paragraph::new(format!(
+                    "Move #{id} before {:?} · ↑↓ target · Enter apply · Esc cancel",
+                    target
+                )),
+                inner,
+            );
+        }
+        Mode::Move(MoveOverlay::Playlist { .. }) => {}
     }
 }
 
@@ -2439,28 +3724,7 @@ mod tests {
     struct Harness {
         app: App,
         sent: Receiver<PlayerCommand>,
-        saved_devices: Arc<Mutex<Vec<DeviceId>>>,
-        saved_float: Arc<Mutex<Vec<bool>>>,
-        saved_int_float: Arc<Mutex<Vec<bool>>>,
-        saved_dirs: Arc<Mutex<Vec<PathBuf>>>,
-        saved_catalogs: Arc<Mutex<Vec<PlaylistCatalog>>>,
-        saved_timing: Arc<Mutex<Vec<(Option<u32>, Option<u32>)>>>,
-    }
-
-    fn noop_hooks(devices: Vec<(DeviceId, String)>) -> Hooks {
-        Hooks {
-            device_provider: Box::new(move || devices.clone()),
-            on_device_selected: Box::new(|_| Ok(())),
-            on_float_to_int_selected: Box::new(|_| Ok(())),
-            on_int_to_float_selected: Box::new(|_| Ok(())),
-            on_browser_dir: Box::new(|_| Ok(())),
-            on_catalog: Box::new(|_| Ok(())),
-            on_timing: Box::new(|_, _| Ok(())),
-            locations: Box::new(|| Ok(Vec::new())),
-            map_drive: None,
-            disconnect_drive: None,
-            mount_share: None,
-        }
+        saves: Arc<Mutex<Vec<PlaylistCatalog>>>,
     }
 
     fn options() -> RunOptions {
@@ -2474,979 +3738,551 @@ mod tests {
             timing: (None, None),
             catalog: PlaylistCatalog::default(),
             catalog_error: None,
+            catalog_path: Some(PathBuf::from("/data/playlists.toml")),
+            config_path: Some(PathBuf::from("/config/config.toml")),
+            config_error: None,
+            accent: None,
+            search_roots: Vec::new(),
+            search_coverage_error: None,
         }
     }
 
-    fn harness(devices: Vec<(DeviceId, String)>) -> Harness {
+    fn harness() -> Harness {
         let (commands, sent) = crossbeam_channel::unbounded();
-        let saved_devices = Arc::new(Mutex::new(Vec::new()));
-        let saved_float = Arc::new(Mutex::new(Vec::new()));
-        let saved_int_float = Arc::new(Mutex::new(Vec::new()));
-        let saved_dirs = Arc::new(Mutex::new(Vec::new()));
-        let saved_catalogs = Arc::new(Mutex::new(Vec::new()));
-        let saved_timing = Arc::new(Mutex::new(Vec::new()));
-        let hooks = {
-            let devices_sink = Arc::clone(&saved_devices);
-            let float_sink = Arc::clone(&saved_float);
-            let int_float_sink = Arc::clone(&saved_int_float);
-            let dirs_sink = Arc::clone(&saved_dirs);
-            let catalogs_sink = Arc::clone(&saved_catalogs);
-            let timing_sink = Arc::clone(&saved_timing);
-            Hooks {
-                device_provider: Box::new(move || devices.clone()),
-                on_device_selected: Box::new(move |device| {
-                    devices_sink.lock().push(device.clone());
-                    Ok(())
-                }),
-                on_float_to_int_selected: Box::new(move |enabled| {
-                    float_sink.lock().push(enabled);
-                    Ok(())
-                }),
-                on_int_to_float_selected: Box::new(move |enabled| {
-                    int_float_sink.lock().push(enabled);
-                    Ok(())
-                }),
-                on_browser_dir: Box::new(move |dir| {
-                    dirs_sink.lock().push(dir.to_path_buf());
-                    Ok(())
-                }),
-                on_catalog: Box::new(move |catalog| {
-                    catalogs_sink.lock().push(catalog.clone());
-                    Ok(())
-                }),
-                on_timing: Box::new(move |period, buffer| {
-                    timing_sink.lock().push((period, buffer));
-                    Ok(())
-                }),
-                locations: Box::new(|| Ok(Vec::new())),
-                map_drive: None,
-                disconnect_drive: None,
-                mount_share: None,
-            }
+        let saves = Arc::new(Mutex::new(Vec::new()));
+        let saver = Arc::clone(&saves);
+        let hooks = Hooks {
+            device_provider: Box::new(|| vec![("dev1".to_owned(), "DAC".to_owned())]),
+            on_device_selected: Box::new(|_| Ok(())),
+            on_device_reset: Box::new(|| Ok("dev1".to_owned())),
+            on_float_to_int_selected: Box::new(|_| Ok(())),
+            on_int_to_float_selected: Box::new(|_| Ok(())),
+            on_browser_dir: Box::new(|_| Ok(())),
+            on_catalog: Box::new(move |catalog| {
+                saver.lock().push(catalog.clone());
+                Ok(())
+            }),
+            on_timing: Box::new(|_, _| Ok(())),
+            on_accent: Box::new(|_| Ok(())),
+            locations: Box::new(|| Ok(Vec::new())),
+            map_drive: None,
+            disconnect_drive: None,
+            mount_share: None,
         };
         Harness {
             app: App::new(options(), hooks, commands),
             sent,
-            saved_devices,
-            saved_float,
-            saved_int_float,
-            saved_dirs,
-            saved_catalogs,
-            saved_timing,
+            saves,
         }
     }
 
     impl Harness {
-        fn key(&mut self, key: KeyCode) -> bool {
-            self.app.handle_key(key)
+        fn key(&mut self, code: KeyCode) -> bool {
+            self.app
+                .handle_key_event(KeyEvent::new(code, KeyModifiers::NONE))
         }
     }
 
-    fn temp_dir(tag: &str) -> PathBuf {
-        let nanos = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        std::env::temp_dir().join(format!("sointty-tui-{tag}-{}-{nanos}", std::process::id()))
-    }
-
-    fn audio_browser() -> (PathBuf, Browser) {
-        let dir = temp_dir("audio");
-        std::fs::create_dir_all(&dir).unwrap();
-        std::fs::write(dir.join("track.flac"), b"").unwrap();
-        let browser = Browser::open(dir.clone()).unwrap();
-        (dir, browser)
-    }
-
     #[test]
-    fn enter_on_audio_enqueues_and_starts_playback() {
-        // Regression: the old browser only sent Enqueue, so choosing a file
-        // never started playback.
-        let (dir, browser) = audio_browser();
-        let mut h = harness(Vec::new());
-        h.app.pane = Some(Pane::Browser(browser));
-        assert!(!h.key(KeyCode::Enter));
-        let enqueued = h.sent.recv().unwrap();
-        assert!(matches!(enqueued, PlayerCommand::Enqueue(_)));
-        let play = h.sent.recv().unwrap();
-        assert!(matches!(play, PlayerCommand::Play));
-        std::fs::remove_dir_all(&dir).ok();
-    }
-
-    #[test]
-    fn playback_keys_work_while_browser_is_open() {
-        // Regression: the open browser swallowed every key except its own, so
-        // pause/next/stop were unreachable while browsing.
-        let (dir, browser) = audio_browser();
-        let mut h = harness(Vec::new());
-        h.app.pane = Some(Pane::Browser(browser));
+    fn global_playback_keys_work_outside_text_input() {
+        let mut h = harness();
         h.key(KeyCode::Char('n'));
         assert!(matches!(h.sent.recv().unwrap(), PlayerCommand::Next));
         h.key(KeyCode::Char(' '));
         assert!(matches!(h.sent.recv().unwrap(), PlayerCommand::Pause));
-        h.key(KeyCode::Char(' '));
-        assert!(matches!(h.sent.recv().unwrap(), PlayerCommand::Play));
         h.key(KeyCode::Char('s'));
         assert!(matches!(h.sent.recv().unwrap(), PlayerCommand::Stop));
-        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
-    fn arrows_seek_relative_to_current_position() {
-        let mut h = harness(Vec::new());
-        h.app.state.frame = 60 * 44_100;
-        h.key(KeyCode::Left);
-        let command = h.sent.recv().unwrap();
-        assert!(matches!(&command, PlayerCommand::SeekFrame(f) if *f == 50 * 44_100));
-        h.key(KeyCode::Right);
-        let command = h.sent.recv().unwrap();
-        assert!(matches!(&command, PlayerCommand::SeekFrame(f) if *f == 70 * 44_100));
-    }
-
-    #[test]
-    fn seek_before_track_start_clamps_to_zero() {
-        let mut h = harness(Vec::new());
-        h.app.state.frame = 5 * 44_100;
-        h.key(KeyCode::Left);
-        assert!(matches!(h.sent.recv().unwrap(), PlayerCommand::SeekFrame(0)));
-    }
-
-    #[test]
-    fn device_pane_selects_and_persists_device() {
-        let devices = vec![
-            ("dev1".to_owned(), "Built-in DAC".to_owned()),
-            ("dev2".to_owned(), "USB DAC".to_owned()),
-        ];
-        let mut h = harness(devices);
-        h.key(KeyCode::Char('d'));
-        // Current device preselected; move to the USB DAC and confirm.
-        h.key(KeyCode::Down);
-        h.key(KeyCode::Enter);
-        let command = h.sent.recv().unwrap();
-        assert!(matches!(&command, PlayerCommand::SelectDevice(id) if id == "dev2"));
-        assert_eq!(h.saved_devices.lock().as_slice(), &["dev2".to_owned()]);
-        assert_eq!(h.app.state.device, "dev2");
-        assert!(h.app.pane.is_none());
-    }
-
-
-    #[test]
-    fn device_display_prefers_friendly_name_and_falls_back_to_id() {
-        let mut h = harness(vec![(
-            "{0.0.0.00000000}.{guid}".to_owned(),
-            "iFi USB DAC".to_owned(),
-        )]);
-        // Startup cache primed from the provider; unknown ids fall back.
-        assert_eq!(h.app.state.device_display(), "dev1");
-        h.app.state.device = "{0.0.0.00000000}.{guid}".to_owned();
-        assert_eq!(h.app.state.device_display(), "iFi USB DAC");
-    }
-    #[test]
-    fn esc_closes_pane_before_quitting() {
-        let mut h = harness(vec![("dev1".to_owned(), "DAC".to_owned())]);
-        h.key(KeyCode::Char('d'));
-        assert!(h.app.pane.is_some());
-        assert!(!h.key(KeyCode::Esc));
-        assert!(h.app.pane.is_none());
-        assert!(h.key(KeyCode::Esc));
-    }
-
-    #[test]
-    fn saver_error_is_reported_but_selection_still_applies() {
-        let (commands, sent) = crossbeam_channel::unbounded();
-        let mut hooks = noop_hooks(vec![("dev2".to_owned(), "USB DAC".to_owned())]);
-        hooks.on_device_selected = Box::new(|_| Err("disk full".to_owned()));
-        let mut app = App::new(options(), hooks, commands);
-        app.handle_key(KeyCode::Char('d'));
-        app.handle_key(KeyCode::Enter);
-        let command = sent.recv().unwrap();
-        assert!(matches!(&command, PlayerCommand::SelectDevice(id) if id == "dev2"));
-        assert_eq!(app.state.device, "dev2");
-        assert!(app.state.status.contains("not saved"));
-    }
-
-    #[test]
-    fn space_retries_queue_after_playback_error() {
-        let mut h = harness(Vec::new());
-        h.app.apply_event(PlayerEvent::Error {
-            track: Some(1),
-            kind: sointty_core::PlayerError::DeviceBusy,
-        });
-        h.key(KeyCode::Char(' '));
-        assert!(matches!(h.sent.recv().unwrap(), PlayerCommand::Play));
-    }
-
-    #[test]
-    fn compatibility_toggle_is_explicit_and_saved() {
-        let mut h = harness(Vec::new());
-        assert!(!h.app.state.float_to_int);
-        h.key(KeyCode::Char('c'));
-        assert!(matches!(h.sent.recv().unwrap(), PlayerCommand::SetFloatToInt(true)));
-        assert!(h.app.state.float_to_int);
-        h.key(KeyCode::Char('c'));
-        assert!(matches!(h.sent.recv().unwrap(), PlayerCommand::SetFloatToInt(false)));
-        assert!(!h.app.state.float_to_int);
-        assert_eq!(*h.saved_float.lock(), vec![true, false]);
-    }
-
-    #[test]
-    fn int_to_float_toggle_is_explicit_and_saved() {
-        let mut h = harness(Vec::new());
-        assert!(!h.app.state.int_to_float);
-        h.key(KeyCode::Char('i'));
-        assert!(matches!(h.sent.recv().unwrap(), PlayerCommand::SetIntToFloat(true)));
-        assert!(h.app.state.int_to_float);
-        h.key(KeyCode::Char('i'));
-        assert!(matches!(h.sent.recv().unwrap(), PlayerCommand::SetIntToFloat(false)));
-        assert!(!h.app.state.int_to_float);
-        assert_eq!(*h.saved_int_float.lock(), vec![true, false]);
-    }
-
-    #[test]
-    fn converted_playback_is_labeled_non_bit_perfect() {
-        let mut h = harness(Vec::new());
-        h.app.state.float_to_int = true;
-        h.app.apply_event(PlayerEvent::Playing {
-            track: 1,
-            output: sointty_core::OutputSpec {
-                device: "dev1".to_owned(),
-                rate_hz: 44_100,
-                layout: sointty_core::ChannelLayout::discrete(2),
-                format: sointty_core::DeviceFormat::S32Le,
-                valid_bits: 32,
-            },
-            converted: true,
-        });
-        assert!(h.app.state.status.contains("not bit-perfect"));
-        h.app.apply_event(PlayerEvent::EndOfQueue);
-        assert!(h.app.state.converted, "last output must still be labeled converted");
-    }
-
-    #[test]
-    fn converted_float_output_is_labeled_integer_to_f32() {
-        let mut h = harness(Vec::new());
-        h.app.state.int_to_float = true;
-        h.app.apply_event(PlayerEvent::Playing {
-            track: 1,
-            output: sointty_core::OutputSpec {
-                device: "dev1".to_owned(),
-                rate_hz: 44_100,
-                layout: sointty_core::ChannelLayout::discrete(2),
-                format: sointty_core::DeviceFormat::F32Le,
-                valid_bits: 32,
-            },
-            converted: true,
-        });
-        assert!(h.app.state.status.contains("integer->F32"));
-        assert!(h.app.state.status.contains("not bit-perfect"));
-    }
-
-    // ---- remembered browsing -------------------------------------------------
-
-    #[test]
-    fn browser_reopens_at_last_directory_and_persists_descend() {
-        let dir = temp_dir("remember");
-        let sub = dir.join("sub");
-        std::fs::create_dir_all(&sub).unwrap();
-        let mut h = harness(Vec::new());
-        h.app.state.last_browser_dir = Some(dir.clone());
-        // b opens at the remembered dir.
-        h.key(KeyCode::Char('b'));
-        let Some(Pane::Browser(browser)) = &h.app.pane else {
-            panic!("browser should be open");
+    fn text_input_owns_printable_keys_and_ctrl_q_requests_quit() {
+        let mut h = harness();
+        h.app.start_prompt("Name:", InputAction::PlaylistCreate);
+        for ch in ['q', 's', 'n', 'r', ' ', '?'] {
+            assert!(!h.key(KeyCode::Char(ch)));
+        }
+        let Mode::Prompt(prompt) = &h.app.mode else {
+            panic!("prompt should stay open");
         };
-        assert_eq!(browser.current_dir, dir);
-        // Descend persists the new directory.
-        h.key(KeyCode::Enter);
-        let Some(Pane::Browser(browser)) = &h.app.pane else {
-            panic!("browser should still be open");
-        };
-        assert_eq!(browser.current_dir, sub);
-        assert_eq!(h.saved_dirs.lock().as_slice(), &[sub.clone()]);
-        // Close and reopen: still at the subdirectory.
-        h.key(KeyCode::Char('b'));
-        assert!(h.app.pane.is_none());
-        h.key(KeyCode::Char('b'));
-        let Some(Pane::Browser(browser)) = &h.app.pane else {
-            panic!("browser should reopen");
-        };
-        assert_eq!(browser.current_dir, sub);
-        std::fs::remove_dir_all(&dir).ok();
-    }
-
-    #[test]
-    fn removed_saved_folder_falls_back_to_home_with_warning() {
-        let home = temp_dir("home");
-        std::fs::create_dir_all(&home).unwrap();
-        let gone = temp_dir("gone");
-        // Never created: the saved folder is missing.
-        let mut h = harness(Vec::new());
-        h.app.state.last_browser_dir = Some(gone.clone());
-        h.app.state.home_dir = Some(home.clone());
-        h.key(KeyCode::Char('b'));
-        let Some(Pane::Browser(browser)) = &h.app.pane else {
-            panic!("browser should fall back to home");
-        };
-        assert_eq!(browser.current_dir, home);
-        assert!(h.app.state.status.contains("unreadable"));
-        std::fs::remove_dir_all(&home).ok();
-    }
-
-    #[test]
-    fn startup_never_uses_process_working_directory() {
-        let mut opts = options();
-        opts.open_browser = true;
-        opts.initial_browser_dir = None;
-        opts.home_dir = Some(temp_dir("home2"));
-        std::fs::create_dir_all(opts.home_dir.as_ref().unwrap()).unwrap();
-        let (commands, _sent) = crossbeam_channel::unbounded();
-        let app = App::new(opts, noop_hooks(Vec::new()), commands);
-        let Some(Pane::Browser(browser)) = &app.pane else {
-            panic!("browser should open at startup");
-        };
-        assert_ne!(
-            browser.current_dir,
-            std::env::current_dir().unwrap(),
-            "process cwd must never be the default"
+        assert_eq!(prompt.buffer, "qsnr ?");
+        assert!(h.sent.try_recv().is_err());
+        assert!(
+            h.app
+                .handle_key_event(KeyEvent::new(KeyCode::Char('q'), KeyModifiers::CONTROL))
         );
-        std::fs::remove_dir_all(browser.current_dir.clone()).ok();
     }
 
     #[test]
-    fn saved_folder_reopens_on_new_app_launch() {
-        let root = temp_dir("relaunch");
-        let sub = root.join("album");
-        std::fs::create_dir_all(&sub).unwrap();
-        let mut first = harness(Vec::new());
-        first.app.state.last_browser_dir = Some(root.clone());
-        first.key(KeyCode::Char('b'));
-        first.key(KeyCode::Enter);
-        let saved = first.saved_dirs.lock().last().cloned().unwrap();
-        let mut opts = options();
-        opts.open_browser = true;
-        opts.initial_browser_dir = Some(saved);
-        let (commands, _) = crossbeam_channel::unbounded();
-        let relaunched = App::new(opts, noop_hooks(Vec::new()), commands);
-        let Some(Pane::Browser(browser)) = &relaunched.pane else {
-            panic!("browser should open at saved path");
-        };
-        assert_eq!(browser.current_dir, sub);
+    fn queue_snapshot_reconciles_selection_by_id() {
+        let mut h = harness();
+        h.app.apply_event(PlayerEvent::QueueChanged {
+            audible: None,
+            pending: vec![
+                QueueItem {
+                    id: 1,
+                    entry: QueueEntry::from(PathBuf::from("/a.flac")),
+                },
+                QueueItem {
+                    id: 2,
+                    entry: QueueEntry::from(PathBuf::from("/b.flac")),
+                },
+            ],
+        });
+        h.app.focus = Focus::Queue;
+        h.app.queue_selected = Some(2);
+        h.app.apply_event(PlayerEvent::QueueChanged {
+            audible: None,
+            pending: vec![QueueItem {
+                id: 2,
+                entry: QueueEntry::from(PathBuf::from("/b.flac")),
+            }],
+        });
+        assert_eq!(h.app.queue_selected, Some(2));
+        h.app.apply_event(PlayerEvent::QueueChanged {
+            audible: None,
+            pending: Vec::new(),
+        });
+        assert_eq!(h.app.queue_selected, None);
+    }
+
+    #[test]
+    fn playlist_dirty_save_failure_retry_and_quit_prompt() {
+        let mut h = harness();
+        h.app.catalog_create("Chill".to_owned());
+        assert!(h.app.has_unsaved_catalog());
+        assert!(!h.key(KeyCode::Char('q')));
+        assert!(matches!(
+            h.app.mode,
+            Mode::Prompt(Prompt {
+                kind: PromptKind::QuitConfirm,
+                ..
+            })
+        ));
+        h.key(KeyCode::Esc);
+        assert!(h.app.has_unsaved_catalog());
+        h.app.save_catalog();
+        assert!(!h.app.has_unsaved_catalog());
+        assert_eq!(h.saves.lock().len(), 1);
+        assert!(h.key(KeyCode::Char('q')));
+    }
+
+    #[test]
+    fn tiny_draw_and_resize_restore_do_not_panic() {
+        let h = harness();
+        for (w, hgt) in [(1, 1), (40, 12), (79, 23), (80, 24), (140, 40)] {
+            let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(w, hgt)).unwrap();
+            terminal.draw(|frame| draw(frame, &h.app)).unwrap();
+            assert_eq!(terminal.backend().buffer().area, Rect::new(0, 0, w, hgt));
+        }
+    }
+
+    fn temp_dir(tag: &str) -> PathBuf {
+        std::env::temp_dir().join(format!(
+            "sointty-tui-{tag}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos(),
+        ))
+    }
+
+    fn item(id: TrackId, path: impl Into<PathBuf>) -> QueueItem {
+        QueueItem {
+            id,
+            entry: QueueEntry::from(path.into()),
+        }
+    }
+
+    #[test]
+    fn library_enter_plays_now_a_only_queues_and_folder_skips_junk() {
+        let root = temp_dir("library-actions");
+        let folder = root.join("folder");
+        std::fs::create_dir_all(&folder).unwrap();
+        let real = root.join("01-Track.flac");
+        std::fs::write(&real, b"").unwrap();
+        std::fs::write(root.join("._01-Track.flac"), b"").unwrap();
+        std::fs::write(root.join(".hidden.flac"), b"").unwrap();
+        std::fs::write(root.join("Thumbs.db"), b"").unwrap();
+        let nested = folder.join("nested.wav");
+        std::fs::write(&nested, b"").unwrap();
+        std::fs::write(folder.join("._nested.wav"), b"").unwrap();
+        let mut h = harness();
+        h.app.browser = Some(Browser::open(root.clone()).unwrap());
+        // Directory first; choose the real audio file.
+        h.app.browser.as_mut().unwrap().selected = 1;
+        assert_eq!(h.app.browser.as_ref().unwrap().items.len(), 2);
+        h.key(KeyCode::Enter);
+        assert!(
+            matches!(h.sent.recv().unwrap(), PlayerCommand::PlayNow(entry) if entry.path == real)
+        );
+        h.key(KeyCode::Char('a'));
+        assert!(
+            matches!(h.sent.recv().unwrap(), PlayerCommand::Enqueue(entry) if entry.path == real)
+        );
+        assert!(h.sent.try_recv().is_err(), "a must not send Play");
+        h.app.browser.as_mut().unwrap().selected = 0;
+        h.key(KeyCode::Char('a'));
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while h.app.collect_op.is_some() && Instant::now() < deadline {
+            h.app.poll_collect();
+            std::thread::yield_now();
+        }
+        assert!(
+            h.app.collect_op.is_none(),
+            "folder collection must complete"
+        );
+        assert!(
+            matches!(h.sent.recv().unwrap(), PlayerCommand::Enqueue(entry) if entry.path == nested)
+        );
+        assert!(
+            h.sent.try_recv().is_err(),
+            "folder add enqueues exactly one real file"
+        );
         std::fs::remove_dir_all(root).unwrap();
     }
 
-    // ---- folder adds ----------------------------------------------------------
-
     #[test]
-    fn adding_folder_collects_audio_only_in_deterministic_order() {
-        let dir = temp_dir("collect");
-        std::fs::create_dir_all(dir.join("nested")).unwrap();
-        std::fs::write(dir.join("A.flac"), b"").unwrap();
-        std::fs::write(dir.join("nested").join("b.mp3"), b"").unwrap();
-        std::fs::write(dir.join("album.cue"), b"").unwrap();
-        std::fs::write(dir.join("album.m3u8"), b"").unwrap();
-        let browser = Browser::open(dir.clone()).unwrap();
-        let mut h = harness(Vec::new());
-        h.app.pane = Some(Pane::Browser(browser));
-        h.key(KeyCode::Char('A'));
-        let names: Vec<String> = h.app.state.catalog.playlists[0]
-            .entries
-            .iter()
-            .map(|entry| {
-                entry.path.file_name().unwrap().to_string_lossy().into_owned()
-            })
-            .collect();
-        assert_eq!(names, ["b.mp3", "A.flac"]);
-        assert_eq!(h.saved_catalogs.lock().len(), 1);
-        // No playback command: the live queue is untouched.
-        assert!(h.sent.try_recv().is_err());
-        std::fs::remove_dir_all(&dir).ok();
-    }
-
-    #[test]
-    fn empty_folder_add_reports_zero_without_save() {
-        let dir = temp_dir("empty");
-        std::fs::create_dir_all(&dir).unwrap();
-        let browser = Browser::open(dir.clone()).unwrap();
-        let mut h = harness(Vec::new());
-        h.app.pane = Some(Pane::Browser(browser));
-        h.key(KeyCode::Char('A'));
-        assert!(h.app.state.status.contains("no audio files"));
-        assert!(h.saved_catalogs.lock().is_empty());
-        assert!(h.app.state.catalog.playlists[0].entries.is_empty());
-        std::fs::remove_dir_all(&dir).ok();
-    }
-
-    // ---- playlists -------------------------------------------------------------
-
-    #[test]
-    fn removed_folder_add_aborts_without_partial_save() {
-        let dir = temp_dir("removed-add");
-        std::fs::create_dir_all(&dir).unwrap();
-        std::fs::write(dir.join("track.flac"), b"").unwrap();
-        let browser = Browser::open(dir.clone()).unwrap();
-        let mut h = harness(Vec::new());
-        h.app.pane = Some(Pane::Browser(browser));
-        std::fs::remove_dir_all(&dir).unwrap();
-        h.key(KeyCode::Char('A'));
-        assert!(h.app.state.status.contains("nothing added"));
-        assert!(h.saved_catalogs.lock().is_empty());
-        assert!(h.app.state.catalog.selected_playlist().entries.is_empty());
-    }
-
-    #[test]
-    fn create_rename_delete_playlists() {
-        let mut h = harness(Vec::new());
-        h.app.catalog_create("Chill".to_owned());
-        assert_eq!(h.app.state.catalog.playlists.len(), 2);
-        assert_eq!(h.app.state.catalog.selected, 1);
-        // Duplicate names rejected case-insensitively.
-        h.app.catalog_create("chill".to_owned());
-        assert_eq!(h.app.state.catalog.playlists.len(), 2);
-        assert!(h.app.state.status.contains("already exists"));
-        h.app.catalog_rename("Chill 2".to_owned());
-        assert_eq!(h.app.state.catalog.playlists[1].name, "Chill 2");
-        h.app.catalog_delete();
-        assert_eq!(h.app.state.catalog.playlists.len(), 1);
-        assert_eq!(h.app.state.catalog.selected, 0);
-        // The final list cannot be deleted.
-        h.app.catalog_delete();
-        assert_eq!(h.app.state.catalog.playlists.len(), 1);
-        assert!(h.app.state.status.contains("final"));
-    }
-
-    #[test]
-    fn switching_lists_never_touches_live_queue() {
-        let mut h = harness(Vec::new());
-        h.app.catalog_create("Second".to_owned());
-        h.app.state.pending = vec![QueueItem {
-            id: 7,
-            entry: QueueEntry::from(PathBuf::from("/music/playing.flac")),
-        }];
-        h.app.catalog_select(0);
-        assert_eq!(h.app.state.pending.len(), 1);
-        assert_eq!(h.app.state.pending[0].id, 7);
-        assert!(h.sent.try_recv().is_err(), "no playback commands on switch");
-    }
-
-    #[test]
-    fn playlist_entry_enter_queues_and_plays_when_idle() {
-        let mut h = harness(Vec::new());
-        h.app.state.catalog.playlists[0].entries.push(QueueEntry::from(PathBuf::from("/t.flac")));
-        h.key(KeyCode::Char('p'));
-        h.key(KeyCode::Tab); // focus entries
-        h.key(KeyCode::Enter);
-        assert!(matches!(h.sent.recv().unwrap(), PlayerCommand::Enqueue(_)));
-        assert!(matches!(h.sent.recv().unwrap(), PlayerCommand::Play));
-    }
-
-    #[test]
-    fn playlist_entry_enter_does_not_restart_while_playing() {
-        let mut h = harness(Vec::new());
-        h.app.state.catalog.playlists[0].entries.push(QueueEntry::from(PathBuf::from("/t.flac")));
-        h.app.state.audible = Some(QueueItem {
-            id: 3,
-            entry: QueueEntry::from(PathBuf::from("/now.flac")),
+    fn queue_focus_uses_engine_ids_and_past_is_ui_only() {
+        let mut h = harness();
+        h.app.apply_event(PlayerEvent::QueueChanged {
+            audible: Some(item(1, "/now.flac")),
+            pending: vec![item(2, "/next.flac"), item(3, "/later.flac")],
         });
-        h.key(KeyCode::Char('p'));
-        h.key(KeyCode::Tab);
-        h.key(KeyCode::Enter);
-        assert!(matches!(h.sent.recv().unwrap(), PlayerCommand::Enqueue(_)));
-        assert!(h.sent.try_recv().is_err(), "no Play while audible");
-    }
-
-    #[test]
-    fn highlighted_playlist_and_song_append_without_selecting_or_restarting() {
-        let mut h = harness(Vec::new());
-        let first = QueueEntry::from(PathBuf::from("first.flac"));
-        let second = QueueEntry::from(PathBuf::from("second.flac"));
-        h.app.state.catalog.playlists.push(SavedPlaylist {
-            name: "Second".to_owned(),
-            entries: vec![first.clone(), second.clone()],
-        });
-        h.app.state.audible = Some(QueueItem {
-            id: 4,
-            entry: QueueEntry::from(PathBuf::from("playing.flac")),
-        });
-        h.key(KeyCode::Char('p'));
-        h.key(KeyCode::Down); // highlighted but not the selected saved list
-        h.key(KeyCode::Char('a'));
-        assert!(matches!(h.sent.recv().unwrap(), PlayerCommand::Enqueue(entry) if entry == first));
-        assert!(matches!(h.sent.recv().unwrap(), PlayerCommand::Enqueue(entry) if entry == second));
-        assert_eq!(h.app.state.catalog.selected, 0);
-        assert!(h.sent.try_recv().is_err(), "adding a whole list must not restart playback");
-        h.key(KeyCode::Tab); // entries of the highlighted list
+        h.app.focus = Focus::Queue;
+        h.app.queue_selected = Some(2);
+        h.key(KeyCode::Char('d'));
+        assert!(matches!(
+            h.sent.recv().unwrap(),
+            PlayerCommand::RemoveQueueEntry(2)
+        ));
+        h.key(KeyCode::Char('m'));
+        assert!(matches!(
+            h.app.mode,
+            Mode::Move(MoveOverlay::Queue { id: 2, .. })
+        ));
         h.key(KeyCode::Down);
-        h.key(KeyCode::Char('a'));
-        assert!(matches!(h.sent.recv().unwrap(), PlayerCommand::Enqueue(entry) if entry == second));
-        assert!(h.sent.try_recv().is_err(), "one song must not restart playback");
-        h.key(KeyCode::Char('A'));
-        assert!(matches!(h.sent.recv().unwrap(), PlayerCommand::Enqueue(entry) if entry == first));
-        assert!(matches!(h.sent.recv().unwrap(), PlayerCommand::Enqueue(entry) if entry == second));
-        assert!(h.sent.try_recv().is_err());
-    }
-
-    #[test]
-    fn focused_visible_playlist_queues_whole_list_in_order() {
-        let mut h = harness(Vec::new());
-        let first = QueueEntry::from(PathBuf::from("a.flac"));
-        let second = QueueEntry::from(PathBuf::from("b.flac"));
-        h.app.state.catalog.playlists[0].entries = vec![first.clone(), second.clone()];
-        h.key(KeyCode::Char('f'));
-        h.key(KeyCode::Char('A'));
-        assert!(matches!(h.sent.recv().unwrap(), PlayerCommand::Enqueue(entry) if entry == first));
-        assert!(matches!(h.sent.recv().unwrap(), PlayerCommand::Enqueue(entry) if entry == second));
-        assert!(matches!(h.sent.recv().unwrap(), PlayerCommand::Play));
-        assert!(h.sent.try_recv().is_err());
-    }
-
-    #[test]
-    fn random_play_toggle_from_queue_menu_and_key() {
-        let mut h = harness(Vec::new());
-        h.key(KeyCode::Char('m'));
-        h.app.dispatch(MenuAction::OpenQueue);
-        h.app.dispatch(MenuAction::QueueToggleShuffle);
-        assert!(h.app.state.shuffle);
-        assert!(matches!(h.sent.recv().unwrap(), PlayerCommand::SetShuffle(true)));
-        h.key(KeyCode::Char('r'));
-        assert!(!h.app.state.shuffle);
-        assert!(matches!(h.sent.recv().unwrap(), PlayerCommand::SetShuffle(false)));
-        assert!(h.sent.try_recv().is_err());
-    }
-
-    #[test]
-    fn malformed_catalog_disables_edits() {
-        let mut opts = options();
-        opts.catalog_error = Some("/data/playlists.toml: bad toml".to_owned());
-        let (commands, _sent) = crossbeam_channel::unbounded();
-        let mut app = App::new(opts, noop_hooks(Vec::new()), commands);
-        app.catalog_create("Nope".to_owned());
-        assert_eq!(app.state.catalog.playlists.len(), 1, "edit must be rejected");
-        assert!(app.state.status.contains("read-only"));
-        assert!(app.state.status.contains("/data/playlists.toml"));
-    }
-
-    #[test]
-    fn failed_catalog_save_keeps_prior_model() {
-        let (commands, _sent) = crossbeam_channel::unbounded();
-        let mut hooks = noop_hooks(Vec::new());
-        hooks.on_catalog = Box::new(|_| Err("disk full".to_owned()));
-        let mut app = App::new(options(), hooks, commands);
-        app.catalog_create("Nope".to_owned());
-        assert_eq!(app.state.catalog.playlists.len(), 1, "failed save must not commit");
-        assert!(app.state.status.contains("not saved"));
-    }
-
-    #[test]
-    fn import_cue_preserves_ranges_and_duplicate_paths() {
-        let dir = temp_dir("cue");
-        std::fs::create_dir_all(&dir).unwrap();
-        std::fs::write(dir.join("album.wav"), b"").unwrap();
-        std::fs::write(
-            dir.join("album.cue"),
-            "FILE \"album.wav\" WAVE\nTRACK 01 AUDIO\nINDEX 01 00:00:00\nTRACK 02 AUDIO\nINDEX 01 01:00:00\n",
-        )
-        .unwrap();
-        let mut h = harness(Vec::new());
-        h.app.catalog_import(dir.join("album.cue"), "Album".to_owned());
-        let playlist = &h.app.state.catalog.playlists[1];
-        assert_eq!(playlist.entries.len(), 2);
-        assert_eq!(playlist.entries[0].path, playlist.entries[1].path);
-        assert_eq!(
-            playlist.entries[0].cue_range.unwrap().start_cd,
-            0,
-        );
-        assert!(playlist.entries[0].cue_range.unwrap().end_cd.is_some());
-        assert!(playlist.entries[1].cue_range.unwrap().end_cd.is_none());
-        std::fs::remove_dir_all(&dir).ok();
-    }
-
-    // ---- timing ----------------------------------------------------------------
-
-    #[test]
-    fn timing_auto_clears_overrides_and_custom_validates() {
-        let mut h = harness(Vec::new());
-        h.app.set_timing(Some(1_024), Some(4_096));
-        assert_eq!(h.app.state.timing, (Some(1_024), Some(4_096)));
+        h.key(KeyCode::Enter);
         assert!(matches!(
             h.sent.recv().unwrap(),
-            PlayerCommand::SetTiming { period_frames: Some(1_024), buffer_frames: Some(4_096) }
+            PlayerCommand::MoveQueueEntry {
+                id: 2,
+                before: Some(3)
+            }
         ));
-        // Undersized buffer is rejected without a save or command.
-        h.app.set_timing(Some(4_096), Some(1_024));
-        assert_eq!(h.app.state.timing, (Some(1_024), Some(4_096)));
-        assert!(h.app.state.status.contains("twice"));
-        // Auto clears both fields.
-        h.app.set_timing(None, None);
-        assert_eq!(h.app.state.timing, (None, None));
+        h.app.queue_selected = Some(3);
+        h.key(KeyCode::Enter);
         assert!(matches!(
             h.sent.recv().unwrap(),
-            PlayerCommand::SetTiming { period_frames: None, buffer_frames: None }
+            PlayerCommand::JumpToQueueEntry(3)
         ));
-        assert_eq!(
-            h.saved_timing.lock().as_slice(),
-            &[(Some(1_024), Some(4_096)), (None, None)]
-        );
+        h.app.queue_selected = Some(1);
+        h.key(KeyCode::Char('d'));
+        assert!(h.app.state.status.contains("read-only"));
+        assert!(h.sent.try_recv().is_err());
+        // Only a different audible ID advances history.
+        h.app.apply_event(PlayerEvent::Paused);
+        h.app.apply_event(PlayerEvent::QueueChanged {
+            audible: Some(item(1, "/now.flac")),
+            pending: vec![item(2, "/next.flac")],
+        });
+        assert!(h.app.past.is_empty());
+        h.app.apply_event(PlayerEvent::QueueChanged {
+            audible: Some(item(2, "/next.flac")),
+            pending: Vec::new(),
+        });
+        assert_eq!(h.app.past.front().unwrap().id, 1);
+        h.app.apply_event(PlayerEvent::EndOfQueue);
+        assert_eq!(h.app.past.back().unwrap().id, 2);
+        h.key(KeyCode::Char('c'));
+        assert!(h.app.past.is_empty());
+        assert!(h.sent.try_recv().is_err(), "c clears only local history");
     }
 
-    // ---- menu -------------------------------------------------------------------
-
     #[test]
-    fn menu_navigates_and_quit_exits() {
-        let mut h = harness(Vec::new());
+    fn playlist_block_move_preserves_duplicate_paths_and_cue_ranges() {
+        let mut h = harness();
+        use sointty_core::CueRange;
+        let image = PathBuf::from("/album/image.wav");
+        let a = QueueEntry {
+            path: image.clone(),
+            cue_range: Some(CueRange {
+                start_cd: 0,
+                end_cd: Some(75),
+            }),
+        };
+        let c = QueueEntry {
+            path: image,
+            cue_range: Some(CueRange {
+                start_cd: 75,
+                end_cd: None,
+            }),
+        };
+        let b = QueueEntry::from(PathBuf::from("/b.flac"));
+        let d = QueueEntry::from(PathBuf::from("/d.flac"));
+        let e = QueueEntry::from(PathBuf::from("/e.flac"));
+        h.app.state.catalog.playlists[0].entries =
+            vec![a.clone(), b.clone(), c.clone(), d.clone(), e.clone()];
+        h.app.screen = Screen::Playlists;
+        h.app.focus = Focus::PlaylistTracks;
+        h.app.playlist_selected = [0, 2].into();
         h.key(KeyCode::Char('m'));
-        assert!(matches!(h.app.pane, Some(Pane::Menu(_))));
-        // Bottom item is Quit.
-        for _ in 0..7 {
+        for _ in 0..3 {
             h.key(KeyCode::Down);
         }
-        assert!(h.key(KeyCode::Enter), "Quit must exit");
-    }
-
-    #[test]
-    fn menu_esc_pops_submenu_before_closing() {
-        let mut h = harness(Vec::new());
-        h.key(KeyCode::Char('m'));
-        // Locations item opens the Locations submenu.
-        h.key(KeyCode::Down);
         h.key(KeyCode::Enter);
-        let Some(Pane::Menu(menu)) = &h.app.pane else {
-            panic!("menu should be open");
-        };
-        assert_eq!(menu.stack.len(), 2);
-        h.key(KeyCode::Esc);
-        let Some(Pane::Menu(menu)) = &h.app.pane else {
-            panic!("menu should still be open");
-        };
-        assert_eq!(menu.stack.len(), 1);
-        h.key(KeyCode::Esc);
-        assert!(h.app.pane.is_none());
+        assert_eq!(
+            h.app.state.catalog.playlists[0].entries,
+            vec![b.clone(), d.clone(), e.clone(), a.clone(), c.clone()]
+        );
+        assert!(h.app.playlist_selected.is_empty());
+        assert_eq!(h.app.playlist_track_sel, 3);
+        assert!(h.app.dirty_playlists.contains(&0));
+        // Remove one of the duplicate image paths by ROW INDEX, not path.
+        h.app.playlist_selected = [3].into();
+        h.key(KeyCode::Char('d'));
+        assert_eq!(h.app.state.catalog.playlists[0].entries, vec![b, d, e, c]);
+        assert_eq!(
+            h.app.state.catalog.playlists[0].entries[3]
+                .cue_range
+                .unwrap()
+                .start_cd,
+            75
+        );
+        assert!(
+            h.sent.try_recv().is_err(),
+            "catalog edits never touch playback"
+        );
     }
 
     #[test]
-    fn keyboard_footer_tracks_browser_playlist_focus_and_input() {
-        fn screen(app: &App) -> String {
-            let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(80, 24)).unwrap();
-            terminal.draw(|frame| draw(frame, app)).unwrap();
-            let buffer = terminal.backend().buffer();
-            (0..24).map(|y| {
-                (0..80).map(|x| buffer[(x, y)].symbol()).collect::<String>()
-            }).collect::<Vec<_>>().join("\n")
-        }
-
-        let dir = temp_dir("key-hints");
-        std::fs::create_dir_all(&dir).unwrap();
-        let mut h = harness(Vec::new());
-        h.app.pane = Some(Pane::Browser(Browser::open(dir.clone()).unwrap()));
-        let browser = screen(&h.app);
-        assert!(browser.contains("q Quit | ? Help"), "{browser}");
-        assert!(browser.contains("a Add | A Add folder | f Focus"), "{browser}");
-        h.key(KeyCode::Char('p'));
-        let names = screen(&h.app);
-        assert!(names.contains("a/A Queue list | Tab Songs"), "{names}");
-        h.key(KeyCode::Tab);
-        let entries = screen(&h.app);
-        assert!(entries.contains("Enter/a Queue song | A Queue list"), "{entries}");
-        h.app.start_input("New playlist name:", InputAction::PlaylistCreate);
-        let input = screen(&h.app);
-        assert!(input.contains("Ctrl+Q Quit immediately from input"), "{input}");
-        assert!(!input.contains("q Quit | ? Help"), "{input}");
-        std::fs::remove_dir_all(dir).unwrap();
-    }
-
-    #[test]
-    fn quit_bypasses_nested_menus_and_text_input_requires_control_q() {
-        let mut h = harness(Vec::new());
-        h.key(KeyCode::Char('m'));
-        h.app.dispatch(MenuAction::OpenQueue);
-        h.key(KeyCode::Char('?'));
-        let Some(Pane::Menu(menu)) = &h.app.pane else {
-            panic!("help must open as a menu");
-        };
-        assert_eq!(menu.stack.last().unwrap().0, "Help");
-        assert!(h.key(KeyCode::Char('q')), "q exits from a nested menu in one press");
-
-        h.app.start_input("Name:", InputAction::PlaylistCreate);
-        assert!(!h.app.handle_key_event(KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE)));
-        let Some(Pane::Input(input)) = &h.app.pane else {
-            panic!("q must remain valid input");
-        };
-        assert_eq!(input.buffer, "q");
-        assert!(h.app.handle_key_event(KeyEvent::new(
-            KeyCode::Char('q'), KeyModifiers::CONTROL
-        )), "Ctrl+Q exits directly from input");
-    }
-
-    // ---- input ------------------------------------------------------------------
-
-    #[test]
-    fn input_owns_text_keys() {
-        let mut h = harness(Vec::new());
-        h.app.start_input("Name:", InputAction::PlaylistCreate);
-        // These would be transport, queue-control, or quit keys globally.
-        for ch in ['q', 's', 'n', 'r', ' '] {
-            assert!(!h.key(KeyCode::Char(ch)), "input must not quit");
-        }
-        let Some(Pane::Input(input)) = &h.app.pane else {
-            panic!("input should be open");
-        };
-        assert_eq!(input.buffer, "qsnr ");
-        h.key(KeyCode::Esc);
-        assert!(h.app.pane.is_none());
-        assert!(h.sent.try_recv().is_err(), "no commands leaked from input");
-    }
-
-    #[test]
-    fn tab_toggles_right_view_outside_playlists() {
-        let mut h = harness(Vec::new());
-        assert_eq!(h.app.right, RightView::SavedList);
-        h.key(KeyCode::Tab);
-        assert_eq!(h.app.right, RightView::Queue);
-        h.key(KeyCode::Tab);
-        assert_eq!(h.app.right, RightView::SavedList);
-    }
-
-    #[test]
-    fn browser_root_opens_drives_and_cancel_restores_browser() {
-        let root = std::env::current_dir().unwrap()
-            .ancestors().last().unwrap().to_path_buf();
-        let other = temp_dir("different-drive");
-        std::fs::create_dir_all(&other).unwrap();
-        let mut h = harness(Vec::new());
-        h.app.hooks.locations = Box::new({
-            let root = root.clone();
-            let other = other.clone();
-            move || Ok(vec![
-                Location {
-                    label: root.display().to_string(),
-                    path: root.clone(),
-                    mapped_network: false,
-                },
-                Location {
-                    label: other.display().to_string(),
-                    path: other.clone(),
-                    mapped_network: false,
-                },
-            ])
+    fn picker_new_playlist_appends_pending_entry_without_playback() {
+        let mut h = harness();
+        let entry = QueueEntry::from(PathBuf::from("/music/pick.flac"));
+        h.app.mode = Mode::PlaylistPicker(PlaylistPicker {
+            entries: vec![entry.clone()],
+            selected: 1,
         });
-        h.app.pane = Some(Pane::Browser(Browser::open(root.clone()).unwrap()));
-        h.key(KeyCode::Backspace);
-        assert!(matches!(h.app.pane, Some(Pane::Locations(_))));
-        h.key(KeyCode::Esc);
-        let Some(Pane::Browser(browser)) = &h.app.pane else {
-            panic!("canceled drive selection must restore browser");
-        };
-        assert_eq!(browser.current_dir, root);
-        assert!(h.saved_dirs.lock().is_empty(), "no fictitious directory saved");
-
-        h.key(KeyCode::Backspace);
-        h.key(KeyCode::Down);
         h.key(KeyCode::Enter);
-        let Some(Pane::Browser(browser)) = &h.app.pane else {
-            panic!("selecting a location must browse its path");
-        };
-        assert_eq!(browser.current_dir, other);
-        assert_eq!(h.saved_dirs.lock().as_slice(), [other.clone()]);
-        std::fs::remove_dir_all(&other).ok();
-    }
-
-    #[test]
-    fn focused_visible_playlist_plays_selected_entry_without_replacing_list() {
-        let mut h = harness(Vec::new());
-        let first = QueueEntry::from(PathBuf::from("first.flac"));
-        let second = QueueEntry::from(PathBuf::from("second.flac"));
-        h.app.state.catalog.playlists[0].entries = vec![first, second.clone()];
-        h.key(KeyCode::Char('f'));
-        assert!(h.app.right_focused);
-        h.key(KeyCode::Down);
+        assert!(matches!(h.app.mode, Mode::Prompt(_)));
+        for ch in "Picked".chars() {
+            h.key(KeyCode::Char(ch));
+        }
         h.key(KeyCode::Enter);
-        assert!(matches!(h.sent.recv().unwrap(), PlayerCommand::Enqueue(entry) if entry == second));
-        assert!(matches!(h.sent.recv().unwrap(), PlayerCommand::Play));
+        assert_eq!(h.app.state.catalog.playlists.len(), 2);
+        assert_eq!(h.app.state.catalog.playlists[1].entries, vec![entry]);
+        assert!(h.app.dirty_playlists.contains(&1));
+        assert!(h.app.catalog_dirty);
+        assert!(matches!(h.app.mode, Mode::Normal));
         assert!(h.sent.try_recv().is_err());
-        assert_eq!(h.app.state.catalog.selected_playlist().entries.len(), 2);
-        h.key(KeyCode::Esc);
-        assert!(!h.app.right_focused);
-        h.key(KeyCode::Tab);
-        assert_eq!(h.app.right, RightView::Queue);
     }
 
     #[test]
-    fn canceling_locations_path_prompt_restores_locations_pane() {
-        let mut h = harness(Vec::new());
-        h.key(KeyCode::Char('l'));
-        assert!(matches!(h.app.pane, Some(Pane::Locations(_))));
-        h.app.start_input("Path:", InputAction::LocationPath);
-        assert!(matches!(h.app.pane, Some(Pane::Input(_))));
-        h.key(KeyCode::Esc);
-        let Some(Pane::Locations(_)) = &h.app.pane else {
-            panic!("Esc must restore the Locations pane");
-        };
+    fn dirty_save_failure_retry_and_quit_yes_no_escape() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let mut h = harness();
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let attempts_for_hook = Arc::clone(&attempts);
+        h.app.hooks.on_catalog = Box::new(move |_| {
+            if attempts_for_hook.fetch_add(1, Ordering::SeqCst) == 0 {
+                Err("disk full".to_owned())
+            } else {
+                Ok(())
+            }
+        });
+        h.app.catalog_create("Chill".to_owned());
+        assert!(!h.key(KeyCode::Char('q')));
+        h.key(KeyCode::Esc); // cancel quit
+        assert!(h.app.has_unsaved_catalog());
+        assert!(!h.app.save_catalog());
+        assert!(h.app.state.status.contains("disk full"));
+        assert!(h.app.has_unsaved_catalog());
+        assert!(!h.key(KeyCode::Char('q')));
+        assert!(h.key(KeyCode::Char('y')), "retry save succeeds, then exits");
+        assert!(!h.app.has_unsaved_catalog());
+        assert_eq!(attempts.load(Ordering::SeqCst), 2);
+
+        let mut no = harness();
+        no.app.catalog_create("Unsaved".to_owned());
+        assert!(!no.key(KeyCode::Char('q')));
+        assert!(no.key(KeyCode::Char('n')), "discard exits without saving");
+        assert!(no.saves.lock().is_empty());
+
+        let mut read_only = harness();
+        read_only.app.state.catalog_error = Some("/data/playlists.toml: bad toml".to_owned());
+        assert!(!read_only.app.catalog_create("Denied".to_owned()));
+        assert_eq!(read_only.app.state.catalog.playlists.len(), 1);
+        assert!(read_only.app.state.status.contains("read-only"));
+        assert!(read_only.saves.lock().is_empty());
     }
 
     #[test]
-    fn failed_locations_path_restores_locations_pane() {
-        let mut h = harness(Vec::new());
-        h.key(KeyCode::Char('l'));
-        h.app.start_input("Path:", InputAction::LocationPath);
-        for ch in "/definitely/not/a/real/dir".chars() {
-            h.key(KeyCode::Char(ch));
-        }
-        h.key(KeyCode::Enter);
-        assert!(h.app.state.status.contains("cannot open"));
-        let Some(Pane::Locations(_)) = &h.app.pane else {
-            panic!("a failed path must restore the Locations pane");
+    fn same_track_seek_preserves_tags_but_refreshes_verdict_and_duration() {
+        use sointty_core::{ChannelLayout, SampleEncoding, StreamSpec};
+        let mut h = harness();
+        h.app.apply_event(PlayerEvent::QueueChanged {
+            audible: Some(item(7, "/music/song.wav")),
+            pending: Vec::new(),
+        });
+        let source = DecodedSpec::Pcm(StreamSpec {
+            rate_hz: 44_100,
+            layout: ChannelLayout::discrete(2),
+            encoding: SampleEncoding::S16,
+        });
+        let buffers = BufferConfig {
+            period_frames: 1_024,
+            buffer_frames: 4_096,
+            ring_frames: 16_384,
         };
-    }
-
-    #[test]
-    fn failing_map_drive_restores_locations_pane() {
-        let mut h = harness(Vec::new());
-        h.app.hooks.map_drive = Some(Box::new(|_, _| Err("OS error 85".to_owned())));
-        h.key(KeyCode::Char('l'));
-        h.app.start_input("Drive letter:", InputAction::MapDriveLetter);
-        h.key(KeyCode::Char('Z'));
-        h.key(KeyCode::Enter);
-        // Second prompt in the chain: share path.
-        let Some(Pane::Input(input)) = &h.app.pane else {
-            panic!("share prompt should follow the letter");
+        let output = OutputSpec {
+            device: "dev1".to_owned(),
+            rate_hz: 44_100,
+            layout: ChannelLayout::discrete(2),
+            format: DeviceFormat::S16Le,
+            valid_bits: 16,
         };
-        assert!(matches!(input.action, InputAction::MapDriveShare('Z')));
-        for ch in "\\\\nas\\music".chars() {
-            h.key(KeyCode::Char(ch));
-        }
-        h.key(KeyCode::Enter);
-        let action = h.app.pending_os.take().unwrap();
-        h.app.run_os_action(action);
-        assert_eq!(h.app.state.status, "OS error 85");
-        let Some(Pane::Locations(_)) = &h.app.pane else {
-            panic!("a failed mapping must restore the Locations pane");
-        };
-    }
-
-    #[test]
-    fn successful_map_drive_opens_browser_and_drops_origin() {
-        let root = temp_dir("mapped");
-        std::fs::create_dir_all(&root).unwrap();
-        let mapped = root.clone();
-        let mut h = harness(Vec::new());
-        h.app.hooks.map_drive = Some(Box::new(move |_, _| Ok(mapped.clone())));
-        h.key(KeyCode::Char('l'));
-        h.app.start_input("Drive letter:", InputAction::MapDriveLetter);
-        h.key(KeyCode::Char('Z'));
-        h.key(KeyCode::Enter);
-        for ch in "\\\\nas\\music".chars() {
-            h.key(KeyCode::Char(ch));
-        }
-        h.key(KeyCode::Enter);
-        let action = h.app.pending_os.take().unwrap();
-        h.app.run_os_action(action);
-        let Some(Pane::Browser(browser)) = &h.app.pane else {
-            panic!("successful mapping must open the browser");
-        };
-        assert_eq!(browser.current_dir, root);
-        assert!(h.app.input_origin.is_none());
-        std::fs::remove_dir_all(&root).ok();
-    }
-
-    #[test]
-    fn playback_duration_correlates_with_track_and_progress_is_visible() {
-        let mut h = harness(Vec::new());
         h.app.apply_event(PlayerEvent::Playing {
             track: 7,
-            output: OutputSpec {
-                device: "dev1".to_owned(),
-                rate_hz: 44_100,
-                layout: sointty_core::ChannelLayout::discrete(2),
-                format: sointty_core::DeviceFormat::S16Le,
-                valid_bits: 16,
-            },
+            output: output.clone(),
+            source,
+            buffers,
             converted: false,
         });
-        h.app.apply_event(PlayerEvent::Duration { track: 8, total_frames: Some(10) });
+        h.app.apply_event(PlayerEvent::Tags {
+            track: 7,
+            tags: TrackTags {
+                title: Some("Song".to_owned()),
+                artist: Some("Artist".to_owned()),
+                album: Some("Album".to_owned()),
+            },
+        });
+        h.app.apply_event(PlayerEvent::Duration {
+            track: 7,
+            total_frames: Some(441_000),
+        });
+        assert_eq!(
+            player_view(&h.app).badge,
+            screens::player::PlaybackBadge::BitPerfect
+        );
+        h.app.apply_event(PlayerEvent::Reconfiguring);
+        assert_eq!(h.app.state.tags.title.as_deref(), Some("Song"));
         assert_eq!(h.app.state.total_frames, None);
-        h.app.apply_event(PlayerEvent::Duration { track: 7, total_frames: Some(441_000) });
-        h.app.apply_event(PlayerEvent::Position { track: 8, frame: 999 });
-        assert_eq!(h.app.state.frame, 0);
-        h.app.apply_event(PlayerEvent::Position { track: 7, frame: 220_500 });
-        let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(90, 24)).unwrap();
-        terminal.draw(|frame| draw(frame, &h.app)).unwrap();
-        let buffer = terminal.backend().buffer();
-        let screen = (0..24).map(|y| {
-            (0..90).map(|x| buffer[(x, y)].symbol()).collect::<String>()
-        }).collect::<Vec<_>>().join("\n");
-        assert!(screen.contains("time: 00:05 / 00:10"), "{screen}");
-        assert!(screen.contains(&progress_bar(220_500, Some(441_000), 76)), "{screen}");
-
+        assert_eq!(
+            player_view(&h.app).badge,
+            screens::player::PlaybackBadge::Idle
+        );
+        let converted_output = OutputSpec {
+            format: DeviceFormat::F32Le,
+            valid_bits: 32,
+            ..output
+        };
+        h.app.apply_event(PlayerEvent::Playing {
+            track: 7,
+            output: converted_output,
+            source,
+            buffers,
+            converted: true,
+        });
+        assert_eq!(
+            h.app.state.tags.title.as_deref(),
+            Some("Song"),
+            "same-track seek keeps tags"
+        );
+        assert_eq!(h.app.state.buffers, Some(buffers));
+        assert_eq!(
+            player_view(&h.app).badge,
+            screens::player::PlaybackBadge::Converted
+        );
+        h.app.apply_event(PlayerEvent::Duration {
+            track: 7,
+            total_frames: Some(441_000),
+        });
         h.app.apply_event(PlayerEvent::EndOfQueue);
-        assert_eq!(h.app.state.total_frames, None);
-        assert_eq!(h.app.state.frame, 0);
+        assert_eq!(
+            player_view(&h.app).badge,
+            screens::player::PlaybackBadge::Idle
+        );
+    }
+
+    fn screen_text(app: &App, width: u16, height: u16) -> String {
+        let mut terminal =
+            Terminal::new(ratatui::backend::TestBackend::new(width, height)).unwrap();
+        terminal.draw(|frame| draw(frame, app)).unwrap();
+        let buffer = terminal.backend().buffer();
+        (0..height)
+            .map(|y| {
+                (0..width)
+                    .map(|x| buffer[(x, y)].symbol())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
     }
 
     #[test]
-    fn redraw_after_resize_keeps_menu_and_reflows_progress_bar() {
-        fn screen(terminal: &Terminal<ratatui::backend::TestBackend>, width: u16, height: u16) -> String {
-            let buffer = terminal.backend().buffer();
-            (0..height).map(|y| {
-                (0..width).map(|x| buffer[(x, y)].symbol()).collect::<String>()
-            }).collect::<Vec<_>>().join("\n")
+    fn three_screens_render_their_panels_and_tabs() {
+        let mut h = harness();
+        let library = screen_text(&h.app, 140, 40);
+        for marker in [
+            "1 Library",
+            "2 Playlists",
+            "3 Settings",
+            "Library",
+            "Queue · 0 tracks",
+            "Now playing",
+            "nothing playing",
+        ] {
+            assert!(library.contains(marker), "library screen missing {marker:?}");
         }
-
-        let mut h = harness(Vec::new());
-        h.app.apply_event(PlayerEvent::Playing {
-            track: 7,
-            output: OutputSpec {
-                device: "dev1".to_owned(),
-                rate_hz: 44_100,
-                layout: sointty_core::ChannelLayout::discrete(2),
-                format: sointty_core::DeviceFormat::S16Le,
-                valid_bits: 16,
-            },
-            converted: false,
-        });
-        h.app.apply_event(PlayerEvent::Duration { track: 7, total_frames: Some(441_000) });
-        h.app.apply_event(PlayerEvent::Position { track: 7, frame: 220_500 });
-        h.key(KeyCode::Char('m'));
-        assert!(matches!(h.app.pane, Some(Pane::Menu(_))));
-
-        // The bar fills the playback block, so it sits between the borders.
-        let bordered_bar = |width: u16| {
-            let inner = usize::from(width.saturating_sub(2)).saturating_sub(12);
-            format!("│{}│", progress_bar(220_500, Some(441_000), inner))
-        };
-
-        let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(90, 24)).unwrap();
-        terminal.draw(|frame| draw(frame, &h.app)).unwrap();
-        let grown = screen(&terminal, 90, 24);
-        assert!(grown.contains("sointty"), "{grown}");
-        assert!(grown.contains("Menu"), "{grown}");
-        assert!(grown.contains(&bordered_bar(90)), "{grown}");
-
-        terminal.backend_mut().resize(110, 30);
-        terminal.draw(|frame| draw(frame, &h.app)).unwrap();
-        let wider = screen(&terminal, 110, 30);
-        assert!(wider.contains("sointty"), "{wider}");
-        assert!(wider.contains("Menu"), "{wider}");
-        assert!(wider.contains(&bordered_bar(110)), "{wider}");
-
-        terminal.backend_mut().resize(40, 12);
-        terminal.draw(|frame| draw(frame, &h.app)).unwrap();
-        assert_eq!(terminal.backend().buffer().area, Rect::new(0, 0, 40, 12));
-        let shrunk = screen(&terminal, 40, 12);
-        assert!(shrunk.contains("sointty"), "{shrunk}");
-        assert!(!shrunk.contains(&bordered_bar(90)), "{shrunk}");
-
-        terminal.backend_mut().resize(90, 24);
-        terminal.draw(|frame| draw(frame, &h.app)).unwrap();
-        let restored = screen(&terminal, 90, 24);
-        assert!(restored.contains("Menu"), "{restored}");
-        assert!(restored.contains(&bordered_bar(90)), "{restored}");
-        assert!(matches!(h.app.pane, Some(Pane::Menu(_))));
+        h.key(KeyCode::Char('2'));
+        let playlists = screen_text(&h.app, 140, 40);
+        assert!(
+            playlists.contains("(empty: p from Library or Search adds tracks)"),
+            "playlists screen missing empty-list hint"
+        );
+        h.key(KeyCode::Char('3'));
+        let settings = screen_text(&h.app, 140, 40);
+        for marker in ["Settings", "Output", "/config/config.toml"] {
+            assert!(settings.contains(marker), "settings screen missing {marker:?}");
+        }
     }
 
     #[test]
-    fn unknown_and_clamped_progress_never_claims_a_duration() {
-        assert_eq!(progress_bar(80, None, 10), "progress: [----------]");
-        assert_eq!(progress_bar(80, Some(40), 10), "progress: [##########]");
-        assert_eq!(clock(3_661), "1:01:01");
+    fn narrow_terminal_shows_small_terminal_hint_and_focused_list_only() {
+        let h = harness();
+        let text = screen_text(&h.app, 60, 20);
+        assert!(
+            text.contains("small terminal"),
+            "narrow header must explain the reduced layout"
+        );
+        assert!(
+            !text.contains("Now playing"),
+            "narrow tier has no side-by-side player panel"
+        );
     }
 
+    #[test]
+    fn no_color_surface_has_no_rgb_or_indexed_cells_and_keeps_selection() {
+        use ratatui::style::Color;
+        let root = temp_dir("no-color");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("song.flac"), b"").unwrap();
+        let mut h = harness();
+        h.app.browser = Some(Browser::open(root.clone()).unwrap());
+        h.app.theme = Theme::build(true, true, None).0;
+        let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(140, 40)).unwrap();
+        terminal.draw(|frame| draw(frame, &h.app)).unwrap();
+        let cells = &terminal.backend().buffer().content;
+        assert!(
+            cells
+                .iter()
+                .all(|cell| cell.fg == Color::Reset && cell.bg == Color::Reset)
+        );
+        assert!(
+            cells
+                .iter()
+                .any(|cell| cell.modifier.contains(Modifier::REVERSED))
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
 }

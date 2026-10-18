@@ -154,6 +154,8 @@ struct Config {
     buffer_frames: Option<u32>,
     float_to_int: Option<bool>,
     int_to_float: Option<bool>,
+    /// Optional TUI accent in exact `#RRGGBB` form.
+    accent: Option<String>,
     /// Last successfully browsed directory; restored on the next launch.
     last_browser_dir: Option<PathBuf>,
 }
@@ -163,18 +165,27 @@ fn config_path() -> Option<PathBuf> {
         .map(|dirs| dirs.config_dir().join("config.toml"))
 }
 
-fn load_config() -> Config {
+fn load_config() -> (Config, Option<String>) {
     let Some(path) = config_path() else {
-        return Config::default();
+        return (Config::default(), None);
     };
-    let Ok(text) = std::fs::read_to_string(&path) else {
-        return Config::default();
+    let text = match std::fs::read_to_string(&path) {
+        Ok(text) => text,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return (Config::default(), None);
+        }
+        Err(error) => {
+            let message = format!("{}: {error}", path.display());
+            eprintln!("sointty: ignoring invalid config {message}");
+            return (Config::default(), Some(message));
+        }
     };
     match toml::from_str(&text) {
-        Ok(config) => config,
+        Ok(config) => (config, None),
         Err(error) => {
-            eprintln!("sointty: ignoring invalid config {}: {error}", path.display());
-            Config::default()
+            let message = format!("{}: {error}", path.display());
+            eprintln!("sointty: ignoring invalid config {message}");
+            (Config::default(), Some(message))
         }
     }
 }
@@ -327,6 +338,38 @@ fn device_saver() -> sointty_tui::DeviceSaver {
     })
 }
 
+/// Resolve the real platform default before persisting `device = None`.
+/// A strict-load/save failure leaves the current selection untouched.
+#[cfg(any(target_os = "linux", windows, target_os = "macos"))]
+fn device_reset() -> sointty_tui::DeviceReset {
+    Box::new(|| {
+        #[cfg(target_os = "linux")]
+        let id = pick_linux_default(&list_devices().map_err(|error| error.to_string())?)
+            .map_err(|error| error.to_string())?;
+        #[cfg(not(target_os = "linux"))]
+        let id = DEFAULT_DEVICE.to_owned();
+        let mut config = load_config_strict()?;
+        config.device = None;
+        save_config(&config).map_err(|error| error.to_string())?;
+        Ok(id)
+    })
+}
+
+/// Persist only a validated accent; malformed config stays untouched.
+#[cfg(any(target_os = "linux", windows, target_os = "macos"))]
+fn accent_saver() -> sointty_tui::AccentSaver {
+    Box::new(|accent| {
+        if let Some(text) = accent
+            && sointty_tui::theme::parse_hex_color(text).is_none()
+        {
+            return Err("accent must be exactly #RRGGBB".to_owned());
+        }
+        let mut config = load_config_strict()?;
+        config.accent = accent.map(str::to_owned);
+        save_config(&config).map_err(|error| error.to_string())
+    })
+}
+
 #[cfg(any(target_os = "linux", windows, target_os = "macos"))]
 fn float_to_int_saver() -> sointty_tui::FloatCompatibilitySaver {
     Box::new(|enabled| {
@@ -446,7 +489,7 @@ fn timing_saver() -> sointty_tui::TimingSaver {
 }
 
 #[cfg(any(target_os = "linux", windows, target_os = "macos"))]
-fn run(cli: Cli, settings: Settings) -> Result<(), PlayerError> {
+fn run(cli: Cli, settings: Settings, config: Config, config_error: Option<String>) -> Result<(), PlayerError> {
     let (command_tx, command_rx) = crossbeam_channel::unbounded();
     let (event_tx, event_rx) = crossbeam_channel::unbounded();
     let device = settings.device.clone();
@@ -499,12 +542,20 @@ fn run(cli: Cli, settings: Settings) -> Result<(), PlayerError> {
             .send(PlayerCommand::Play)
             .map_err(|_| PlayerError::Output)?;
     }
-    let config = load_config();
     let loaded = playlists::load();
     if let Some(error) = &loaded.read_only_error {
         eprintln!("sointty: playlists read-only: {error}");
     }
     let home_dir = directories::BaseDirs::new().map(|dirs| dirs.home_dir().to_path_buf());
+    let (search_roots, search_coverage_error) = match locations::list_locations() {
+        Ok(locations) => (locations.into_iter().map(|location| location.path).collect(), None),
+        Err(error) => {
+            let fallback = config.last_browser_dir.clone()
+                .or_else(|| home_dir.clone())
+                .or_else(|| std::env::current_dir().ok());
+            (fallback.into_iter().collect(), Some(error))
+        }
+    };
     let options = sointty_tui::RunOptions {
         open_browser,
         initial_browser_dir: config.last_browser_dir.clone(),
@@ -515,15 +566,23 @@ fn run(cli: Cli, settings: Settings) -> Result<(), PlayerError> {
         timing: (settings.period_frames, settings.buffer_frames),
         catalog: loaded.catalog,
         catalog_error: loaded.read_only_error,
+        catalog_path: playlists::catalog_path(),
+        config_path: config_path(),
+        config_error,
+        accent: config.accent,
+        search_roots,
+        search_coverage_error,
     };
     let hooks = sointty_tui::Hooks {
         device_provider: device_provider(),
         on_device_selected: device_saver(),
+        on_device_reset: device_reset(),
         on_float_to_int_selected: float_to_int_saver(),
         on_int_to_float_selected: int_to_float_saver(),
         on_browser_dir: browser_dir_saver(),
         on_catalog: Box::new(playlists::save),
         on_timing: timing_saver(),
+        on_accent: accent_saver(),
         locations: Box::new(locations::list_locations),
         map_drive: locations::map_drive_hook(),
         disconnect_drive: locations::disconnect_drive_hook(),
@@ -536,8 +595,9 @@ fn run(cli: Cli, settings: Settings) -> Result<(), PlayerError> {
 }
 
 #[cfg(not(any(target_os = "linux", windows, target_os = "macos")))]
-fn run(cli: Cli, settings: Settings) -> Result<(), PlayerError> {
-    let _ = (cli.files, settings.device, settings.period_frames, settings.buffer_frames, settings.float_to_int, settings.int_to_float);
+fn run(cli: Cli, settings: Settings, config: Config, config_error: Option<String>) -> Result<(), PlayerError> {
+    let _ = (cli.files, settings.device, settings.period_frames, settings.buffer_frames,
+        settings.float_to_int, settings.int_to_float, config, config_error);
     Err(PlayerError::InvalidInput(
         "audio output is not wired for this OS yet; use a Linux, Windows or macOS host",
     ))
@@ -550,8 +610,9 @@ fn main() -> ExitCode {
         if run_index_dispatch(&cli)? {
             return Ok(());
         }
-        let settings = resolve_settings(&cli, &load_config())?;
-        run(cli, settings)
+        let (config, config_error) = load_config();
+        let settings = resolve_settings(&cli, &config)?;
+        run(cli, settings, config, config_error)
     });
     match result {
         Ok(()) => ExitCode::SUCCESS,
@@ -689,6 +750,7 @@ mod tests {
             buffer_frames: None,
             float_to_int: Some(true),
             int_to_float: Some(false),
+            accent: Some("#E5A84B".to_owned()),
             last_browser_dir: Some(PathBuf::from("C:\\Music")),
         };
         let text = toml::to_string_pretty(&config).unwrap();
@@ -699,6 +761,7 @@ mod tests {
         assert_eq!(parsed.buffer_frames, None);
         assert_eq!(parsed.last_browser_dir, Some(PathBuf::from("C:\\Music")));
         assert_eq!(parsed.int_to_float, Some(false));
+        assert_eq!(parsed.accent.as_deref(), Some("#E5A84B"));
         // A pre-existing config without the field still parses.
         let legacy: Config = toml::from_str("device = \"hw:0,0\"\n").unwrap();
         assert_eq!(legacy.last_browser_dir, None);

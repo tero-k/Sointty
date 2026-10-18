@@ -85,7 +85,7 @@ pub fn home(area: Rect) -> HomeRegions {
     match tier {
         Tier::Wide => {
             let footer_h = 1;
-            let player_h = 5;
+            let player_h = 6; // border + four content rows
             let main = rest(area, y, player_h + footer_h);
             let player_top = main.y.saturating_add(main.height);
             let player = Rect {
@@ -125,7 +125,7 @@ pub fn home(area: Rect) -> HomeRegions {
             }
         }
         Tier::Medium => {
-            let player_h = 2;
+            let player_h = 1;
             let main = rest(area, y, player_h + 1);
             let player_top = main.y.saturating_add(main.height);
             let player = Rect {

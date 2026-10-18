@@ -8,9 +8,10 @@ use std::time::{Duration, Instant};
 use crossbeam_channel::{Receiver, Sender};
 use rand::{Rng, seq::SliceRandom};
 use sointty_core::{
-    AudioOutput, BufferConfig, Decoder, DecodedBlock, DecodedPcm, DeviceFormat, DeviceId,
-    DopPacker, OutputCounters, OutputSpec, PlayerCommand, PlayerError, PlayerEvent, QueueEntry,
-    SampleEncoding, StreamSpec, TrackId, TrackTags, cd_frames_to_samples, pack_exact, pack_native_dsd,
+    AudioOutput, BufferConfig, Decoder, DecodedBlock, DecodedPcm, DecodedSpec, DeviceFormat,
+    DeviceId, DopPacker, OutputCounters, OutputSpec, PlayerCommand, PlayerError, PlayerEvent,
+    QueueEntry, SampleEncoding, StreamSpec, TrackId, TrackTags, cd_frames_to_samples, pack_exact,
+    pack_native_dsd,
 };
 use sointty_source::StallState;
 
@@ -135,6 +136,8 @@ struct Playback {
     decoder: Box<dyn Decoder>,
     producer: rtrb::Producer<u8>,
     output: OutputSpec,
+    /// The decoder's own spec, captured at configure time for display.
+    source: DecodedSpec,
     /// Timing used for this stream (per-rate defaults plus any overrides).
     buffers: BufferConfig,
     written_frames: u64,
@@ -354,6 +357,15 @@ struct StallEpisode {
 }
 
 type OutputFactory<O> = Box<dyn FnMut(DeviceId) -> Result<O, PlayerError> + Send>;
+
+/// The decoder's own spec as a `DecodedSpec`, for the `Playing` event's
+/// read-only signal-path fields.
+fn decoded_spec(decoder: &dyn Decoder) -> DecodedSpec {
+    match decoder.dsd_spec() {
+        Some(dsd) => DecodedSpec::Dsd(dsd),
+        None => DecodedSpec::Pcm(decoder.spec()),
+    }
+}
 
 /// Frames left to write in the current CUE span (`None` for whole-file
 /// tracks, i.e. unlimited).
@@ -1144,12 +1156,14 @@ impl<O: AudioOutput> Worker<O> {
         self.publish_track(track.id, stall);
         self.emit(PlayerEvent::Reconfiguring);
         let (output_spec, conversion, buffers) = self.configure_for_decoder(decoder.as_ref())?;
+        let source = decoded_spec(decoder.as_ref());
         let (producer, consumer) =
             rtrb::RingBuffer::new(Self::ring_bytes(buffers, output_spec.bytes_per_frame()));
         let mut playback = Playback {
             decoder,
             producer,
             output: output_spec.clone(),
+            source,
             buffers,
             written_frames: 0,
             start_sample,
@@ -1167,6 +1181,8 @@ impl<O: AudioOutput> Worker<O> {
         self.emit(PlayerEvent::Playing {
             track: track.id,
             output: output_spec,
+            source,
+            buffers,
             converted: conversion.converted(),
         });
         self.emit(PlayerEvent::Tags {
@@ -1201,9 +1217,11 @@ impl<O: AudioOutput> Worker<O> {
         }
         decoder.seek_to_frame(target)?;
         self.output.stop()?;
+        self.emit(PlayerEvent::Reconfiguring);
         // `seek_to_frame` counts per-channel DSD bytes for DSD decoders, so
         // the seek target needs no unit conversion.
         let (output_spec, conversion, buffers) = self.configure_for_decoder(decoder.as_ref())?;
+        let source = decoded_spec(decoder.as_ref());
         let (producer, consumer) =
             rtrb::RingBuffer::new(Self::ring_bytes(buffers, output_spec.bytes_per_frame()));
         let packing = Packing::for_output(&output_spec, conversion);
@@ -1211,6 +1229,7 @@ impl<O: AudioOutput> Worker<O> {
             decoder,
             producer,
             output: output_spec,
+            source,
             buffers,
             written_frames: 0,
             start_sample: playback.start_sample,
@@ -1225,6 +1244,22 @@ impl<O: AudioOutput> Worker<O> {
         self.reported_xruns = 0;
         self.prefill(&mut playback)?;
         self.output.start(consumer, Arc::clone(&self.counters))?;
+        // Refresh the read-only signal-path fields so no stale verdict
+        // survives a new configure; tags stay untouched on a same-track
+        // seek.
+        if let Some(track) = &self.current {
+            self.emit(PlayerEvent::Playing {
+                track: track.id,
+                output: playback.output.clone(),
+                source,
+                buffers,
+                converted: playback.packing.converted(),
+            });
+            self.emit(PlayerEvent::Duration {
+                track: track.id,
+                total_frames: playback_total(&playback),
+            });
+        }
         self.playback = Some(playback);
         if let Some(track) = &self.current {
             self.emit(PlayerEvent::Position {
@@ -1273,12 +1308,14 @@ impl<O: AudioOutput> Worker<O> {
         decoder.seek_to_frame(target)?;
         self.emit(PlayerEvent::Reconfiguring);
         let (output_spec, conversion, buffers) = self.configure_for_decoder(decoder.as_ref())?;
+        let source = decoded_spec(decoder.as_ref());
         let (producer, consumer) =
             rtrb::RingBuffer::new(Self::ring_bytes(buffers, output_spec.bytes_per_frame()));
         let mut playback = Playback {
             decoder,
             producer,
             output: output_spec.clone(),
+            source,
             buffers,
             written_frames: resume_frame,
             start_sample: old.start_sample,
@@ -1298,6 +1335,8 @@ impl<O: AudioOutput> Worker<O> {
             self.emit(PlayerEvent::Playing {
                 track: track.id,
                 output: output_spec,
+                source,
+                buffers,
                 converted: conversion.converted(),
             });
             self.emit(PlayerEvent::Duration {
@@ -1391,6 +1430,8 @@ impl<O: AudioOutput> Worker<O> {
             self.emit(PlayerEvent::Playing {
                 track,
                 output: playback.output.clone(),
+                source: playback.source,
+                buffers: playback.buffers,
                 converted: playback.packing.converted(),
             });
             self.emit(PlayerEvent::Duration {
@@ -1508,6 +1549,7 @@ impl<O: AudioOutput> Worker<O> {
                 // old track continues uninterrupted into the new one.
                 let boundary = playback.written_frames;
                 playback.decoder = prepared.decoder;
+                playback.source = decoded_spec(playback.decoder.as_ref());
                 playback.start_sample = start_sample;
                 playback.end_frames = end_frames;
                 playback.span_written = 0;
@@ -4713,5 +4755,38 @@ mod tests {
             [3]
         );
         worker.output.stop().unwrap();
+    }
+
+    #[test]
+    fn playing_reports_actual_source_and_buffers_on_start_and_seek() {
+        let spec = test_spec(44_100);
+        let mut plan = HashMap::new();
+        plan.insert(PathBuf::from("long.wav"), FakeTrack::Pcm(spec, 1_000_000));
+        let harness = spawn_engine(plan);
+        enqueue(&harness, "long.wav");
+        harness.commands.send(PlayerCommand::Play).unwrap();
+        let first = recv_until(&harness.events, |event| {
+            matches!(event, PlayerEvent::Playing { track: 1, .. })
+        });
+        let PlayerEvent::Playing { source, buffers, output, converted, .. } = first else {
+            unreachable!("matched Playing above");
+        };
+        assert_eq!(source, DecodedSpec::Pcm(spec));
+        assert_eq!(buffers, test_buffers());
+        assert_eq!(output.rate_hz, 44_100);
+        assert!(!converted);
+        harness.commands.send(PlayerCommand::SeekFrame(44_100)).unwrap();
+        let sought = recv_until(&harness.events, |event| {
+            matches!(event, PlayerEvent::Playing { track: 1, .. })
+        });
+        let PlayerEvent::Playing { source, buffers, output, converted, .. } = sought else {
+            unreachable!("matched Playing above");
+        };
+        assert_eq!(source, DecodedSpec::Pcm(spec), "seek keeps decoder source");
+        assert_eq!(buffers, test_buffers(), "seek reports the new configure timing");
+        assert_eq!(output.rate_hz, 44_100);
+        assert!(!converted);
+        harness.commands.send(PlayerCommand::Quit).unwrap();
+        harness.join().unwrap();
     }
 }

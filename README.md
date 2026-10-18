@@ -14,8 +14,10 @@ and unit tested, hardware testing pending.
 
 ![Sointty terminal UI while playing a 192 kHz file](docs/assets/tui-playback.png)
 
-The terminal shows the negotiated output, elapsed position, current navigation
-pane, selected playlist, and a context-sensitive key guide.
+The terminal is organized into three screens switched with `1`/`2`/`3`:
+Library (browser, queue, and a Now playing panel with the negotiated
+output), Playlists, and Settings. A context-sensitive key guide stays
+visible at the bottom; `?` lists every key.
 
 ## Behavior
 
@@ -25,7 +27,7 @@ pane, selected playlist, and a context-sensitive key guide.
   float-decoding formats on integer-only devices, and `--allow-int-to-float`
   (TUI `i`) enables integer→F32 conversion on float-only endpoints such as the
   macOS internal speakers (S16/S24 convert exactly; S32 loses its low 8 bits).
-  Converted output is labeled `NOT bit-perfect` in the UI.
+  Converted output is labeled `converted` in the Now playing panel.
 - On macOS, hog mode is paired with Core Audio Integer Mode: non-mixable
   integer stream formats are selected for both the hardware and IOProc sides
   when the driver offers them, so capable USB DACs receive the exact integer
@@ -57,36 +59,48 @@ sointty /path/to/album/                # play files or folders
 sointty playlist.m3u                   # playlists expand into tracks
 ```
 
-With no arguments, sointty opens a filesystem browser where you last left it
+With no arguments, sointty opens the Library screen where you last left it
 (first launch: your home folder). A key guide stays visible at the bottom and
-changes with the active pane. Press `?` for full help, `m` for the menu, or `q`
-to quit immediately from any pane without backing out through menus. While
-typing in an input prompt, `q` is text; use `Ctrl+Q` to quit immediately.
-Press `d` to choose and save the output device.
+changes with the focused pane. Press `?` for the full key list or `q` to quit
+immediately; if playlists have unsaved edits, quit asks whether to save first.
+While typing in an input prompt, `q` is text; use `Ctrl+Q` to quit
+immediately. Press `d` to jump to the output device setting.
 
 ### Keys
 
 | Key | Action |
 |---|---|
-| `space` | play / pause |
+| `1` / `2` / `3` | Library / Playlists / Settings screen (`b` and `m` also open Library and Settings) |
+| `space` | play / pause (`Ctrl+Space` inside editable lists) |
 | `s` / `n` | stop / next track |
 | `←` / `→` | seek back / forward 10 s |
-| `b` | file browser (`Enter` plays, `a` adds to playlist, `A` adds the folder, `Backspace` goes up or shows drives at root) |
-| `p` | playlists: `↑`/`↓` highlight a list, `a` appends that whole list; `Tab` focuses songs, `a`/`Enter` appends one song, `A` appends the whole highlighted list |
+| `↑` / `↓` (`k` / `j`) | move the selection |
+| `Tab` | switch pane (Library ↔ Queue, playlist names ↔ tracks, settings sections ↔ rows, search scopes) |
+| `Enter` | open a folder or play a track; in the queue, jump to the entry; in a playlist, play from here |
+| `Backspace` | browser directory up (shows drives at a root) |
+| `a` / `A` | queue the selected file or folder / queue the whole album |
+| `/` | search: type to filter, `Tab` cycles scope, `Enter` plays, `a` queues, `p` adds to a playlist, `o` opens the folder |
+| `p` | add the selected track(s) to a playlist |
 | `l` | locations: drives and network shares (map/mount via the OS) |
-| `f` | focus the visible saved playlist: `↑`/`↓` select, `a`/`Enter` appends one song, `A` appends the whole list; `Esc` returns to browser |
-| `Tab` | switch right pane between selected playlist and live queue (in the Playlists pane, switch between lists and songs) |
+| `x` | actions overlay for the current pane |
 | `r` | toggle random play for the live queue; the current song and preopened next song stay in place |
-| `m` / `?` | menu / full keyboard help |
-| `d` | choose output device |
+| `d` | jump to the output device setting |
 | `c` | allow F32→integer conversion (off by default) |
 | `i` | allow integer→F32 conversion for float-only devices (off by default) |
+| `?` | full key list |
 | `q` | quit immediately from any non-input pane |
 | `Ctrl+Q` | quit immediately, including while typing in a prompt |
-| `Esc` | close the current pane or step back through menus; quit when no pane is open |
+| `Esc` | close the current overlay or step back; quit from the Library home |
 
-Buffer timing (period/buffer frames) is adjustable under `m` → DAC settings;
-Auto derives timing from each track's sample rate.
+Queue pane: `d` removes the selected entry, `m` moves it (`↑`/`↓` pick the
+gap, `Enter` drops), `Enter` jumps playback to it.
+
+Playlist editing: `n` creates a list, `space`/`v` select rows or a range,
+`Q` queues the selection, `m` moves it, `d` removes it, `r` renames the
+list, and `Ctrl+S` saves all changes.
+
+Buffer timing (period/buffer frames) is adjustable on the Settings screen
+under Output; Auto derives timing from each track's sample rate.
 
 Playback shows elapsed/total time and a text progress bar. When the decoder
 cannot report a reliable length, the total reads `--:--` and the bar remains
@@ -99,7 +113,7 @@ file. Named playlists live in `<data dir>/sointty/playlists.toml`; adding
 tracks never touches the playback queue.
 Random play shuffles only upcoming queue entries, not saved playlists. Turning it
 off keeps the current queue order and appends future songs in order. The same
-toggle is available under `m` → Queue.
+toggle is `r` and under Settings → Playback.
 
 ## Fidelity rules
 

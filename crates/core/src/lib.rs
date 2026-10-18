@@ -251,7 +251,7 @@ impl From<PathBuf> for QueueEntry {
 }
 
 /// CUE track bounds in CD frames (75 Hz); `end_cd == None` means source EOF.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct CueRange {
     pub start_cd: u64,
     pub end_cd: Option<u64>,
@@ -337,6 +337,11 @@ pub enum PlayerEvent {
     Playing {
         track: TrackId,
         output: OutputSpec,
+        /// The decoder's own spec for this stream (read-only presentation
+        /// data for signal-path display).
+        source: DecodedSpec,
+        /// The buffer timing this stream was configured with.
+        buffers: BufferConfig,
         /// True only when samples underwent an opted-in format conversion
         /// (F32→integer or integer→F32) instead of the exact path.
         converted: bool,
