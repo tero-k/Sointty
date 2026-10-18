@@ -3199,6 +3199,14 @@ fn draw(frame: &mut ratatui::Frame<'_>, app: &App) {
         footer.push(("?", "all keys"));
     }
     widgets::render_footer(frame, regions.footer, &footer, &app.theme);
+    if regions.footer.height >= 2 && app.mode.kind() == ModeKind::Normal {
+        let playback_row = Rect {
+            y: regions.footer.y.saturating_add(1),
+            height: 1,
+            ..regions.footer
+        };
+        widgets::render_footer(frame, playback_row, &keymap::playback_pairs(), &app.theme);
+    }
     draw_overlay(frame, app);
 }
 
@@ -3920,6 +3928,23 @@ mod tests {
     }
 
     #[test]
+    fn shift_modified_keys_dispatch_in_app() {
+        let mut h = harness();
+        // Shift+space arrives as Char(' ') with SHIFT; it must pause.
+        assert!(!h.app.handle_key_event(KeyEvent::new(
+            KeyCode::Char(' '),
+            KeyModifiers::SHIFT
+        )));
+        assert!(matches!(h.sent.recv().unwrap(), PlayerCommand::Pause));
+        // Shift+/ arrives as Char('?') with SHIFT; it must open help.
+        assert!(!h.app.handle_key_event(KeyEvent::new(
+            KeyCode::Char('?'),
+            KeyModifiers::SHIFT
+        )));
+        assert!(matches!(h.app.mode, Mode::Help));
+    }
+
+    #[test]
     fn shared_toggle_saves_first_and_updates_settings_access_immediately() {
         let mut h = harness();
         h.app.hooks.on_shared_playback_selected = Box::new(|_| Err("invalid TOML".to_owned()));
@@ -4400,6 +4425,25 @@ mod tests {
             })
             .collect::<Vec<_>>()
             .join("\n")
+    }
+
+    #[test]
+    fn playback_keys_row_renders_on_wide_and_medium_not_narrow() {
+        let h = harness();
+        let wide = screen_text(&h.app, 140, 40);
+        for marker in ["play/pause", "stop", "next", "seek -10s", "seek +10s", "shuffle"] {
+            assert!(wide.contains(marker), "wide playback row shows {marker}");
+        }
+        let medium = screen_text(&h.app, 100, 30);
+        assert!(
+            medium.contains("stop"),
+            "medium footer has the playback row"
+        );
+        let narrow = screen_text(&h.app, 60, 20);
+        assert!(
+            !narrow.contains("stop"),
+            "narrow footer stays a single context row"
+        );
     }
 
     #[test]

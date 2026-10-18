@@ -19,6 +19,11 @@ exists today.
 - Pending-queue control commands in the player control plane.
 - Fix pause: `space` pauses and resumes the current track in place instead
   of stopping it and advancing the queue to the next track.
+- Fix shifted shortcuts: `Shift+A` (queue album), `Shift+Q` (queue playlist
+  selection), `?` (full key list), and `Y`/`N` quit answers now register,
+  where previously only Caps Lock produced them.
+- Show the playback keys (`space`, `s`, `n`, `←`/`→`, `r`) on a dedicated
+  footer row below the context key guide.
 
 ## 0.1.4 (2026-10-17)
 

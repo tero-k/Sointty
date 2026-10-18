@@ -999,12 +999,25 @@ pub static BINDINGS: &[Binding] = &[
     },
 ];
 
+/// Effective modifiers for matching. Crossterm reports SHIFT together
+/// with a shifted character (Shift+a arrives as `Char('A')` | SHIFT),
+/// but the produced character already encodes the case, so SHIFT must
+/// not disqualify a `NONE` binding. CONTROL/ALT stay significant.
+fn match_modifiers(key: KeyEvent) -> KeyModifiers {
+    if matches!(key.code, KeyCode::Char(_)) {
+        key.modifiers - KeyModifiers::SHIFT
+    } else {
+        key.modifiers
+    }
+}
+
 /// Resolve a key in Normal mode: pane-specific bindings first, then
 /// globals. Returns `None` for unbound keys.
 pub fn lookup(focus: Focus, key: KeyEvent) -> Option<Action> {
+    let modifiers = match_modifiers(key);
     let mut global_hit = None;
     for binding in BINDINGS {
-        if binding.code != key.code || binding.modifiers != key.modifiers {
+        if binding.code != key.code || binding.modifiers != modifiers {
             continue;
         }
         match binding.scope {
@@ -1021,14 +1034,28 @@ pub fn lookup(focus: Focus, key: KeyEvent) -> Option<Action> {
 /// not listed here remain text in Search/Prompt; the app handles their
 /// characters after this lookup.
 pub fn lookup_mode(mode: ModeKind, key: KeyEvent) -> Option<Action> {
+    let modifiers = match_modifiers(key);
     BINDINGS
         .iter()
         .find(|binding| {
             binding.scope == Scope::In(mode)
                 && binding.code == key.code
-                && binding.modifiers == key.modifiers
+                && binding.modifiers == modifiers
         })
         .map(|binding| binding.action)
+}
+
+/// Playback transport keycaps, the same in every context: drawn as a
+/// dedicated footer row so playback control is always discoverable.
+/// Sourced from the dispatch table, so it cannot drift from the keys.
+pub fn playback_pairs() -> Vec<(&'static str, &'static str)> {
+    BINDINGS
+        .iter()
+        .filter(|binding| {
+            binding.footer && binding.group == "Playback" && binding.modifiers == NONE
+        })
+        .map(|binding| (binding.key, binding.label))
+        .collect()
 }
 
 /// Footer keycaps for a context: applicable bindings in table order,
@@ -1304,6 +1331,48 @@ mod tests {
         let settings = help.iter().find(|(name, _)| *name == "Settings").unwrap();
         assert!(settings.1.iter().any(|(key, _)| *key == "c"));
         assert!(settings.1.iter().any(|(key, _)| *key == "i"));
+    }
+
+    #[test]
+    fn shift_modified_characters_match_their_bindings() {
+        let shift = |code| KeyEvent::new(code, KeyModifiers::SHIFT);
+        // Crossterm reports shifted characters with a SHIFT modifier; the
+        // character already encodes the case, so SHIFT must not block a hit.
+        assert_eq!(
+            lookup(Focus::Library, shift(KeyCode::Char('A'))),
+            Some(Action::EnqueueAlbum)
+        );
+        assert_eq!(
+            lookup(Focus::Library, shift(KeyCode::Char('?'))),
+            Some(Action::ToggleHelp)
+        );
+        assert_eq!(
+            lookup(Focus::PlaylistTracks, shift(KeyCode::Char('Q'))),
+            Some(Action::EnqueueSelection)
+        );
+        assert_eq!(
+            lookup(Focus::Library, shift(KeyCode::Char(' '))),
+            Some(Action::TogglePause)
+        );
+        // Overlay modes normalize the same way.
+        assert_eq!(
+            lookup_mode(ModeKind::QuitConfirm, shift(KeyCode::Char('Y'))),
+            Some(Action::ConfirmYes)
+        );
+        // CONTROL stays significant with characters.
+        let ctrl_space = KeyEvent::new(KeyCode::Char(' '), KeyModifiers::CONTROL | KeyModifiers::SHIFT);
+        assert_eq!(lookup(Focus::Library, ctrl_space), Some(Action::TogglePause));
+        // Non-character keys keep exact modifier matching.
+        assert_eq!(lookup(Focus::Library, shift(KeyCode::Enter)), None);
+    }
+
+    #[test]
+    fn playback_row_lists_transport_keys_without_ctrl_variants() {
+        let pairs = playback_pairs();
+        for key in ["space", "s", "n", "←", "→", "r"] {
+            assert!(pairs.iter().any(|(k, _)| *k == key), "missing {key}");
+        }
+        assert!(!pairs.iter().any(|(k, _)| k.contains("ctrl")));
     }
 
     #[test]

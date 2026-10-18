@@ -37,7 +37,9 @@ sointty --shared /path/to/track.wav     # OS mixer, not bit-perfect
 
 With no arguments, sointty opens the Library screen where you last left it
 (first launch: your home folder). A key guide stays visible at the bottom and
-changes with the focused pane. Press `?` for the full key list or `q` to quit
+changes with the focused pane, with a second row showing the always-active
+playback keys: `space` play/pause, `s` stop, `n` next, `←`/`→` seek, `r`
+shuffle. Press `?` for the full key list or `q` to quit
 immediately; if playlists have unsaved edits, quit asks whether to save first.
 While typing in an input prompt, `q` is text; use `Ctrl+Q` to quit
 immediately.
