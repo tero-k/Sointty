@@ -4,11 +4,12 @@
 //! 1x1 upward renders without panics:
 //!
 //! - Wide (>=120x24): header, 45/55 Library/Queue split, four-row Now
-//!   playing panel, keycap footer.
+//!   playing panel, two-row keycap footer (context keys + playback row).
 //! - Medium (80-119 cols, >=24 rows): one focused list at a time (Tab
-//!   switches Library/Queue) plus a collapsed one-line player strip.
+//!   switches Library/Queue) plus a collapsed one-line player strip and
+//!   the two-row footer.
 //! - Narrow (anything smaller): focused list, mini player, small-terminal
-//!   hint, safely clipped header/footer.
+//!   hint, safely clipped header and one-row footer.
 
 use ratatui::layout::Rect;
 
@@ -84,7 +85,7 @@ pub fn home(area: Rect) -> HomeRegions {
     let header = take_rows(area, &mut y, 1);
     match tier {
         Tier::Wide => {
-            let footer_h = 1;
+            let footer_h = 2; // context keycaps + playback transport row
             let player_h = 6; // border + four content rows
             let main = rest(area, y, player_h + footer_h);
             let player_top = main.y.saturating_add(main.height);
@@ -126,7 +127,8 @@ pub fn home(area: Rect) -> HomeRegions {
         }
         Tier::Medium => {
             let player_h = 1;
-            let main = rest(area, y, player_h + 1);
+            let footer_h = 2; // context keycaps + playback transport row
+            let main = rest(area, y, player_h + footer_h);
             let player_top = main.y.saturating_add(main.height);
             let player = Rect {
                 x: area.x,
