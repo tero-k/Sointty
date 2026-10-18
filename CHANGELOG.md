@@ -1,0 +1,53 @@
+# Changelog
+
+These are retrospectively named development milestones based on dated commits.
+They are not tagged or published releases, and the 0.1.x numbers were not the
+manifest versions at those dates; they exist to summarize how the project
+evolved toward the current build. Only `0.2.0` describes the code as it
+exists today.
+
+## 0.2.0 (2026-10-18, current build)
+
+- Rebuilt the terminal UI as three screens switched with `1`/`2`/`3`: Library
+  (file browser, queue, and Now playing panel), Playlists, and Settings.
+- Context-sensitive key guide at the bottom of every screen, with `?` for the
+  full key list.
+- Search across library scopes with play, queue, playlist, and open-folder
+  actions.
+- Responsive layouts that adapt to terminal width, plus display titles and
+  presentation metadata for tidier track rows.
+- Pending-queue control commands in the player control plane.
+
+## 0.1.4 (2026-10-17)
+
+- Redraw the TUI on terminal resize, following the October screenshot and
+  documentation refresh.
+
+## 0.1.3 (2026-10-03)
+
+- macOS Core Audio Integer Mode negotiation: non-mixable integer stream
+  formats are preferred for the hardware and IOProc sides under hog mode.
+- Verified bit-perfect playback on an iFi ZEN DAC V2, including the float
+  IOProc fallback path via the integer-to-F32 opt-in.
+
+## 0.1.2 (2026-09-28)
+
+- Recover the exact source encoding of FLAC streams widened into S32
+  containers.
+- Read Core Audio physical formats as ranged descriptions and re-verify the
+  format after buffer-size changes; match S24 streams into 32-bit slots.
+- Add the opt-in integer-to-F32 conversion for float-only endpoints.
+
+## 0.1.1 (2026-09-27)
+
+- Windows: fix F32 compatibility opt-in and WASAPI push-mode clicks on
+  drivers that force whole-buffer periods.
+- Add persistent named playlists, the locations view for drives and network
+  shares, and queue controls.
+
+## 0.1.0 (2026-09-26)
+
+- Initial player: terminal UI, Symphonia-based decoding, and direct ALSA,
+  WASAPI, and Core Audio backends.
+- Bit-perfect fidelity contract: no resampling or mixing, failures typed
+  instead of silent conversions.

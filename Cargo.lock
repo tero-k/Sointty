@@ -1880,7 +1880,7 @@ checksum = "f9395f0f0eee849a9b707b2f06bb92a6a422090e2123bb2ef8e87a0e61892a8e"
 
 [[package]]
 name = "sointty"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "audio_thread_priority",
  "crossbeam-channel",
@@ -1904,14 +1904,14 @@ dependencies = [
 
 [[package]]
 name = "sointty-core"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "rtrb",
 ]
 
 [[package]]
 name = "sointty-decode"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "ffmpeg-next",
  "lofty",
@@ -1924,7 +1924,7 @@ dependencies = [
 
 [[package]]
 name = "sointty-library"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "rusqlite",
  "sointty-core",
@@ -1933,7 +1933,7 @@ dependencies = [
 
 [[package]]
 name = "sointty-output-alsa"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "alsa",
  "rtrb",
@@ -1942,7 +1942,7 @@ dependencies = [
 
 [[package]]
 name = "sointty-output-coreaudio"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "audio_thread_priority",
  "block2",
@@ -1954,7 +1954,7 @@ dependencies = [
 
 [[package]]
 name = "sointty-output-wasapi"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "audio_thread_priority",
  "rtrb",
@@ -1964,7 +1964,7 @@ dependencies = [
 
 [[package]]
 name = "sointty-playlist"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "quick-xml",
  "rcue",
@@ -1973,14 +1973,14 @@ dependencies = [
 
 [[package]]
 name = "sointty-source"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "sointty-core",
 ]
 
 [[package]]
 name = "sointty-tui"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "crossbeam-channel",
  "crossterm",

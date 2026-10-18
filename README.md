@@ -8,16 +8,79 @@ No resampling, no volume processing, no EQ, no mixer in between.
 [![MSRV: 1.98.1](https://img.shields.io/badge/rustc-1.98.1%2B-orange.svg)](https://blog.rust-lang.org/releases/)
 [![Platform: Linux | Windows | macOS](https://img.shields.io/badge/platform-Linux%20%7C%20Windows%20%7C%20macOS-lightgrey.svg)](#platforms)
 
-v1 feature complete (see [`docs/PLAN.md`](docs/PLAN.md)). Verified on Windows
-(iFi USB DAC) and macOS (iFi ZEN DAC V2); the Linux backend is implemented
+Current build: **0.2.0** (see [CHANGELOG.md](CHANGELOG.md)). Verified on
+Windows and macOS with an iFi ZEN DAC V2; the Linux backend is implemented
 and unit tested, hardware testing pending.
 
-![Sointty terminal UI while playing a 192 kHz file](docs/assets/tui-playback.png)
+![Sointty Library screen: file browser, queue, and Now playing panel](docs/assets/tui-library.png)
 
-The terminal is organized into three screens switched with `1`/`2`/`3`:
-Library (browser, queue, and a Now playing panel with the negotiated
-output), Playlists, and Settings. A context-sensitive key guide stays
-visible at the bottom; `?` lists every key.
+## Try it
+
+```sh
+# Linux: ALSA headers required; libopus for the default Opus support
+sudo apt install libasound2-dev libopus-dev
+cargo build --release
+
+# Windows / macOS: no system audio dependencies
+cargo build --release
+```
+
+```sh
+sointty --list-devices                 # list output endpoints
+sointty /path/to/album/                # play files or folders
+sointty playlist.m3u                   # playlists expand into tracks
+sointty                                # no arguments: open the Library browser
+```
+
+With no arguments, sointty opens the Library screen where you last left it
+(first launch: your home folder). A key guide stays visible at the bottom and
+changes with the focused pane. Press `?` for the full key list or `q` to quit
+immediately; if playlists have unsaved edits, quit asks whether to save first.
+While typing in an input prompt, `q` is text; use `Ctrl+Q` to quit
+immediately.
+
+## The three screens
+
+Press `1`, `2`, or `3` to switch screens (`b` and `m` also open Library and
+Settings).
+
+**1: Library.** Browse files on the left, see the upcoming queue in the
+middle, and watch the Now playing panel on the right, which shows the format
+as negotiated with the device. `a` queues the selected file or folder, `A`
+queues the whole album, and `/` searches by typing.
+
+**2: Playlists.** Manage named playlists stored on disk: `n` creates a list,
+`space`/`v` select rows or a range, `Q` queues the selection, `m` moves it,
+`d` removes it, `r` renames the list, and `Ctrl+S` saves all changes. Adding
+tracks to a playlist never touches the playback queue.
+
+![Sointty Playlists screen: playlist names and track rows](docs/assets/tui-playlists.png)
+
+**3: Settings.** Pick the output device, adjust buffer timing, and toggle the
+conversion opt-ins. Press `d` from anywhere to jump straight to the output
+device setting.
+
+![Sointty Settings screen: output and playback options](docs/assets/tui-settings.png)
+
+The screenshots are illustrative demo views rendered from the current UI with
+throwaway demo files, not recordings of real libraries or hardware playback.
+
+## Everyday keys
+
+| Key | Action |
+|---|---|
+| `1` / `2` / `3` | Library / Playlists / Settings screen |
+| `space` | play / pause |
+| `s` / `n` | stop / next track |
+| `←` / `→` | seek back / forward 10 s |
+| `↑` / `↓` (`k` / `j`) | move the selection |
+| `Tab` | switch pane |
+| `Enter` | open a folder or play a track |
+| `a` / `A` | queue the selection / queue the whole album |
+| `/` | search: type to filter, `Enter` plays, `a` queues |
+| `?` | full key list |
+| `q` | quit immediately from any non-input pane |
+| `Ctrl+Q` | quit immediately, including while typing in a prompt |
 
 ## Behavior
 
@@ -42,44 +105,14 @@ visible at the bottom; `?` lists every key.
   are reported, not hidden.
 - Local files only; remote URLs are rejected.
 
-## Quick start
+## More keys
 
-```sh
-# Linux: ALSA headers required; libopus for the default Opus support
-sudo apt install libasound2-dev libopus-dev
-cargo build --release
-
-# Windows / macOS: no system audio dependencies
-cargo build --release
-```
-
-```sh
-sointty --list-devices                 # list output endpoints
-sointty /path/to/album/                # play files or folders
-sointty playlist.m3u                   # playlists expand into tracks
-```
-
-With no arguments, sointty opens the Library screen where you last left it
-(first launch: your home folder). A key guide stays visible at the bottom and
-changes with the focused pane. Press `?` for the full key list or `q` to quit
-immediately; if playlists have unsaved edits, quit asks whether to save first.
-While typing in an input prompt, `q` is text; use `Ctrl+Q` to quit
-immediately. Press `d` to jump to the output device setting.
-
-### Keys
+Beyond the everyday keys above:
 
 | Key | Action |
 |---|---|
-| `1` / `2` / `3` | Library / Playlists / Settings screen (`b` and `m` also open Library and Settings) |
-| `space` | play / pause (`Ctrl+Space` inside editable lists) |
-| `s` / `n` | stop / next track |
-| `←` / `→` | seek back / forward 10 s |
-| `↑` / `↓` (`k` / `j`) | move the selection |
-| `Tab` | switch pane (Library ↔ Queue, playlist names ↔ tracks, settings sections ↔ rows, search scopes) |
-| `Enter` | open a folder or play a track; in the queue, jump to the entry; in a playlist, play from here |
 | `Backspace` | browser directory up (shows drives at a root) |
-| `a` / `A` | queue the selected file or folder / queue the whole album |
-| `/` | search: type to filter, `Tab` cycles scope, `Enter` plays, `a` queues, `p` adds to a playlist, `o` opens the folder |
+| `Tab` in search | cycle the search scope |
 | `p` | add the selected track(s) to a playlist |
 | `l` | locations: drives and network shares (map/mount via the OS) |
 | `x` | actions overlay for the current pane |
@@ -87,33 +120,17 @@ immediately. Press `d` to jump to the output device setting.
 | `d` | jump to the output device setting |
 | `c` | allow F32→integer conversion (off by default) |
 | `i` | allow integer→F32 conversion for float-only devices (off by default) |
-| `?` | full key list |
-| `q` | quit immediately from any non-input pane |
-| `Ctrl+Q` | quit immediately, including while typing in a prompt |
 | `Esc` | close the current overlay or step back; quit from the Library home |
+
+In search, `p` adds to a playlist and `o` opens the containing folder.
+`Ctrl+Space` acts as play/pause inside editable lists, where `space` selects.
 
 Queue pane: `d` removes the selected entry, `m` moves it (`↑`/`↓` pick the
 gap, `Enter` drops), `Enter` jumps playback to it.
 
-Playlist editing: `n` creates a list, `space`/`v` select rows or a range,
-`Q` queues the selection, `m` moves it, `d` removes it, `r` renames the
-list, and `Ctrl+S` saves all changes.
-
-Buffer timing (period/buffer frames) is adjustable on the Settings screen
-under Output; Auto derives timing from each track's sample rate.
-
 Playback shows elapsed/total time and a text progress bar. When the decoder
 cannot report a reliable length, the total reads `--:--` and the bar remains
 empty instead of estimating from file size.
-
-Settings live in `<config dir>/sointty/config.toml`
-(`%APPDATA%\sointty\sointty\config\config.toml` on Windows,
-`~/.config/sointty/config.toml` on Linux). Command-line flags override the
-file. Named playlists live in `<data dir>/sointty/playlists.toml`; adding
-tracks never touches the playback queue.
-Random play shuffles only upcoming queue entries, not saved playlists. Turning it
-off keeps the current queue order and appends future songs in order. The same
-toggle is `r` and under Settings → Playback.
 
 ## Fidelity rules
 
@@ -157,6 +174,21 @@ adjacent ranges.
 |---|---|---|
 | iFi ZEN DAC V2 | macOS | 192 kHz S24 FLAC, bit-perfect via Core Audio Integer Mode (non-mixable integer formats, hog mode) |
 | iFi ZEN DAC V2 | Windows | WASAPI exclusive, integer path |
+
+## Configuration
+
+Settings live in `<config dir>/sointty/config.toml`
+(`%APPDATA%\sointty\sointty\config\config.toml` on Windows,
+`~/.config/sointty/config.toml` on Linux). Command-line flags override the
+file. Named playlists live in `<data dir>/sointty/playlists.toml`; adding
+tracks never touches the playback queue.
+
+Buffer timing (period/buffer frames) is adjustable on the Settings screen
+under Output; Auto derives timing from each track's sample rate.
+
+Random play shuffles only upcoming queue entries, not saved playlists. Turning
+it off keeps the current queue order and appends future songs in order. The
+same toggle is `r` and under Settings → Playback.
 
 ## Building
 
