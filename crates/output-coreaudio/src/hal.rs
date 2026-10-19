@@ -73,6 +73,9 @@ const LOGGED_BUFFERS: usize = 8;
 /// `configure` retries after a settle delay: total attempts is 1 + this.
 const SETTLE_RETRIES: usize = 2;
 
+/// Delay between settle-capable retries, shared by `configure` and `start`.
+const SETTLE_DELAY: std::time::Duration = std::time::Duration::from_millis(250);
+
 /// The one `UnsupportedFormat` reason that cannot heal with settle time:
 /// the offered physical-format list has no exact carrier for the stream.
 /// Kept as a shared constant so the retry policy can match it exactly
@@ -860,7 +863,7 @@ impl AudioOutput for CoreAudioOutput {
                             "configure: attempt {attempt} failed ({err}); retrying after settle delay"
                         );
                     }
-                    std::thread::sleep(std::time::Duration::from_millis(250));
+                    std::thread::sleep(SETTLE_DELAY);
                     self.acquire_hog()?;
                 }
             }
@@ -936,12 +939,26 @@ impl AudioOutput for CoreAudioOutput {
         if status != kAudioHardwareNoError {
             return Err(PlayerError::Output);
         }
-        // SAFETY: `proc_id` is a live IOProcID for `self.device`.
-        let status = unsafe { AudioDeviceStart(self.device, proc_id) };
-        if let Some(log) = &mut log {
-            use std::io::Write;
-            let _ = writeln!(log, "  start: device_start status={status}");
-        }
+        // A rate/format switch leaves the device refusing to start for a
+        // short while even after configure's readbacks all match: observed
+        // on a USB DAC as device_start status=35 (Darwin EAGAIN) right
+        // after a 48 kHz -> 96 kHz switch, while a fresh process at the
+        // same rate starts cleanly. Same bounded settle policy as
+        // `configure`: retry with a short delay before giving up.
+        let mut attempt = 0;
+        let status = loop {
+            // SAFETY: `proc_id` is a live IOProcID for `self.device`.
+            let status = unsafe { AudioDeviceStart(self.device, proc_id) };
+            if let Some(log) = &mut log {
+                use std::io::Write;
+                let _ = writeln!(log, "  start: device_start status={status}");
+            }
+            if status == kAudioHardwareNoError || attempt == SETTLE_RETRIES {
+                break status;
+            }
+            attempt += 1;
+            std::thread::sleep(SETTLE_DELAY);
+        };
         if status != kAudioHardwareNoError {
             // SAFETY: `proc_id` is a live IOProcID for `self.device`.
             unsafe { AudioDeviceDestroyIOProcID(self.device, proc_id) };
