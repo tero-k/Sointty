@@ -70,6 +70,16 @@ type IoBlockDyn = dyn Fn(
 
 const LOGGED_BUFFERS: usize = 8;
 
+/// `configure` retries after a settle delay: total attempts is 1 + this.
+const SETTLE_RETRIES: usize = 2;
+
+/// The one `UnsupportedFormat` reason that cannot heal with settle time:
+/// the offered physical-format list has no exact carrier for the stream.
+/// Kept as a shared constant so the retry policy can match it exactly
+/// instead of duplicating a literal.
+const REASON_NO_EXACT_PHYSICAL_FORMAT: &str =
+    "no offered physical format preserves the stream exactly";
+
 /// One render thread's best-effort diagnostics. The HAL writes only atomics;
 /// `stop` formats and writes the log after the IO block has been destroyed.
 struct RenderReport {
@@ -537,10 +547,7 @@ impl CoreAudioOutput {
             })
             .collect();
         let Some(matched) = pick_physical_format(&candidates, input) else {
-            return Err(Self::unsupported(
-                input,
-                "no offered physical format preserves the stream exactly",
-            ));
+            return Err(Self::unsupported(input, REASON_NO_EXACT_PHYSICAL_FORMAT));
         };
         // Pin the exact requested rate on the chosen physical format; the
         // readback below verifies the hardware settled on it.
@@ -820,33 +827,41 @@ impl AudioOutput for CoreAudioOutput {
         // shared mixing). Any failure below releases the hog before
         // returning.
         self.acquire_hog()?;
-        match self.configure_inner(input, buffers) {
-            Ok(spec) => Ok(spec),
-            Err(err) => {
-                self.release_hog();
-                // A rate/format switch leaves the stream in the previous
-                // non-mixable format, and the driver rejects reconfiguration
-                // until it settles back to its mixable default (observed on
-                // an iFi ZEN DAC V2: 192 kHz -> 48 kHz fails once, then an
-                // immediate retry succeeds). Retry exactly once, after a
-                // short settle delay, only when this device was configured
-                // before; genuinely unsupported formats on a fresh device
-                // still fail on the first attempt.
-                if self.spec.is_none() || !matches!(err, PlayerError::UnsupportedFormat { .. }) {
-                    return Err(err);
-                }
-                if let Some(mut log) = debug_log() {
-                    use std::io::Write;
-                    let _ = writeln!(log, "configure: retrying after settle delay");
-                }
-                std::thread::sleep(std::time::Duration::from_millis(250));
-                self.acquire_hog()?;
-                match self.configure_inner(input, buffers) {
-                    Ok(spec) => Ok(spec),
-                    Err(retry_err) => {
-                        self.release_hog();
-                        Err(retry_err)
+        // A rate/format switch leaves the stream in the previous
+        // non-mixable format, and the driver rejects reconfiguration until
+        // it settles back to its mixable default (observed on an iFi ZEN DAC
+        // V2: 192 kHz -> 48 kHz fails at the nominal-rate set, then a retry
+        // after a short delay succeeds; a first attempt can also read back
+        // the previous mixable format before the non-mixable one sticks).
+        // The device keeps its last format after the process exits, so this
+        // applies even to the first configure of a fresh backend. Retry a
+        // bounded number of times with a settle delay; pure matching
+        // failures (no offered physical format can carry the stream) cannot
+        // heal with time and fail immediately.
+        let mut attempt = 0;
+        loop {
+            match self.configure_inner(input, buffers) {
+                Ok(spec) => return Ok(spec),
+                Err(err) => {
+                    self.release_hog();
+                    let settleable = matches!(
+                        &err,
+                        PlayerError::UnsupportedFormat { reason, .. }
+                            if *reason != REASON_NO_EXACT_PHYSICAL_FORMAT
+                    );
+                    if !settleable || attempt == SETTLE_RETRIES {
+                        return Err(err);
                     }
+                    attempt += 1;
+                    if let Some(mut log) = debug_log() {
+                        use std::io::Write;
+                        let _ = writeln!(
+                            log,
+                            "configure: attempt {attempt} failed ({err}); retrying after settle delay"
+                        );
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(250));
+                    self.acquire_hog()?;
                 }
             }
         }
@@ -910,11 +925,23 @@ impl AudioOutput for CoreAudioOutput {
                 RcBlock::as_ptr(&block),
             )
         };
+        // Diagnose starts that succeed yet never render: record each status
+        // so the stop log (`played_frames=0` with no `io:` lines) can be
+        // attributed to the HAL never invoking the block.
+        let mut log = debug_log();
+        if let Some(log) = &mut log {
+            use std::io::Write;
+            let _ = writeln!(log, "  start: create_io_proc status={status}");
+        }
         if status != kAudioHardwareNoError {
             return Err(PlayerError::Output);
         }
-        // SAFETY: `proc_id` was just created for `self.device`.
+        // SAFETY: `proc_id` is a live IOProcID for `self.device`.
         let status = unsafe { AudioDeviceStart(self.device, proc_id) };
+        if let Some(log) = &mut log {
+            use std::io::Write;
+            let _ = writeln!(log, "  start: device_start status={status}");
+        }
         if status != kAudioHardwareNoError {
             // SAFETY: `proc_id` is a live IOProcID for `self.device`.
             unsafe { AudioDeviceDestroyIOProcID(self.device, proc_id) };
