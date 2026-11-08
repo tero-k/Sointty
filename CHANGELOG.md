@@ -8,6 +8,8 @@ exists today.
 
 ## 0.2.0 (2026-10-18, current build)
 
+- Refresh 54 locked Rust packages to the latest releases compatible with the
+  existing workspace requirements and Rust 1.98.1.
 - Fix search freezing the whole app on broad queries: the search worker
   indexes whole drives, so short queries matched tens of thousands of
   entries and the UI spent all its time draining and re-sorting results.
