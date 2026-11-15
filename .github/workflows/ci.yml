@@ -28,7 +28,7 @@ jobs:
           persist-credentials: false
       - name: Install Linux native dependencies
         if: runner.os == 'Linux'
-        run: sudo apt-get update && sudo apt-get install --yes libasound2-dev libopus-dev pkg-config
+        run: sudo apt-get update && sudo apt-get install --yes libasound2-dev libdbus-1-dev libopus-dev pkg-config
       - name: Run workspace tests
         run: cargo test --workspace --locked
 
