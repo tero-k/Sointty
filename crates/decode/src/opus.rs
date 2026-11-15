@@ -10,7 +10,7 @@
 //! is reached. Frame accounting uses page granule positions, which per
 //! RFC 7845 count all decoded samples including the pre-skip padding.
 
-use std::io::BufReader;
+use std::io::{BufReader, SeekFrom};
 
 use ogg::{OggReadError, PacketReader};
 use opus::{Channels, Decoder as OpusDecoder, MSDecoder};
@@ -22,6 +22,8 @@ use sointty_core::{
 const RATE_HZ: u32 = 48_000;
 /// Longest Opus frame (120 ms) at 48 kHz.
 const MAX_FRAME: usize = 5760;
+/// RFC 7845 recommends at least 80 ms of decoded pre-roll before a seek target.
+const SEEK_PREROLL_FRAMES: u64 = 3_840;
 /// Consecutive packet decode failures tolerated before giving up.
 const MAX_BAD_PACKETS: u32 = 8;
 
@@ -263,10 +265,16 @@ impl OggOpusDecoder {
                 Some(packet) => packet,
                 None => {
                     self.ended = true;
-                    return Ok(self.total_valid.unwrap_or(0));
+                    let position = self.total_valid.unwrap_or(0);
+                    self.position = position;
+                    return Ok(position);
                 }
             };
-            if packet.stream_serial() != self.serial || packet.data.is_empty() {
+            if packet.stream_serial() != self.serial
+                || packet.data.is_empty()
+                || packet.data.starts_with(b"OpusHead")
+                || packet.data.starts_with(b"OpusTags")
+            {
                 continue;
             }
             let frames = self.decode_packet(&packet.data)? as u64;
@@ -307,6 +315,27 @@ impl OggOpusDecoder {
             }
         }
     }
+
+    /// Finds the real EOS granule without decoding or buffering the stream.
+    fn scan_total_valid(&mut self) -> Result<u64, PlayerError> {
+        self.reader
+            .seek_bytes(SeekFrom::Start(0))
+            .map_err(|error| PlayerError::Io(error.kind()))?;
+        let mut total = 0;
+        while let Some(packet) = read_packet(&mut self.reader)? {
+            if packet.stream_serial() == self.serial && packet.last_in_stream() {
+                total = packet.absgp_page().saturating_sub(self.pre_skip);
+                break;
+            }
+        }
+        self.total_valid = Some(total);
+        self.ended = true;
+        self.position = total;
+        self.pending = 0;
+        self.scratch.clear();
+        self.discard.clear();
+        Ok(total)
+    }
 }
 
 impl Decoder for OggOpusDecoder {
@@ -325,7 +354,7 @@ impl Decoder for OggOpusDecoder {
             let frames = self.pending;
             self.pending = 0;
             self.position += frames as u64;
-            return Ok(Some(DecodedBlock::new(
+            return Ok(Some(DecodedBlock::pcm_block(
                 self.spec,
                 frames,
                 DecodedPcm::F32(&self.scratch),
@@ -381,7 +410,7 @@ impl Decoder for OggOpusDecoder {
             self.scratch.drain(..drop_frames * channels);
             self.scratch.truncate(keep * channels);
             self.position = block_pos + keep as u64;
-            return Ok(Some(DecodedBlock::new(
+            return Ok(Some(DecodedBlock::pcm_block(
                 self.spec,
                 keep as u32,
                 DecodedPcm::F32(&self.scratch),
@@ -392,11 +421,11 @@ impl Decoder for OggOpusDecoder {
     /// Seeks so the next `next_block` yields exactly `frame` (48 kHz,
     /// post-pre-skip timeline) and returns the frame landed on.
     ///
-    /// `ogg::PacketReader::seek_absgp` positions at the first page whose
-    /// granule position reaches `frame + pre_skip`; packets are then decoded
-    /// and discarded until that exact granule, so the landing is sample-exact
-    /// even when the seek lands mid-page. This is a bisection plus a short
-    /// decode-discard, not a continuous decode from stream start.
+    /// `ogg::PacketReader::seek_absgp` positions near the target minus 80 ms
+    /// of codec pre-roll; packets are then decoded and discarded until the
+    /// exact granule, so the landing is sample-exact even mid-page. This is a
+    /// bisection plus a short decode-discard, not a continuous decode from
+    /// stream start.
     fn seek_to_frame(&mut self, frame: u64) -> Result<u64, PlayerError> {
         let frame = match self.total_valid {
             Some(total) => frame.min(total),
@@ -412,27 +441,13 @@ impl Decoder for OggOpusDecoder {
         self.bad_packets = 0;
 
         let target_ogg = frame.saturating_add(self.pre_skip);
+        let seek_ogg = target_ogg.saturating_sub(SEEK_PREROLL_FRAMES);
         let found = self
             .reader
-            .seek_absgp(Some(self.serial), target_ogg)
+            .seek_absgp(Some(self.serial), seek_ogg)
             .map_err(map_ogg_error)?;
         if !found {
-            // Target is past the last page's granule position: clamp to the
-            // end of the stream.
-            let found_end = self
-                .reader
-                .seek_absgp(Some(self.serial), u64::MAX)
-                .map_err(map_ogg_error)?;
-            if !found_end {
-                self.ended = true;
-                self.total_valid = Some(0);
-                self.position = 0;
-                return Ok(0);
-            }
-            let position = self.decode_discard_to(u64::MAX)?;
-            self.ended = true;
-            self.position = position;
-            return Ok(position);
+            return self.scan_total_valid();
         }
         self.ended = false;
         self.decode_discard_to(target_ogg)
@@ -470,10 +485,17 @@ mod tests {
     const FRAME: usize = 960; // 20 ms at 48 kHz
     const SERIAL: u32 = 0x0102_0304;
 
-    /// Encodes `frames` samples of a deterministic 300 Hz sine into an Ogg
-    /// Opus stream, returning the file bytes, the input samples (interleaved)
-    /// and the encoder pre-skip written into the OpusHead.
     fn encode_fixture(channels: u16, frames: usize) -> (Vec<u8>, Vec<f32>, u64) {
+        encode_fixture_with_gain(channels, frames, 0)
+    }
+
+    /// Encodes `frames` valid samples plus codec padding into an Ogg Opus
+    /// stream, returning the bytes, padded input samples, and encoder pre-skip.
+    fn encode_fixture_with_gain(
+        channels: u16,
+        frames: usize,
+        gain: i16,
+    ) -> (Vec<u8>, Vec<f32>, u64) {
         let opus_channels = match channels {
             1 => Channels::Mono,
             _ => Channels::Stereo,
@@ -484,7 +506,8 @@ mod tests {
         let pre_skip = encoder.get_lookahead().expect("lookahead") as u64;
 
         let n_ch = channels as usize;
-        let input: Vec<f32> = (0..frames * n_ch)
+        let packets = (frames + pre_skip as usize).div_ceil(FRAME);
+        let input: Vec<f32> = (0..packets * FRAME * n_ch)
             .map(|i| {
                 let n = i / n_ch;
                 0.5 * (2.0 * std::f32::consts::PI * 300.0 * n as f32 / RATE_HZ as f32 + 0.7).sin()
@@ -500,7 +523,7 @@ mod tests {
             head.push(channels as u8);
             head.extend_from_slice(&(pre_skip as u16).to_le_bytes());
             head.extend_from_slice(&RATE_HZ.to_le_bytes()); // input rate
-            head.extend_from_slice(&0i16.to_le_bytes()); // output gain
+            head.extend_from_slice(&gain.to_le_bytes()); // output gain
             head.push(0); // mapping family 0
             writer
                 .write_packet(head, SERIAL, PacketWriteEndInfo::EndPage, 0)
@@ -513,15 +536,18 @@ mod tests {
                 .write_packet(tags, SERIAL, PacketWriteEndInfo::EndPage, 0)
                 .expect("tags");
 
-            let packets = frames / FRAME;
-            let mut granule = pre_skip;
             for index in 0..packets {
                 let start = index * FRAME * n_ch;
                 let packet = encoder
                     .encode_vec_float(&input[start..start + FRAME * n_ch], 4000)
                     .expect("encode");
-                granule += FRAME as u64;
-                let end = if index + 1 == packets {
+                let last = index + 1 == packets;
+                let granule = if last {
+                    pre_skip + frames as u64
+                } else {
+                    ((index + 1) * FRAME) as u64
+                };
+                let end = if last {
                     PacketWriteEndInfo::EndStream
                 } else {
                     PacketWriteEndInfo::EndPage
@@ -542,7 +568,7 @@ mod tests {
         let mut total = 0u64;
         let mut samples = Vec::new();
         while let Some(block) = decoder.next_block().expect("block") {
-            assert_eq!(block.spec.rate_hz, RATE_HZ);
+            assert_eq!(block.spec.pcm().expect("PCM block").rate_hz, RATE_HZ);
             total += block.frames as u64;
             match block.pcm {
                 DecodedPcm::F32(data) => samples.extend_from_slice(data),
@@ -598,16 +624,7 @@ mod tests {
 
     #[test]
     fn rejects_nonzero_output_gain() {
-        let (mut bytes, _, _) = encode_fixture(1, FRAME * 2);
-        // Locate the OpusHead packet payload inside the first page (page
-        // header + segment table precede it) and corrupt the gain field at
-        // offset 16.
-        let magic_at = bytes
-            .windows(8)
-            .position(|window| window == b"OpusHead")
-            .expect("OpusHead magic");
-        bytes[magic_at + 16] = 1; // gain = 1 (LE)
-        bytes[magic_at + 17] = 0;
+        let (bytes, _, _) = encode_fixture_with_gain(1, FRAME * 2, 1);
         let error = OggOpusDecoder::open(Box::new(MemSource(Cursor::new(bytes))))
             .err()
             .expect("gain must be rejected");
@@ -638,7 +655,8 @@ mod tests {
         assert_eq!(landed, target);
 
         let block = decoder.next_block().expect("block").expect("some");
-        assert_eq!(block.frames as u64, FRAME as u64);
+        let block_frames = u64::from(block.frames);
+        assert!(block_frames > 0 && block_frames <= FRAME as u64);
         match block.pcm {
             DecodedPcm::F32(data) => {
                 let expected = input[target as usize * 2];
@@ -652,7 +670,7 @@ mod tests {
         }
 
         let (rest, _) = collect(&mut decoder);
-        assert_eq!(rest + FRAME as u64 + landed, frames as u64);
+        assert_eq!(rest + block_frames + landed, frames as u64);
     }
 
     #[test]

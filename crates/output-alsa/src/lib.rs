@@ -89,6 +89,7 @@ mod imp {
                 ],
                 SampleEncoding::S32 => &[(DeviceFormat::S32Le, Format::S32LE)],
                 SampleEncoding::F32 => &[(DeviceFormat::F32Le, Format::FloatLE)],
+                SampleEncoding::Dsd => &[],
             };
 
             let mut configured = None;
