@@ -6,7 +6,7 @@ use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
 
 use crossbeam_channel::{Receiver, Sender};
-use rand::{Rng, seq::SliceRandom};
+use rand::{RngExt, seq::SliceRandom};
 use sointty_core::{
     AudioOutput, BufferConfig, DecodedBlock, DecodedPcm, DecodedSpec, Decoder, DeviceFormat,
     DeviceId, DopPacker, OutputAccess, OutputCounters, OutputSpec, PlayerCommand, PlayerError,
@@ -748,7 +748,7 @@ impl<O: AudioOutput> Worker<O> {
                 if enabled && !self.shuffle {
                     self.queue
                         .make_contiguous()
-                        .shuffle(&mut rand::thread_rng());
+                        .shuffle(&mut rand::rng());
                 }
                 self.shuffle = enabled;
                 self.emit_queue_changed();
@@ -912,7 +912,7 @@ impl<O: AudioOutput> Worker<O> {
             tags,
         };
         if self.shuffle {
-            let index = rand::thread_rng().gen_range(0..=self.queue.len());
+            let index = rand::rng().random_range(0..=self.queue.len());
             self.queue.insert(index, track);
         } else {
             self.queue.push_back(track);
