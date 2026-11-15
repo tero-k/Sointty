@@ -15,8 +15,8 @@ use std::io::BufReader;
 use ogg::{OggReadError, PacketReader};
 use opus::{Channels, Decoder as OpusDecoder, MSDecoder};
 use sointty_core::{
-    ChannelLayout, DecodedBlock, DecodedPcm, Decoder, PlayerError, SampleEncoding, Source,
-    StreamSpec,
+    ChannelLayout, DecodedBlock, DecodedPcm, DecodedSpec, Decoder, PlayerError, SampleEncoding,
+    Source, StreamSpec,
 };
 
 const RATE_HZ: u32 = 48_000;
@@ -326,7 +326,7 @@ impl Decoder for OggOpusDecoder {
             self.pending = 0;
             self.position += frames as u64;
             return Ok(Some(DecodedBlock::new(
-                self.spec,
+                DecodedSpec::Pcm(self.spec),
                 frames,
                 DecodedPcm::F32(&self.scratch),
             )));
@@ -382,7 +382,7 @@ impl Decoder for OggOpusDecoder {
             self.scratch.truncate(keep * channels);
             self.position = block_pos + keep as u64;
             return Ok(Some(DecodedBlock::new(
-                self.spec,
+                DecodedSpec::Pcm(self.spec),
                 keep as u32,
                 DecodedPcm::F32(&self.scratch),
             )));
