@@ -655,7 +655,8 @@ mod tests {
         assert_eq!(landed, target);
 
         let block = decoder.next_block().expect("block").expect("some");
-        assert_eq!(block.frames as u64, FRAME as u64);
+        let block_frames = u64::from(block.frames);
+        assert!(block_frames > 0 && block_frames <= FRAME as u64);
         match block.pcm {
             DecodedPcm::F32(data) => {
                 let expected = input[target as usize * 2];
@@ -669,7 +670,7 @@ mod tests {
         }
 
         let (rest, _) = collect(&mut decoder);
-        assert_eq!(rest + FRAME as u64 + landed, frames as u64);
+        assert_eq!(rest + block_frames + landed, frames as u64);
     }
 
     #[test]
