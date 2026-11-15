@@ -765,6 +765,13 @@ mod tests {
         parse_cli_args(args.iter().map(|a| a.to_string()))
     }
 
+    fn config_with_device() -> Config {
+        Config {
+            device: Some("hw:0,0".to_owned()),
+            ..Config::default()
+        }
+    }
+
     #[test]
     fn reindex_takes_one_root_and_leaves_files() {
         // Regression: the old greedy loop swallowed a positional file as a
@@ -842,22 +849,22 @@ mod tests {
     fn zero_or_undersized_timing_is_a_typed_error() {
         let zero_period = parse(&["--period-frames", "0"]).unwrap();
         assert!(matches!(
-            resolve_settings(&zero_period, &Config::default()),
+            resolve_settings(&zero_period, &config_with_device()),
             Err(PlayerError::InvalidInput(_))
         ));
         let zero_buffer = parse(&["--buffer-frames", "0"]).unwrap();
         assert!(matches!(
-            resolve_settings(&zero_buffer, &Config::default()),
+            resolve_settings(&zero_buffer, &config_with_device()),
             Err(PlayerError::InvalidInput(_))
         ));
         let undersized = parse(&["--period-frames", "4096", "--buffer-frames", "4096"]).unwrap();
         assert!(matches!(
-            resolve_settings(&undersized, &Config::default()),
+            resolve_settings(&undersized, &config_with_device()),
             Err(PlayerError::InvalidInput(_))
         ));
         // A single override is fine: the counterpart is rate-relative.
         let single = parse(&["--period-frames", "1024"]).unwrap();
-        let settings = resolve_settings(&single, &Config::default()).unwrap();
+        let settings = resolve_settings(&single, &config_with_device()).unwrap();
         assert_eq!(settings.period_frames, Some(1024));
         assert_eq!(settings.buffer_frames, None);
     }
@@ -907,10 +914,10 @@ mod tests {
     fn float_compatibility_is_opt_in_with_cli_override() {
         let config = Config {
             float_to_int: Some(true),
-            ..Config::default()
+            ..config_with_device()
         };
         assert!(
-            !resolve_settings(&parse(&[]).unwrap(), &Config::default())
+            !resolve_settings(&parse(&[]).unwrap(), &config_with_device())
                 .unwrap()
                 .float_to_int
         );
@@ -926,7 +933,7 @@ mod tests {
         );
         let off = Config {
             float_to_int: Some(false),
-            ..Config::default()
+            ..config_with_device()
         };
         assert!(
             resolve_settings(&parse(&["--allow-float-to-int"]).unwrap(), &off)
@@ -939,10 +946,10 @@ mod tests {
     fn int_to_float_compatibility_is_opt_in_with_cli_override() {
         let config = Config {
             int_to_float: Some(true),
-            ..Config::default()
+            ..config_with_device()
         };
         assert!(
-            !resolve_settings(&parse(&[]).unwrap(), &Config::default())
+            !resolve_settings(&parse(&[]).unwrap(), &config_with_device())
                 .unwrap()
                 .int_to_float
         );
@@ -958,7 +965,7 @@ mod tests {
         );
         let off = Config {
             int_to_float: Some(false),
-            ..Config::default()
+            ..config_with_device()
         };
         assert!(
             resolve_settings(&parse(&["--allow-int-to-float"]).unwrap(), &off)
